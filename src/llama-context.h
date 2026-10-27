@@ -368,6 +368,13 @@ private:
 
     bool sched_need_reserve = true;
 
+    // backend samplers changed since the last reserve; a reserve is only needed if the
+    // structure of the sampler chains differs (see sampling_signature())
+    bool        sampling_need_check = false;
+    std::string sampling_sig_reserved;
+
+    std::string sampling_signature() const;
+
     // whether the reserve graph has a logits tensor, set in sched_reserve()
     // true until then, because the first output_reserve() runs before any graph is reserved
     bool graph_has_logits = true;

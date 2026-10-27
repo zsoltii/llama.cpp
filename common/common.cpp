@@ -26,6 +26,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <mutex>
 #include <random>
 #include <regex>
 #include <sstream>
@@ -2369,6 +2370,66 @@ bool common_prompt_batch_decode(
     return true;
 }
 
+// a fresh multi-MiB std::vector costs one page fault per 4 KiB page on first write, which can be
+// as slow as the device -> host copy of the state itself, so released buffers are kept for reuse
+struct ckpt_pool {
+    std::mutex                        mutex;
+    std::vector<std::vector<uint8_t>> bufs;
+};
+
+// never destroyed: checkpoints may be released during static destruction
+static ckpt_pool & ckpt_pool_get() {
+    static ckpt_pool * pool = new ckpt_pool();
+    return *pool;
+}
+
+static constexpr size_t CKPT_POOL_MIN_BUF   = 1u << 20;
+static constexpr size_t CKPT_POOL_MAX_BYTES = 512u << 20;
+
+static void ckpt_buf_acquire(std::vector<uint8_t> & buf, size_t size) {
+    if (buf.capacity() < size) {
+        auto & pool = ckpt_pool_get();
+        std::lock_guard<std::mutex> lock(pool.mutex);
+
+        // smallest pooled buffer that fits
+        auto best = pool.bufs.end();
+        for (auto it = pool.bufs.begin(); it != pool.bufs.end(); ++it) {
+            if (it->capacity() >= size && (best == pool.bufs.end() || it->capacity() < best->capacity())) {
+                best = it;
+            }
+        }
+        if (best != pool.bufs.end()) {
+            buf.swap(*best);
+            pool.bufs.erase(best);
+        }
+    }
+
+    buf.resize(size);
+}
+
+static void ckpt_buf_release(std::vector<uint8_t> & buf) {
+    if (buf.capacity() < CKPT_POOL_MIN_BUF) {
+        return;
+    }
+
+    auto & pool = ckpt_pool_get();
+    std::lock_guard<std::mutex> lock(pool.mutex);
+
+    size_t total = buf.capacity();
+    for (const auto & b : pool.bufs) {
+        total += b.capacity();
+    }
+    if (total <= CKPT_POOL_MAX_BYTES) {
+        pool.bufs.push_back(std::move(buf));
+    }
+    buf = {};
+}
+
+common_prompt_checkpoint::~common_prompt_checkpoint() {
+    ckpt_buf_release(data_tgt);
+    ckpt_buf_release(data_dft);
+}
+
 size_t common_prompt_checkpoint::size() const {
     return data_tgt.size() + data_dft.size() + data_spec.size();
 }
@@ -2407,7 +2468,7 @@ void common_prompt_checkpoint::update_tgt(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
-    data_tgt.resize(ckpt_size);
+    ckpt_buf_acquire(data_tgt, ckpt_size);
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
@@ -2425,7 +2486,7 @@ void common_prompt_checkpoint::update_dft(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
-    data_dft.resize(ckpt_size);
+    ckpt_buf_acquire(data_dft, ckpt_size);
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {

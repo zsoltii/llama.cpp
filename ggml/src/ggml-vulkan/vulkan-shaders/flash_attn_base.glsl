@@ -19,6 +19,8 @@ layout (constant_id = 13) const uint32_t FaTypeV = 0;
 // sizeof(decode buffer): quants -> ggml block size; F32 -> 16 (decodeBufF32 vec4).
 layout (constant_id = 14) const uint32_t FaBlockBytesK = 2;
 layout (constant_id = 15) const uint32_t FaBlockBytesV = 2;
+// coopmat1 path: M size of the cooperative matrices (16, or 8 on devices that only support 8x16x16)
+layout (constant_id = 16) const uint32_t FaCmM = 16;
 
 const bool USE_MASK_OPT    = (Flags & 1) != 0;
 const bool MASK_ENABLE     = (Flags & 2) != 0;

@@ -1259,8 +1259,30 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
 
     result.shmem_staging = (device->vendor_id == VK_VENDOR_ID_NVIDIA && hsk < 256 && hsv < 256) ? 1 : 0;
 
-    if (!reduce_block_rows && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
+    if (!reduce_block_rows && result.block_rows > 1 && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
         result.block_rows /= 2;
+    }
+
+    // The K/V staging tile scales with Bc * max(hsk, hsv) and does not shrink with block_rows. Without fp16 the
+    // shader uses fp32 (e.g. NVIDIA Pascal: hsk=192 -> 50 KB > 48 KB), and an oversized dispatch faults on the GPU
+    // instead of failing at pipeline creation. Fall back to reading K/V directly from global memory.
+    if (result.shmem_staging && !ggml_vk_flash_attn_scalar_shmem_support(device, result, hsk, hsv, f32acc, k_type, v_type)) {
+        result.shmem_staging = 0;
+    }
+
+    // Without fp16 the shader runs in fp32 (FLOAT_TYPE=float), which doubles the per-thread register footprint of the
+    // Br x Bc score tile; at Bc=32 it spills (GTX 1080 Ti, 512 rows x 8.7k keys: 2.2x slower). Use narrower 16x16 tiles
+    // with row_split for prefill-sized batches. Decode/verify (few rows) keep the defaults.
+    if (!device->fp16 && n_rows > 8 && result.subgroup_size == 32) {
+        vk_fa_tuning_params narrow = result;
+        narrow.block_rows = 16;
+        narrow.block_cols = 16;
+        narrow.row_split = 4;
+        narrow.workgroup_size = 128;
+        narrow.shmem_staging = 0;
+        if (ggml_vk_flash_attn_scalar_shmem_support(device, narrow, hsk, hsv, f32acc, k_type, v_type)) {
+            result = narrow;
+        }
     }
 
     // On AMD RDNA, for small head sizes and big batch size the shader uses few registers, so too many subgroups get scheduled
@@ -1282,20 +1304,30 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
     return result;
 }
 
+// M size of the coopmat1 FA shapes (MxNxK = Mx16x16): 16 when supported, else 8 (e.g. Intel Xe2), 0 if neither
+static uint32_t ggml_vk_fa_cm1_m(const vk_device& device, bool f32acc) {
+    if (f32acc ? device->coopmat_support_16x16x16_f32acc : device->coopmat_support_16x16x16_f16acc) {
+        return 16;
+    }
+    if (f32acc ? device->coopmat_support_8x16x16_f32acc : device->coopmat_support_8x16x16_f16acc) {
+        return 8;
+    }
+    return 0;
+}
+
 static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
     GGML_UNUSED(n_rows);
     GGML_UNUSED(n_kv);
     GGML_UNUSED(k_type);
     GGML_UNUSED(v_type);
-    GGML_UNUSED(f32acc);
-
     vk_fa_tuning_params result{};
     result.path = FA_COOPMAT1;
 
     const uint32_t D = hsk | hsv;
 
     const uint32_t coopmat_block_rows = 16;
-    const uint32_t coopmat_block_cols = 16;
+    // KV rows per subgroup = coopmat M size
+    const uint32_t coopmat_block_cols = std::max(ggml_vk_fa_cm1_m(device, f32acc), 8u);
 
     const uint32_t num_subgroups = 4;
 
@@ -1358,8 +1390,7 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
     }
 
     if (path == FA_COOPMAT1) {
-        bool shape_ok = (f32acc && device->coopmat_support_16x16x16_f32acc) ||
-                        (!f32acc && device->coopmat_support_16x16x16_f16acc);
+        bool shape_ok = ggml_vk_fa_cm1_m(device, f32acc) != 0;
         const vk_fa_tuning_params params = get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
         bool shmem_ok = ggml_vk_flash_attn_coopmat_shmem_support(device, params, hsk, hsv, f32acc, k_type, v_type);
 
@@ -1426,6 +1457,7 @@ static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& s
         /*13 FaTypeV         */ static_cast<uint32_t>(state.v_type),
         /*14 FaBlockBytesK   */ fa_block_bytes(state.k_type),
         /*15 FaBlockBytesV   */ fa_block_bytes(state.v_type),
+        /*16 FaCmM           */ state.path == FA_COOPMAT1 ? state.Bc / state.row_split : 16u,
     };
 }
 
@@ -1861,6 +1893,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         } else if (device->vendor_id == VK_VENDOR_ID_QUALCOMM && device->coopmat_support) {
             m_warptile     = { 64, 64, 64, 16, 64, 64, 1, tm_l, tn_l, tk_l, 64 };
             m_warptile_mmq = { 64, 64, 64, 32, 64, 64, 1, tm_m, tn_m, tk_m, 64 };
+        } else if (device->vendor_id == VK_VENDOR_ID_NVIDIA && !device->coopmat_support) {
+            // NVIDIA without tensor cores (Pascal, DP4A): the 128-thread tile keeps 64-128 accumulators per thread,
+            // which limits occupancy. 16 warps with 2x1 thread tiles: GTX 1080 Ti, pp512 MMQ 1.7-2.1x faster.
+            l_warptile_mmq_int = l_warptile_mmq_int_k = { 512, 128, 128, 32, 32, 32, 2, 2, 1, 1, mm_warp_8 };
         }
 
         l_mmq_wg_denoms = l_wg_denoms = {128, 128, 1 };
@@ -4294,6 +4330,32 @@ vk_device ggml_vk_get_device(size_t idx) {
         device->subgroup_size = subgroup_props.subgroupSize;
         device->subgroup_size_log2 = uint32_t(log2f(float(device->subgroup_size)));
         device->uma = device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
+
+        // Without resizable BAR the host-visible VRAM window is small (typically 256 MiB). Drivers
+        // (e.g. ANV on xe) still hand out allocations from that memory type past the window by
+        // placing them in system memory, so later compute buffers end up being read over PCIe
+        // (catastrophic on Thunderbolt eGPUs). Only use host-visible vidmem when it covers most of VRAM.
+        if (!device->uma && !device->disable_host_visible_vidmem && getenv("GGML_VK_ALLOW_SMALL_BAR_VIDMEM") == nullptr) {
+            const vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
+            vk::DeviceSize vram = 0, bar = 0;
+            for (uint32_t i = 0; i < mem_props.memoryHeapCount; i++) {
+                if (mem_props.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                    vram = std::max(vram, mem_props.memoryHeaps[i].size);
+                }
+            }
+            const vk::MemoryPropertyFlags bar_flags = vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible;
+            for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+                if ((mem_props.memoryTypes[i].propertyFlags & bar_flags) == bar_flags) {
+                    bar = std::max(bar, mem_props.memoryHeaps[mem_props.memoryTypes[i].heapIndex].size);
+                }
+            }
+            if (bar > 0 && bar < vram / 2) {
+                device->disable_host_visible_vidmem = true;
+                GGML_LOG_INFO("ggml_vulkan: %s: small BAR (%zu MiB of %zu MiB VRAM host-visible), not using host-visible vidmem\n",
+                              device->properties.deviceName.data(), (size_t) (bar / (1024*1024)), (size_t) (vram / (1024*1024)));
+            }
+        }
+
         if (sm_builtins) {
             device->shader_core_count = sm_props.shaderSMCount;
         } else if (amd_shader_core_properties2) {
@@ -4756,6 +4818,13 @@ vk_device ggml_vk_get_device(size_t idx) {
             pfn_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(device->physical_device, &cm_props_num, cm_props.data());
 
             VK_LOG_DEBUG("ggml_vulkan: Cooperative Matrix Shapes: " << cm_props.size());
+            if (getenv("GGML_VK_FA_DEBUG")) {
+                for (auto& prop : cm_props) {
+                    fprintf(stderr, "ggml_vulkan: coopmat M=%u N=%u K=%u A=%s C=%s scope=%s\n", prop.MSize, prop.NSize, prop.KSize,
+                            vk::to_string((vk::ComponentTypeKHR)prop.AType).c_str(), vk::to_string((vk::ComponentTypeKHR)prop.CType).c_str(),
+                            vk::to_string((vk::ScopeKHR)prop.scope).c_str());
+                }
+            }
 
             for (auto& prop : cm_props) {
                 VK_LOG_DEBUG("ggml_vulkan: M: " << prop.MSize << " N: " << prop.NSize << " K: " << prop.KSize << " A: " << vk::to_string((vk::ComponentTypeKHR)prop.AType) << " B: " << vk::to_string((vk::ComponentTypeKHR)prop.BType) << " C: " << vk::to_string((vk::ComponentTypeKHR)prop.CType) << " Result: " << vk::to_string((vk::ComponentTypeKHR)prop.ResultType) << " saturatingAccumulation: " << prop.saturatingAccumulation << " scope: " << vk::to_string((vk::ScopeKHR)prop.scope));
@@ -4779,6 +4848,9 @@ vk_device ggml_vk_get_device(size_t idx) {
                         if (prop.MSize == 16 && prop.NSize == 16 && prop.KSize == 16) {
                             device->coopmat_support_16x16x16_f32acc = true;
                         }
+                        if (prop.MSize == 8 && prop.NSize == 16 && prop.KSize == 16) {
+                            device->coopmat_support_8x16x16_f32acc = true;
+                        }
                     } else if ((vk::ComponentTypeKHR)prop.CType == vk::ComponentTypeKHR::eFloat16 &&
                                (vk::ComponentTypeKHR)prop.ResultType == vk::ComponentTypeKHR::eFloat16) {
                         // coopmat sizes not set yet
@@ -4793,6 +4865,9 @@ vk_device ggml_vk_get_device(size_t idx) {
                         }
                         if (prop.MSize == 16 && prop.NSize == 16 && prop.KSize == 16) {
                             device->coopmat_support_16x16x16_f16acc = true;
+                        }
+                        if (prop.MSize == 8 && prop.NSize == 16 && prop.KSize == 16) {
+                            device->coopmat_support_8x16x16_f16acc = true;
                         }
                     }
                 } else if ((vk::ComponentTypeKHR)prop.AType      == vk::ComponentTypeKHR::eSint8 &&
@@ -8187,9 +8262,8 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     const uint32_t Br = params.block_rows;
     const uint32_t Bc = params.block_cols;
 
-    const uint32_t MatBr = 16, MatBc = 16;
-
-    const uint32_t row_split = Bc / MatBc;
+    const uint32_t MatBr = 16;
+    const uint32_t row_split = params.row_split;
 
     const uint32_t hsk_pad = ROUNDUP_POW2(hsk, 16);
     const uint32_t hsv_pad = ROUNDUP_POW2(hsv, 16);
@@ -8197,7 +8271,7 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     const uint32_t acctype = f32acc ? 4 : 2;
     const uint32_t f16vec4 = 8;
 
-    const uint32_t tmpsh = (Bc / MatBc) * sizeof(float);
+    const uint32_t tmpsh = row_split * sizeof(float);
     // DATA_A_IQ4_NL is compiled into the FA shaders unconditionally, so its shared table is always allocated.
     const uint32_t iq_shmem = 16 * sizeof(ggml_fp16_t);
 
@@ -8211,13 +8285,13 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     const uint32_t sfsh = Bc * sfshstride * acctype;
 
     const uint32_t kvshstride = (params.shmem_staging ? std::max(hsk_pad, hsv_pad) : MatBr) / 4 + 2;
-    const uint32_t vsh_stride = MatBc / 4 * row_split;
+    const uint32_t vsh_stride = 16 / 4 * row_split;
     const uint32_t ksh = ((kvshstride >= vsh_stride) ? (Bc * kvshstride) : (Bc * vsh_stride)) * f16vec4;
 
     // BF16 PVMat accumulator is f32 (no bf16 accumulator support), so pvsh is vec4 (16 bytes)
     const uint32_t pvsh_elem_size = (k_type == GGML_TYPE_BF16) ? 16u : f16vec4;
     const uint32_t osh_stride = params.row_split * MatBr / 4;
-    const uint32_t pvsh = MatBc * osh_stride * pvsh_elem_size;
+    const uint32_t pvsh = Br * osh_stride * pvsh_elem_size;
 
     const uint32_t slope = Br * acctype;
 
@@ -8449,6 +8523,19 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const uint32_t Br = fa_pipeline_state.Br;
     const uint32_t Bc = fa_pipeline_state.Bc;
 
+    // Target number of workgroups per shader core for split_k. With few rows (decode/verify) the
+    // grid is tiny and a long KV split into only ~2 workgroups per core leaves the GPU latency-bound
+    // (Arc B50: low-batch FA 2-3x faster with 16). Splits are kept >= fa_min_kv_per_split keys long,
+    // so short contexts keep the old split. Overrides: GGML_VK_FA_WG_PER_CORE, GGML_VK_FA_MIN_KV_SPLIT.
+    static const uint32_t fa_wg_per_core = [] {
+        const char * env = getenv("GGML_VK_FA_WG_PER_CORE");
+        return env ? (uint32_t) std::max(1, atoi(env)) : 16u;
+    }();
+    static const uint32_t fa_min_kv_per_split = [] {
+        const char * env = getenv("GGML_VK_FA_MIN_KV_SPLIT");
+        return env ? (uint32_t) std::max(1, atoi(env)) : 256u;
+    }();
+
     GGML_ASSERT(Br == pipeline->wg_denoms[0]);
     const uint32_t Tr = CEIL_DIV(N, Br);
 
@@ -8465,13 +8552,31 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         // Match the shader's per-split block count so no split is empty.
         const uint32_t per_blocks = CEIL_DIV(total_blocks, split_k);
         split_k = CEIL_DIV(total_blocks, per_blocks);
-    } else if (gqa_ratio > 1 && workgroups_x <= Br) {
-        split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
-    } else if (gqa_ratio <= 1) {
-        uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
-        if (total_wgs_no_split < shader_core_count * 2) {
-            split_k = shader_core_count * 2 / total_wgs_no_split;
+    } else {
+        uint32_t base_wgs = 0;
+        if (gqa_ratio > 1 && workgroups_x <= Br) {
+            base_wgs = workgroups_x * workgroups_y * workgroups_z;
+        } else if (gqa_ratio <= 1) {
+            base_wgs = Tr * workgroups_y * workgroups_z;
         }
+        if (base_wgs > 0) {
+            // previous behavior: ~2 workgroups per core
+            if (base_wgs < shader_core_count * 2) {
+                split_k = shader_core_count * 2 / base_wgs;
+            }
+            // more workgroups for long KV, but never splits shorter than fa_min_kv_per_split
+            if (base_wgs < shader_core_count * fa_wg_per_core) {
+                const uint32_t split_k_wide = std::min(shader_core_count * fa_wg_per_core / base_wgs, KV / fa_min_kv_per_split);
+                split_k = std::max(split_k, split_k_wide);
+            }
+        }
+    }
+
+    static const bool fa_debug = getenv("GGML_VK_FA_DEBUG") != nullptr;
+    if (fa_debug) {
+        fprintf(stderr, "ggml_vulkan: FA N=%u KV=%u gqa=%u K=%s V=%s path=%d Br=%u Bc=%u wg=(%u,%u,%u) split_k=%u dequant_kv=%d sparse=%d\n",
+                N, KV, gqa_ratio, ggml_type_name(k->type), ggml_type_name(v->type), (int) tuning_params.path, Br, Bc,
+                workgroups_x, workgroups_y, workgroups_z, split_k, (int) use_dequant_kv, (int) use_sparse);
     }
 
     if (!use_sparse && split_k > 1) {
@@ -14527,7 +14632,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         std::fill(ctx->query_nodes.begin(), ctx->query_nodes.end(), nullptr);
         std::fill(ctx->query_node_idx.begin(), ctx->query_node_idx.end(), 0);
 
-        GGML_ASSERT(ctx->compute_ctx.expired());
+        // compute_ctx may already hold async input uploads (set_tensor_async) recorded by the scheduler;
+        // the first timestamp is written after them, so they are not attributed to any node.
         compute_ctx = ggml_vk_get_compute_ctx(ctx);
         ctx->query_idx = 0;
         compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
@@ -16794,6 +16900,12 @@ std::string vk_perf_logger::get_node_fusion_name(const ggml_tensor * node, const
         uint64_t      size_N  = node->ne[3] * node->ne[0] * node->ne[1];
         name += " M=Cout=" + std::to_string(Cout) + ", K=Cin*KW*KH=" + std::to_string(size_K) +
                 ", N=N*OW*OH=" + std::to_string(size_N);
+        return fusion_str + name;
+    }
+    if (node->op == GGML_OP_GET_ROWS || node->op == GGML_OP_ARGSORT || node->op == GGML_OP_TOP_K) {
+        std::string name = ggml_op_name(node->op);
+        name += std::string(" ") + ggml_type_name(node->src[0]->type) + "(" + std::to_string(node->src[0]->ne[0]) + "," + std::to_string(node->src[0]->ne[1]) +
+                "," + std::to_string(node->src[0]->ne[2]) + ") -> (" + std::to_string(node->ne[0]) + "," + std::to_string(node->ne[1]) + "," + std::to_string(node->ne[2]) + ")";
         return fusion_str + name;
     }
     if (node->op == GGML_OP_RMS_NORM) {

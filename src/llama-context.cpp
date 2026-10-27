@@ -729,12 +729,37 @@ void llama_context::sched_new(size_t max_nodes, bool parallel) {
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 }
 
+std::string llama_context::sampling_signature() const {
+    std::string sig;
+    for (const auto & [seq_id, smpl] : sampling.samplers) {
+        sig += std::to_string(seq_id) + ':';
+        const int32_t n = llama_sampler_chain_n(smpl);
+        for (int32_t i = 0; i < n; ++i) {
+            sig += llama_sampler_name(llama_sampler_chain_get(smpl, i));
+            sig += ',';
+        }
+        sig += ';';
+    }
+    return sig;
+}
+
 void llama_context::sched_reserve() {
+    if (sampling_need_check) {
+        sampling_need_check = false;
+
+        // a new sampler with the same chain structure only needs a graph rebuild, which the
+        // graph reuse check already forces (it compares the sampler pointers)
+        if (sampling_signature() != sampling_sig_reserved) {
+            sched_need_reserve = true;
+        }
+    }
+
     if (!sched_need_reserve) {
         return;
     }
 
     sched_need_reserve = false;
+    sampling_sig_reserved = sampling_signature();
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
@@ -1432,7 +1457,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
             warned = true;
         }
         if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+            sampling_need_check = true;
         }
         sampling.samplers.erase(seq_id);
         return false;
@@ -1451,7 +1476,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampling.samplers[seq_id] = sampler;
 
-        sched_need_reserve = true;
+        sampling_need_check = true;
 
         return true;
     }
@@ -1460,7 +1485,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d, cannot be offloaded to the backend\n", __func__, llama_sampler_name(sampler), seq_id);
 
         if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+            sampling_need_check = true;
         }
 
         sampling.samplers.erase(seq_id);
@@ -1470,7 +1495,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     sampling.samplers.erase(seq_id);
 
-    sched_need_reserve = true;
+    sampling_need_check = true;
 
     return true;
 }

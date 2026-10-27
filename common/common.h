@@ -1283,6 +1283,15 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 //
 
 struct common_prompt_checkpoint {
+    common_prompt_checkpoint() = default;
+    common_prompt_checkpoint(const common_prompt_checkpoint &) = default;
+    common_prompt_checkpoint(common_prompt_checkpoint &&) = default;
+    common_prompt_checkpoint & operator=(const common_prompt_checkpoint &) = default;
+    common_prompt_checkpoint & operator=(common_prompt_checkpoint &&) = default;
+
+    // returns the data buffers to a small pool that update_tgt()/update_dft() reuse
+    ~common_prompt_checkpoint();
+
     int64_t n_tokens;
 
     // (optional) id of the task that created the checkpoint
