@@ -345,6 +345,16 @@ void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
         ctx->almost_ready_fence_pending = false;
     }
 
+    // Optional blocking wait: the default spin keeps latency low but pins one CPU
+    // core at 100% while the GPU works. GGML_VK_BLOCKING_SYNC trades that for a
+    // kernel wait (the CPU sleeps). Expect no throughput change on discrete GPUs.
+    static const bool blocking_sync = getenv("GGML_VK_BLOCKING_SYNC") != nullptr;
+    if (blocking_sync) {
+        VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX), "fence", ctx->device);
+        ctx->device->device.resetFences({ ctx->fence });
+        return;
+    }
+
     // Spin (w/pause) waiting for the graph to finish executing.
     vk::Result result;
     for (;;) {
@@ -769,7 +779,7 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
 #endif
 
     try {
-        pipeline->pipeline = device->device.createComputePipeline(VK_NULL_HANDLE, compute_pipeline_create_info).value;
+        pipeline->pipeline = device->device.createComputePipeline(device->pipeline_cache, compute_pipeline_create_info).value;
     } catch (const vk::SystemError& e) {
         std::cerr << "ggml_vulkan: compute pipeline creation failed for " << pipeline->name << ": " << e.what() << std::endl;
         throw;
@@ -2878,6 +2888,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         rm_stdq = 2;
         rm_stdq_int = 2;
     }
+    // Experimental: override the number of K rows processed per shader for k-quants and IQ types.
+    if (const char * env = getenv("GGML_VK_RM_KQ")) {
+        const int val = atoi(env);
+        if (val >= 1 && val <= 4) {
+            rm_kq = (uint32_t) val;
+            // note: GGML_LOG_INFO is not visible in the server log at shader-load time
+            fprintf(stderr, "%s: rm_kq overridden to %d via GGML_VK_RM_KQ\n", __func__, val);
+        } else {
+            GGML_LOG_WARN("%s: invalid GGML_VK_RM_KQ value '%s' (expected 1..4), ignoring\n", __func__, env);
+        }
+    }
     // RDNA3/4: above four columns, static 4 rows for all types bench faster than the default
     const bool is_rdna3_or_4 = device->vendor_id == VK_VENDOR_ID_AMD && (device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA4);
     auto const &rm_int_n = [&](uint32_t rows, uint32_t i) { return (is_rdna3_or_4 && i >= 4) ? 4u : rows; };
@@ -2889,6 +2910,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
         return is_rdna3_or_4 ? 4u : rows;
     };
+    // Experimental (GGML_VK_KQ_BATCH_RM=N): rows per shader for the fp K-quant mat-vec with 2+ columns.
+    // Each workgroup re-reads B per column, so more rows per workgroup cut the B traffic of small batches.
+    // q6_K is capped at 4 rows, more rows regress it (register pressure).
+    auto const &rm_kq_n = [&](uint32_t i, uint32_t max_rows = 8) { return (device->kq_batch_rm > 0 && i >= 1) ? std::min(device->kq_batch_rm, max_rows) : rm_kq; };
     uint32_t rm_iq = 2 * rm_kq;
 
     const bool use_subgroups = device->subgroup_arithmetic;
@@ -2940,9 +2965,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q8_0][i], "mul_mat_vec_q8_0_f32_f32", arr_dmmv_q8_0_f32_f32_len[reduc], arr_dmmv_q8_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq, 1, 1}, {wg_size_subgroup, 1*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q2_K][i], "mul_mat_vec_q2_k_f32_f32", arr_dmmv_q2_k_f32_f32_len[reduc16], arr_dmmv_q2_k_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q3_K][i], "mul_mat_vec_q3_k_f32_f32", arr_dmmv_q3_k_f32_f32_len[reduc16], arr_dmmv_q3_k_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_f32_f32", arr_dmmv_q4_k_f32_f32_len[reduc16], arr_dmmv_q4_k_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q5_K][i], "mul_mat_vec_q5_k_f32_f32", arr_dmmv_q5_k_f32_f32_len[reduc16], arr_dmmv_q5_k_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q6_K][i], "mul_mat_vec_q6_k_f32_f32", arr_dmmv_q6_k_f32_f32_len[reduc16], arr_dmmv_q6_k_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_f32_f32", arr_dmmv_q4_k_f32_f32_len[reduc16], arr_dmmv_q4_k_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq_n(i), 1, 1}, {wg_size_subgroup16, rm_kq_n(i), i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q5_K][i], "mul_mat_vec_q5_k_f32_f32", arr_dmmv_q5_k_f32_f32_len[reduc16], arr_dmmv_q5_k_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq_n(i), 1, 1}, {wg_size_subgroup16, rm_kq_n(i), i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q6_K][i], "mul_mat_vec_q6_k_f32_f32", arr_dmmv_q6_k_f32_f32_len[reduc16], arr_dmmv_q6_k_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq_n(i, 4), 1, 1}, {wg_size_subgroup16, rm_kq_n(i, 4), i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_TQ1_0][i], "mul_mat_vec_tq1_0_f32_f32", arr_dmmv_tq1_0_f32_f32_len[reduc16], arr_dmmv_tq1_0_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_TQ2_0][i], "mul_mat_vec_tq2_0_f32_f32", arr_dmmv_tq2_0_f32_f32_len[reduc16], arr_dmmv_tq2_0_f32_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_IQ1_S][i],   "mul_mat_vec_iq1_s_f32_f32",   arr_dmmv_iq1_s_f32_f32_len[reduc16],   arr_dmmv_iq1_s_f32_f32_data[reduc16],   "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
@@ -2969,9 +2994,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q8_0][i], "mul_mat_vec_q8_0_f16_f32", arr_dmmv_q8_0_f16_f32_len[reduc], arr_dmmv_q8_0_f16_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq, 1, 1}, {wg_size_subgroup, 1*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q2_K][i], "mul_mat_vec_q2_k_f16_f32", arr_dmmv_q2_k_f16_f32_len[reduc16], arr_dmmv_q2_k_f16_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q3_K][i], "mul_mat_vec_q3_k_f16_f32", arr_dmmv_q3_k_f16_f32_len[reduc16], arr_dmmv_q3_k_f16_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_f16_f32", arr_dmmv_q4_k_f16_f32_len[reduc16], arr_dmmv_q4_k_f16_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q5_K][i], "mul_mat_vec_q5_k_f16_f32", arr_dmmv_q5_k_f16_f32_len[reduc16], arr_dmmv_q5_k_f16_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
-            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q6_K][i], "mul_mat_vec_q6_k_f16_f32", arr_dmmv_q6_k_f16_f32_len[reduc16], arr_dmmv_q6_k_f16_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_f16_f32", arr_dmmv_q4_k_f16_f32_len[reduc16], arr_dmmv_q4_k_f16_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq_n(i), 1, 1}, {wg_size_subgroup16, rm_kq_n(i), i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q5_K][i], "mul_mat_vec_q5_k_f16_f32", arr_dmmv_q5_k_f16_f32_len[reduc16], arr_dmmv_q5_k_f16_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq_n(i), 1, 1}, {wg_size_subgroup16, rm_kq_n(i), i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+            ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q6_K][i], "mul_mat_vec_q6_k_f16_f32", arr_dmmv_q6_k_f16_f32_len[reduc16], arr_dmmv_q6_k_f16_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq_n(i, 4), 1, 1}, {wg_size_subgroup16, rm_kq_n(i, 4), i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_TQ1_0][i], "mul_mat_vec_tq1_0_f16_f32", arr_dmmv_tq1_0_f16_f32_len[reduc16], arr_dmmv_tq1_0_f16_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_TQ2_0][i], "mul_mat_vec_tq2_0_f16_f32", arr_dmmv_tq2_0_f16_f32_len[reduc16], arr_dmmv_tq2_0_f16_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_IQ1_S][i],   "mul_mat_vec_iq1_s_f16_f32",   arr_dmmv_iq1_s_f16_f32_len[reduc16],   arr_dmmv_iq1_s_f16_f32_data[reduc16],   "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_iq, 1, 1}, {wg_size_subgroup16, rm_iq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
@@ -4013,6 +4038,30 @@ static bool ggml_vk_host_buffer_import_usable(uint32_t vendor_id) {
     return vendor_id != VK_VENDOR_ID_AMD;
 }
 
+// devices with a persistent pipeline cache, saved from an exit handler
+static std::vector<vk_device> g_vk_pipeline_cache_devices;
+
+static void ggml_vk_save_pipeline_caches() {
+    for (auto & device : g_vk_pipeline_cache_devices) {
+        if (device->pipeline_cache == VK_NULL_HANDLE || device->pipeline_cache_path.empty()) {
+            continue;
+        }
+        size_t sz = 0;
+        if (vkGetPipelineCacheData(device->device, device->pipeline_cache, &sz, nullptr) != VK_SUCCESS || sz == 0) {
+            continue;
+        }
+        std::vector<char> data(sz);
+        if (vkGetPipelineCacheData(device->device, device->pipeline_cache, &sz, data.data()) != VK_SUCCESS) {
+            continue;
+        }
+        if (FILE * f = fopen(device->pipeline_cache_path.c_str(), "wb")) {
+            fwrite(data.data(), 1, sz, f);
+            fclose(f);
+            fprintf(stderr, "ggml_vulkan: pipeline cache saved: %s (%zu bytes)\n", device->pipeline_cache_path.c_str(), sz);
+        }
+    }
+}
+
 vk_device ggml_vk_get_device(size_t idx) {
     VK_LOG_DEBUG("ggml_vk_get_device(" << idx << ")");
 
@@ -4289,6 +4338,16 @@ vk_device ggml_vk_get_device(size_t idx) {
         if (GGML_VK_MAX_NODES_PER_SUBMIT != nullptr) {
             uint32_t max_nodes_per_submit = std::stoul(GGML_VK_MAX_NODES_PER_SUBMIT);
             device->max_nodes_per_submit = std::max(max_nodes_per_submit, 1u);
+        }
+
+        // Split the graph into at most this many submissions by flops. Large values submit more
+        // often, which overlaps the CPU command buffer generation with the GPU. Small decode
+        // graphs are dominated by the per-submission overhead, so allow lowering it.
+        device->flops_per_submit_div = 40;
+        const char* GGML_VK_FLOPS_PER_SUBMIT_DIV = getenv("GGML_VK_FLOPS_PER_SUBMIT_DIV");
+        if (GGML_VK_FLOPS_PER_SUBMIT_DIV != nullptr) {
+            uint32_t flops_per_submit_div = std::stoul(GGML_VK_FLOPS_PER_SUBMIT_DIV);
+            device->flops_per_submit_div = std::max(flops_per_submit_div, 1u);
         }
 
         const bool force_disable_f16 = getenv("GGML_VK_DISABLE_F16") != nullptr;
@@ -4895,6 +4954,17 @@ vk_device ggml_vk_get_device(size_t idx) {
         descriptor_set_layout_create_info.setPNext(&dslbfci);
         device->dsl = device->device.createDescriptorSetLayout(descriptor_set_layout_create_info);
 
+        device->kq_batch_rm = 0;
+        if (const char * env = getenv("GGML_VK_KQ_BATCH_RM")) {
+            const int val = atoi(env);
+            if (val >= 1 && val <= 8) {
+                device->kq_batch_rm = (uint32_t) val;
+                fprintf(stderr, "ggml_vulkan: K-quant mat-vec batch rows = %d via GGML_VK_KQ_BATCH_RM\n", val);
+            } else {
+                GGML_LOG_WARN("ggml_vulkan: invalid GGML_VK_KQ_BATCH_RM value '%s' (expected 1..8), ignoring\n", env);
+            }
+        }
+
         ggml_vk_load_shaders(device);
 
         // Prefer a dedicated transfer queue on AMD dGPUs (non-GCN) when graphics queue use is disabled.
@@ -4942,6 +5012,41 @@ vk_device ggml_vk_get_device(size_t idx) {
             device->mmvq_mode = -1;
         } else if (getenv("GGML_VK_FORCE_MMVQ")) {
             device->mmvq_mode = 1;
+        }
+
+        // Optional persistent pipeline cache: pipeline creation (SPIR-V -> machine code)
+        // dominates the first graph build after startup, the driver can reuse the blob.
+        if (const char * env = getenv("GGML_VK_PIPELINE_CACHE")) {
+            if (env[0] != '\0') {
+                device->pipeline_cache_path = env;
+                std::vector<char> initial;
+                if (FILE * f = fopen(env, "rb")) {
+                    if (fseek(f, 0, SEEK_END) == 0) {
+                        const long sz = ftell(f);
+                        if (sz > 0 && fseek(f, 0, SEEK_SET) == 0) {
+                            initial.resize((size_t) sz);
+                            if (fread(initial.data(), 1, initial.size(), f) != initial.size()) {
+                                initial.clear();
+                            }
+                        }
+                    }
+                    fclose(f);
+                }
+                VkPipelineCacheCreateInfo ci{ VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
+                ci.initialDataSize = initial.size();
+                ci.pInitialData    = initial.empty() ? nullptr : initial.data();
+                if (vkCreatePipelineCache(device->device, &ci, nullptr, &device->pipeline_cache) != VK_SUCCESS) {
+                    device->pipeline_cache = VK_NULL_HANDLE;
+                    fprintf(stderr, "ggml_vulkan: pipeline cache creation failed (ignored)\n");
+                } else {
+                    fprintf(stderr, "ggml_vulkan: pipeline cache enabled: %s (%zu bytes initial)\n", env, initial.size());
+                    // the device object is kept alive by the static device registry, so the
+                    // destructor may never run; save the cache from an exit handler instead
+                    g_vk_pipeline_cache_devices.push_back(device);
+                    static std::once_flag atexit_once;
+                    std::call_once(atexit_once, []() { std::atexit(ggml_vk_save_pipeline_caches); });
+                }
+            }
         }
 
         // publish the device only when it is fully built
@@ -6664,6 +6769,11 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
     // using MMVQ is only a win on Intel.
     bool mmvq_q6 = device->vendor_id == VK_VENDOR_ID_INTEL;
     if (src0_type == GGML_TYPE_Q6_K && !mmvq_q6) {
+        return false;
+    }
+
+    // Experimental: with GGML_VK_KQ_BATCH_RM the fp K-quant shader with more rows is faster for small batches
+    if (device->kq_batch_rm > 0 && n > 1 && (src0_type == GGML_TYPE_Q4_K || src0_type == GGML_TYPE_Q5_K)) {
         return false;
     }
 
@@ -14454,7 +14564,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             flops_cap = 2'000'000'000ULL * ctx->device->shader_core_count;
         }
     }
-    uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / 40u);
+    uint64_t flops_per_submit = std::min(flops_cap, ctx->last_total_flops / ctx->device->flops_per_submit_div);
 
     auto const submit_after = [&](int start, int end) {
         if (ctx->device->serialize_submissions) {
@@ -16590,6 +16700,11 @@ vk_device_struct::~vk_device_struct() {
         ggml_vk_destroy_pipeline(device, pl);
     }
     all_pipelines.clear();
+
+    if (pipeline_cache != VK_NULL_HANDLE) {
+        vkDestroyPipelineCache(device, pipeline_cache, nullptr);
+        pipeline_cache = VK_NULL_HANDLE;
+    }
 
     device.destroyDescriptorSetLayout(dsl);
 

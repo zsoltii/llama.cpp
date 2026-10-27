@@ -444,4 +444,20 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // LLAMA_GRAPH_TIMING: per-context aggregates keyed by (n_tokens, n_outputs), flushed every 64 graphs
+    struct graph_timing_stats {
+        int64_t n        = 0;
+        int64_t n_built  = 0;
+        int64_t t_build  = 0;
+        int64_t t_inputs = 0;
+        int64_t t_submit = 0;
+    };
+    std::map<std::pair<int32_t, int32_t>, graph_timing_stats> gt_stats;
+    enum { GT_DEC_RESERVE, GT_DEC_MEM_UPDATE, GT_DEC_INIT_BATCH, GT_DEC_OUT_RESERVE, GT_DEC_UBATCH, GT_DEC_EXTRACT, GT_DEC_TOTAL, GT_DEC_APPLY, GT_DEC_COUNT };
+    int64_t gt_dec[GT_DEC_COUNT] = {};
+    int64_t gt_n_dec   = 0;
+    int64_t gt_n_graph = 0;
+    int64_t gt_n_sync  = 0;
+    int64_t gt_t_sync  = 0;
 };

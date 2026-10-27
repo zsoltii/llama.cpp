@@ -392,6 +392,12 @@ static ggml_cuda_device_info ggml_cuda_init() {
             CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleSpin));
         }
 
+        // Experimental: use the blocking schedule instead of the default spin schedule.
+        if (getenv("GGML_CUDA_BLOCKING_SYNC") != nullptr) {
+            CUDA_CHECK(cudaSetDevice(physical_id));
+            CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
+        }
+
 #endif  // defined(GGML_USE_HIP)
     }
 

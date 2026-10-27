@@ -1524,6 +1524,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // LLAMA_MTP_DEFER_CATCHUP: instead of a separate catch-up decode after each target batch, keep the
+    // (token, pos, h) rows and decode them together with the first draft step, after the rejected
+    // drafts were dropped in accept(). Saves one ctx_dft decode per speculative step.
+    struct catchup_row {
+        llama_token        id;
+        llama_pos          pos;
+        std::vector<float> h;
+    };
+    bool defer_catchup = false;
+    std::vector<std::vector<catchup_row>> catchup;      // [n_seq]
+    std::vector<llama_pos>                catchup_pos0; // first pos of the latest deferred batch, per seq
+
+    // drop deferred rows at or after pos (stale after a rollback or a re-evaluation)
+    void catchup_drop_from(llama_seq_id seq_id, llama_pos pos) {
+        auto & rows = catchup[seq_id];
+        while (!rows.empty() && rows.back().pos >= pos) {
+            rows.pop_back();
+        }
+    }
+
+    // add the deferred rows of a sequence to the draft batch, without outputs
+    void catchup_add(llama_seq_id seq_id) {
+        for (const auto & r : catchup[seq_id]) {
+            const int32_t idx = batch.add(r.id, r.pos, seq_id, false);
+            batch.set_embd_state(idx, { r.h.data(), 1, (size_t) n_embd });
+        }
+    }
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1598,6 +1626,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+
+        defer_catchup = getenv("LLAMA_MTP_DEFER_CATCHUP") != nullptr && !is_mem_shared && !chain_heads;
+        if (defer_catchup) {
+            SPC_INF("%s", "deferring the catch-up decode into the first draft step (LLAMA_MTP_DEFER_CATCHUP)\n");
+        }
+        catchup.assign(n_seq, {});
+        catchup_pos0.assign(n_seq, -1);
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1617,6 +1652,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
+
+        catchup[seq_id].clear();
+        catchup_pos0[seq_id] = -1;
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1678,52 +1716,93 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // TODO:this is generally true, but would be nice to assert it
             const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
 
-            for (int k = 0; k < n_tokens; ++k) {
-                const auto & t = batch_in.tokens[k];
-
-                const llama_seq_id seq_id = t.seq_id;
-
-                // vision tokens carry an embedding instead of an id
-                const int32_t idx = t.id != LLAMA_TOKEN_NULL
-                    ? batch.add(t.id, t.pos[0], seq_id, false)
-                    : batch.add_embd(t.embd, t.pos.data(), seq_id, false);
-
-                const float * h_row = k == i_batch_beg[seq_id]
-                    ? pending_h[seq_id].data()
-                    : h_tgt + (size_t) (k - 1) * n_embd;
-
-                batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
+            // small batches (target verification) are deferred to the next draft step
+            bool defer = defer_catchup && n_tokens <= this->params.n_max + 1;
+            for (int k = 0; k < n_tokens && defer; ++k) {
+                defer = batch_in.tokens[k].id != LLAMA_TOKEN_NULL;
             }
 
-            auto * mem_dft = llama_get_memory(ctx_dft);
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_beg[seq_id] >= 0) {
+                    catchup_drop_from(seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0]);
+                }
+            }
 
-            bool ok = true;
-            for (int head = 0; head < n_mtp_layers; ++head) {
-                if (chain_heads) {
-                    // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
-                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                        if (i_batch_beg[seq_id] < 0) {
-                            continue;
-                        }
-                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0], -1);
+            if (defer) {
+                for (int k = 0; k < n_tokens; ++k) {
+                    const auto & t = batch_in.tokens[k];
+
+                    const llama_seq_id seq_id = t.seq_id;
+
+                    const float * h_row = k == i_batch_beg[seq_id]
+                        ? pending_h[seq_id].data()
+                        : h_tgt + (size_t) (k - 1) * n_embd;
+
+                    if (k == i_batch_beg[seq_id]) {
+                        catchup_pos0[seq_id] = t.pos[0];
                     }
-                    llama_set_nextn_layer_offset(ctx_dft, head);
+                    catchup[seq_id].push_back({ t.id, t.pos[0], std::vector<float>(h_row, h_row + n_embd) });
+                }
+            } else {
+
+                // flush rows deferred earlier, they precede the positions of this batch
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    catchup_add(seq_id);
                 }
 
-                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-                if (rc != 0) {
-                    SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
-                            head, (int) rc, (int) batch_in.tokens[0].pos[0]);
-                    ok = false;
-                    break;
-                }
-            }
+                for (int k = 0; k < n_tokens; ++k) {
+                    const auto & t = batch_in.tokens[k];
 
-            if (chain_heads) {
-                llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
-            }
-            if (!ok) {
-                return false;
+                    const llama_seq_id seq_id = t.seq_id;
+
+                    // vision tokens carry an embedding instead of an id
+                    const int32_t idx = t.id != LLAMA_TOKEN_NULL
+                        ? batch.add(t.id, t.pos[0], seq_id, false)
+                        : batch.add_embd(t.embd, t.pos.data(), seq_id, false);
+
+                    const float * h_row = k == i_batch_beg[seq_id]
+                        ? pending_h[seq_id].data()
+                        : h_tgt + (size_t) (k - 1) * n_embd;
+
+                    batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
+                }
+
+                auto * mem_dft = llama_get_memory(ctx_dft);
+
+                bool ok = true;
+                for (int head = 0; head < n_mtp_layers; ++head) {
+                    if (chain_heads) {
+                        // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
+                        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                            if (i_batch_beg[seq_id] < 0) {
+                                continue;
+                            }
+                            llama_memory_seq_rm(mem_dft, seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0], -1);
+                        }
+                        llama_set_nextn_layer_offset(ctx_dft, head);
+                    }
+
+                    const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                    if (rc != 0) {
+                        SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
+                                head, (int) rc, (int) batch_in.tokens[0].pos[0]);
+                        ok = false;
+                        break;
+                    }
+                }
+
+                if (chain_heads) {
+                    llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+                }
+
+                for (auto & rows : catchup) {
+                    rows.clear();
+                }
+
+                if (!ok) {
+                    return false;
+                }
+
             }
         }
 
@@ -1781,6 +1860,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 common_sampler_reset(smpls[seq_id].get());
             }
 
+            if (defer_catchup) {
+                catchup_drop_from(seq_id, dp.pos0);
+                catchup_add(seq_id);
+            }
+
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
             batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
 
@@ -1811,6 +1895,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+
+            // the deferred rows of the drafting sequences were part of the first step
+            if (i == 0 && defer_catchup) {
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (drafting[seq_id]) {
+                        catchup[seq_id].clear();
+                    }
+                }
+            }
+
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
                 break;
@@ -1927,6 +2021,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+
+        // the rejected drafts never reach the draft KV
+        if (defer_catchup && catchup_pos0[seq_id] >= 0) {
+            catchup_drop_from(seq_id, catchup_pos0[seq_id] + i_h + 1);
+        }
     }
 };
 

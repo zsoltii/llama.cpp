@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 // ggml_compute_forward_dup
 
@@ -9462,7 +9464,26 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool use_ref = params->use_ref;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    // Experimental: allow the chunked split-KV path (batch 1) for quantized K/V as well.
+    // The chunk function is type-generic (vec_dot for K, to_float for V), so only the
+    // work decomposition changes. Default off; measurement notes in results.md (round 23).
+    static const bool split_quant = []() {
+        const bool on = getenv("GGML_CPU_FA_SPLIT_QUANT") != nullptr;
+        if (on) {
+            fprintf(stderr, "GGML_CPU_FA_SPLIT_QUANT: split-KV path enabled for quantized K/V\n");
+        }
+        return on;
+    }();
+    const bool kv_split_ok = kv_is_f32_or_f16 || split_quant;
+    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_split_ok && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    if (use_split_kv_path && split_quant) {
+        static bool warned = false;
+        if (!warned) {
+            fprintf(stderr, "GGML_CPU_FA_SPLIT_QUANT: split-KV path taken (K=%s, V=%s, n_kv=%lld)\n",
+                    ggml_type_name(k->type), ggml_type_name(v->type), (long long) nek1);
+            warned = true;
+        }
+    }
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;

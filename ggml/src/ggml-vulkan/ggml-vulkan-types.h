@@ -684,6 +684,9 @@ struct vk_device_struct {
     bool pipeline_robustness;
     bool memory_priority;
     vk::Device device;
+    // optional persistent pipeline cache (GGML_VK_PIPELINE_CACHE=<path>)
+    VkPipelineCache pipeline_cache = VK_NULL_HANDLE;
+    std::string pipeline_cache_path;
     uint32_t vendor_id;
     vk::DriverId driver_id;
     vk_device_architecture architecture;
@@ -714,12 +717,16 @@ struct vk_device_struct {
     bool add_rms_fusion;
     uint32_t partials_binding_alignment;
     uint32_t max_nodes_per_submit;
+    // the graph is split into at most this many submissions by flops (see ggml_vk_graph_compute)
+    uint32_t flops_per_submit_div;
 
     bool shader_64b_indexing;
 
     bool integer_dot_product;
     // 0: default, 1: force mmvq, -1: disable mmvq
     int32_t mmvq_mode;
+    // rows per shader for the fp K-quant mat-vec with 2+ columns (GGML_VK_KQ_BATCH_RM), 0 = default
+    uint32_t kq_batch_rm;
 
     bool subgroup_size_control;
     uint32_t subgroup_min_size;

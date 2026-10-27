@@ -2,6 +2,8 @@
 #include "dequantize.cuh"
 
 #include <cstdint>
+#include <cstdlib>
+#include <type_traits>
 
 #define CUDA_Q8_0_NE_ALIGN 2048
 
@@ -133,6 +135,48 @@ static __global__ void dequantize_block_q4_1(const void * __restrict__ vx, dst_t
     for (int l = 0; l < 4; ++l) {
         y[l+ 0] = ggml_cuda_cast<dst_t>(d.x * (q[l] & 0xF) + d.y);
         y[l+16] = ggml_cuda_cast<dst_t>(d.x * (q[l] >>  4) + d.y);
+    }
+}
+
+// experimental: same as dequantize_block_q4_1 but with one 32-bit load and 8-byte stores per chunk (see GGML_CUDA_CONV_FAST)
+template<typename dst_t>
+static __global__ void dequantize_block_q4_1_v2(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb32) {
+
+    const int64_t i = blockIdx.x;
+
+    // assume 32 threads
+    const int64_t tid = threadIdx.x;
+    const int64_t il  = tid/8;
+    const int64_t ir  = tid%8;
+    const int64_t ib = 8*i + ir;
+    if (ib >= nb32) {
+        return;
+    }
+
+    dst_t * y = yy + 256*i + 32*ir + 4*il;
+
+    const block_q4_1 * x = (const block_q4_1 *)vx + ib;
+    const float2 d = __half22float2(x->dm);
+
+    const uint32_t qw = *(const uint32_t *) (x->qs + 4*il);
+
+    if constexpr (std::is_same_v<dst_t, half>) {
+        const uint32_t lo = qw;
+        const uint32_t hi = qw >> 4;
+
+        const half2 l01 = __floats2half2_rn(d.x * ( lo        & 0xF) + d.y, d.x * ((lo >>  8) & 0xF) + d.y);
+        const half2 l23 = __floats2half2_rn(d.x * ((lo >> 16) & 0xF) + d.y, d.x * ((lo >> 24) & 0xF) + d.y);
+        const half2 h01 = __floats2half2_rn(d.x * ( hi        & 0xF) + d.y, d.x * ((hi >>  8) & 0xF) + d.y);
+        const half2 h23 = __floats2half2_rn(d.x * ((hi >> 16) & 0xF) + d.y, d.x * ((hi >> 24) & 0xF) + d.y);
+
+        uint2 v;
+        v.x = *(const uint32_t *) &l01; v.y = *(const uint32_t *) &l23; *(uint2 *) (y     ) = v;
+        v.x = *(const uint32_t *) &h01; v.y = *(const uint32_t *) &h23; *(uint2 *) (y + 16) = v;
+    } else {
+        for (int l = 0; l < 4; ++l) {
+            y[l+ 0] = ggml_cuda_cast<dst_t>(d.x * ((qw >> (8*l    )) & 0xF) + d.y);
+            y[l+16] = ggml_cuda_cast<dst_t>(d.x * ((qw >> (8*l + 4)) & 0xF) + d.y);
+        }
     }
 }
 
@@ -298,7 +342,18 @@ template<typename dst_t>
 static void dequantize_row_q4_1_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb32 = k / 32;
     const int nb = (k + 255) / 256;
-    dequantize_block_q4_1<<<nb, 32, 0, stream>>>(vx, y, nb32);
+    static const bool use_v2 = []() {
+        const bool legacy = getenv("GGML_CUDA_CONV_LEGACY") != nullptr;
+        if (legacy) {
+            GGML_LOG_WARN("dequantize_row_q4_1_cuda: using the legacy (unvectorized) kernel\n");
+        }
+        return !legacy;
+    }();
+    if (use_v2) {
+        dequantize_block_q4_1_v2<<<nb, 32, 0, stream>>>(vx, y, nb32);
+    } else {
+        dequantize_block_q4_1<<<nb, 32, 0, stream>>>(vx, y, nb32);
+    }
 }
 
 template<typename dst_t>

@@ -537,7 +537,7 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     }
 }
 
-static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_auto(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
     return BEST_FATTN_KERNEL_NONE;
@@ -716,6 +716,51 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
     }
     return BEST_FATTN_KERNEL_TILE;
+}
+
+// Experimental: force a specific FlashAttention kernel family via GGML_CUDA_FA_FORCE_KERNEL=vec|tile|mma.
+// An optional ":N" suffix (e.g. vec:4) applies the override only for batches with Q->ne[1] <= N.
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+#ifdef FLASH_ATTN_AVAILABLE
+    static const std::pair<best_fattn_kernel, int64_t> forced = []() {
+        std::pair<best_fattn_kernel, int64_t> res = { BEST_FATTN_KERNEL_NONE, INT64_MAX };
+        const char * env = getenv("GGML_CUDA_FA_FORCE_KERNEL");
+        if (env == nullptr || env[0] == '\0') {
+            return res;
+        }
+        std::string val(env);
+        const size_t pos = val.find(':');
+        if (pos != std::string::npos) {
+            res.second = std::stoll(val.substr(pos + 1));
+            val = val.substr(0, pos);
+        }
+        if (val == "vec") {
+            res.first = BEST_FATTN_KERNEL_VEC;
+        } else if (val == "tile") {
+            res.first = BEST_FATTN_KERNEL_TILE;
+        } else if (val == "mma") {
+            res.first = BEST_FATTN_KERNEL_MMA_F16;
+        } else {
+            GGML_LOG_WARN("GGML_CUDA_FA_FORCE_KERNEL: unknown value '%s' (expected vec|tile|mma[:max_batch]), using the default\n", env);
+            return res;
+        }
+        // note: the first call happens during model load, where GGML_LOG_* messages are dropped
+        fprintf(stderr, "GGML_CUDA_FA_FORCE_KERNEL: forcing '%s' for Q->ne[1] <= %lld\n", val.c_str(), (long long) res.second);
+        return res;
+    }();
+    if (forced.first != BEST_FATTN_KERNEL_NONE && dst->src[0]->ne[1] <= forced.second) {
+        if (forced.first == BEST_FATTN_KERNEL_VEC) {
+            // same applicability check as the auto dispatcher, to avoid an invalid launch
+            const ggml_tensor * Q = dst->src[0];
+            const ggml_tensor * K = dst->src[1];
+            if (!(Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0)) {
+                return ggml_cuda_get_best_fattn_kernel_auto(device, dst);
+            }
+        }
+        return forced.first;
+    }
+#endif // FLASH_ATTN_AVAILABLE
+    return ggml_cuda_get_best_fattn_kernel_auto(device, dst);
 }
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {

@@ -319,6 +319,30 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
     }
+    // Experimental: return false to route every quantized mul_mat through MMQ instead of MMVQ.
+    static const bool disable_mmvq = getenv("GGML_CUDA_DISABLE_MMVQ") != nullptr;
+    if (disable_mmvq) {
+        static bool warned = false;
+        if (!warned) {
+            GGML_LOG_INFO("%s: disabling MMVQ via GGML_CUDA_DISABLE_MMVQ\n", __func__);
+            warned = true;
+        }
+        return false;
+    }
+    // Experimental: route batches >= N through MMQ (tensor cores), keep MMVQ below N.
+    // Targets the MTP verify batch (ne11 = 1 + n_max = 3) without touching batch-1 decodes.
+    static const int64_t mmq_min_batch = []() {
+        const char * env = getenv("GGML_CUDA_MMQ_MIN_BATCH");
+        return env ? (int64_t) atoll(env) : (int64_t) 0;
+    }();
+    if (mmq_min_batch > 0 && ne11 >= mmq_min_batch) {
+        static bool warned = false;
+        if (!warned) {
+            GGML_LOG_WARN("%s: routing ne11 >= %lld through MMQ via GGML_CUDA_MMQ_MIN_BATCH\n", __func__, (long long) mmq_min_batch);
+            warned = true;
+        }
+        return false;
+    }
     // k-quants cost more to decode and mvq redoes that per column, so MMQ wins sooner.
     // Only list quant-types MMQ supports, others would fall back to cuBLAS.
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_ADA_LOVELACE) {
@@ -535,7 +559,11 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 case GGML_TYPE_Q4_K:
                 case GGML_TYPE_Q5_K:
                 case GGML_TYPE_Q6_K:
+#ifdef GGML_CUDA_MMVQ_TURING_KQ_NWARPS4
+                    return 4;
+#else
                     return 2;
+#endif
                 default:
                     return 4;
             }
@@ -592,6 +620,10 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
     }
 }
 
+#ifndef GGML_CUDA_MMVQ_TURING_RPB_SMALL
+#define GGML_CUDA_MMVQ_TURING_RPB_SMALL 4
+#endif
+
 static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
@@ -606,6 +638,12 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
             case 2:
             case 3:
             case 4:
+                // Turing: more rows per block re-read y less often for small batches (MTP verify),
+                // -17..-22% for K-quants at ncols_dst = 3; -DGGML_CUDA_MMVQ_TURING_RPB_SMALL=2 restores the old value
+                if (table_id == MMVQ_PARAMETERS_TURING) {
+                    return GGML_CUDA_MMVQ_TURING_RPB_SMALL;
+                }
+                return 2;
             case 5:
             case 6:
             case 7:

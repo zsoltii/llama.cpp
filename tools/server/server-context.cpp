@@ -762,6 +762,12 @@ struct server_slot {
                 "   graphs reused = %10d\n",
                 llama_perf_context(ctx_tgt).n_reused);
 
+        if (ctx_dft) {
+            SLT_INF(*this,
+                    "   graphs reused = %10d    (draft ctx)\n",
+                    llama_perf_context(ctx_dft).n_reused);
+        }
+
         SLT_INF(*this,
                 "  graph reallocs = %10d    / %5d        (same size) / (changed size)\n",
                 llama_perf_context(ctx_tgt).n_reallocs_same, llama_perf_context(ctx_tgt).n_reallocs_diff);
@@ -3384,6 +3390,37 @@ private:
     int64_t n_decode      = 0;
     int64_t n_post_decode = 0;
     int64_t n_sampl       = 0;
+
+    // LLAMA_SERVER_TIMING: per-step breakdown of update_slots(), averaged and printed every 64 steps
+    //   *_work = time spent inside the yielded work, the rest of the phase is the yield handoff
+    enum { ST_GAP, ST_PRE, ST_DRAFT, ST_DRAFT_WORK, ST_TGT, ST_TGT_WORK, ST_SPEC, ST_SPEC_WORK, ST_POST, ST_ACCEPT, ST_STEP, ST_COUNT };
+    static constexpr const char * st_names[ST_COUNT] = {
+        "gap", "pre_decode", "draft", "draft_work", "tgt_decode", "tgt_work", "spec_process", "spec_work", "post_decode", "accept", "step",
+    };
+    const bool st_enabled = getenv("LLAMA_SERVER_TIMING") != nullptr;
+    int64_t st_t[ST_COUNT] = {};
+    int64_t st_n     = 0;
+    int64_t st_t_end = 0;
+
+    int64_t st_now() const { return st_enabled ? ggml_time_us() : 0; }
+    void st_add(int id, int64_t t0) { if (st_enabled) { st_t[id] += ggml_time_us() - t0; } }
+
+    void st_step_end(int64_t t0) {
+        if (!st_enabled) {
+            return;
+        }
+        st_t_end = ggml_time_us();
+        st_t[ST_STEP] += st_t_end - t0;
+        if (++st_n % 64 == 0) {
+            std::string msg;
+            for (int i = 0; i < ST_COUNT; ++i) {
+                msg += string_format(" %s=%.3f", st_names[i], st_t[i]/1000.0/st_n);
+            }
+            SRV_INF("step timing (avg ms over %" PRId64 " steps):%s\n", st_n, msg.c_str());
+            std::fill(st_t, st_t + ST_COUNT, 0);
+            st_n = 0;
+        }
+    }
 // #define DEBUG_TIMINGS
 #ifdef DEBUG_TIMINGS
     struct scoped_timer {
@@ -3483,6 +3520,8 @@ private:
             if (all_idle) {
                 SRV_TRC("%s", "all slots are idle\n");
 
+                st_t_end = 0;
+
                 metrics_flush_idle();
 
                 return; // skip further processing
@@ -3496,9 +3535,15 @@ private:
             }
         }
 
+        const int64_t st_t0 = st_now();
+        if (st_enabled && st_t_end > 0) {
+            st_t[ST_GAP] += st_t0 - st_t_end;
+        }
+
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
+            st_add(ST_PRE, st_t0);
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
             abort_all_slots("pre_decode() failed: " + std::string(e.what()));
@@ -3568,13 +3613,17 @@ private:
 
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
+                const int64_t st_t_post = st_now();
                 post_decode(n_tokens, off);
+                st_add(ST_POST, st_t_post);
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
         }
+
+        st_step_end(st_t0);
     }
 
     void process_tts_slots() {
@@ -3804,9 +3853,13 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            const int64_t st_t_draft = st_now();
             queue_tasks.yield_to_queue([&]() {
+                const int64_t st_t_work = st_now();
                 common_speculative_draft(spec.get());
+                st_add(ST_DRAFT_WORK, st_t_work);
             });
+            st_add(ST_DRAFT, st_t_draft);
         }
 
         // make checkpoints if needed
@@ -4582,12 +4635,16 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const int64_t st_t_tgt = st_now();
         queue_tasks.yield_to_queue([&]() {
+            const int64_t st_t_work = st_now();
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+            st_add(ST_TGT_WORK, st_t_work);
         });
+        st_add(ST_TGT, st_t_tgt);
 
         if (ret != 0) {
             {
@@ -4647,9 +4704,13 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
+            const int64_t st_t_spec = st_now();
             queue_tasks.yield_to_queue([&]() {
+                const int64_t st_t_work = st_now();
                 ok = common_speculative_process(spec.get(), batch.view);
+                st_add(ST_SPEC_WORK, st_t_work);
             });
+            st_add(ST_SPEC, st_t_spec);
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -4833,6 +4894,7 @@ private:
                 // drafters that fill no distribution fall back here
                 const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
 
+                const int64_t st_t_accept = st_now();
                 std::vector<llama_token> accepted;
                 if (!synth_probs.empty()) {
                     // synthetic acceptance replaces verification entirely, so it comes first
@@ -4848,6 +4910,7 @@ private:
                 }
 
                 GGML_ASSERT(accepted.size() >= 1);
+                st_add(ST_ACCEPT, st_t_accept);
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
