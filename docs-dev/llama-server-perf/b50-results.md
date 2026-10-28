@@ -230,10 +230,74 @@ llama-bench v5: pp512 **656** (374), pp512@d8192 **536** (291), pp512@d16384 449
 KLD (a B50-es brew f16 referenciához, 1080 Ti-n): saját v5 q8_0 0,0022, brew q8_0 0,0026 → azonos pontosság
 (a ~0,002 a két eszköz eltérő számítási útja: int8 MMQ vs coopmat).
 
+## CUDA — GTX 1080 Ti (sm_61)
+
+Toolchain: conda env `llama-cuda` (CUDA 12.9 — a 13-as már nem támogatja az sm_61-et — + GCC 14, a rendszer GCC 16-ját
+az nvcc 12 nem fogadja el). Build: `build-cuda`, `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="61;75;86"` (1080 Ti,
+2080 Ti/T1200, 3090). Viszonyítás: upstream `de5122d87` CUDA-build. `test-backend-ops` (CUDA0): 19051/19051 OK.
+
+llama-bench (q8_0 KV): upstream / saját pp512 980 / 966, pp512@d8192 778 / 764, tg64 41,0 / 41,0. 1–4 tokenes batch
+(saját): CUDA pp1 40,7, pp2 76, pp3 106, pp4 127 t/s vs Vulkan 45, 69, 83, 92 → a CUDA verify-batch olcsó.
+
+16. **A felhasználói parancs + MTP CUDA-n: a `-fit` csak 31/34 réteget tesz GPU-ra** (MTP nélkül, ill. Vulkanon 34/34).
+    Ok: a CUDA FA a kvantált K/V f16 másolatát a compute bufferben foglalja (`ggml_cuda_flash_attn_ext_get_alloc_size`,
+    TILE/MMA kernelhez), a teljes kontextusra: 128k-nál ~0,5 GB kontextusonként. Compute buffer CUDA vs Vulkan: main
+    689 vs 229 MiB, MTP 681 vs 171 MiB. Az 1 GB-os alap fit-tartalékkal 3 réteg (súlyok + recurrent állapot) a CPU-ra
+    kerül → CPU-splitek, 13 pörgő CPU-szál, story tg 34 (MTP nélkül 40). Valójában befér (teljes offload: 10,46 / 11,26 GB).
+    - `-fitt 512` → 34/34; `-ctkd f16 -ctvd f16` → MTP compute 681 → 169 MiB, de csak 33/34.
+17. **Javítás: darabolt K/V f16 konverzió a CUDA FA-ban** (`fattn-common.cuh`, `fattn.cu`). A TILE és VEC kernel
+    (parallel_blocks, stream-k nélkül) a kvantált KV-t 64 MiB-os darabokban (Qwen3.5-9B: 16384 sor) konvertálja és
+    dolgozza fel; minden darab ≥2 parallel blockkal fut, a részeredményeket (VKQ, KQ max/sum) egy új
+    `flash_attn_combine_kv_chunk` kernel olvasztja a dst-ben futó eredménybe, az utolsó darab normalizál. A sinks csak
+    az első darabnál, a mask darabonként eltolva. A compute buffer csak egy darabnyi f16 helyet foglal → CUDA0 compute
+    689 → 253 MiB, a fit 8284 MiB-ot vetít 11017 MiB szabadra → **a felhasználói parancs módosítás nélkül 34/34**.
+    Az MMA (Turing+, stream-k) és a sparse út változatlan (2080 Ti/3090-en még teendő). `GGML_CUDA_FA_KV_CHUNK_MB`
+    felülírja a darabméretet (0 = kikapcsolva).
+    - Helyesség: `test-backend-ops` teljes CUDA 19051/19051, FLASH_ATTN_EXT 256 soros darabokkal
+      (`GGML_CUDA_FA_KV_CHUNK_MB=0.0001`) 4040/4040.
+    - Költség (FA prefill, kv=8704, nb=512, q8_0, us/run, darab nélkül / 8 MiB / 2 MiB): hsk256 16612 / 17981 / 22013,
+      hsk128 14793 / 17247 / 22699 → darabonként ~0,3 ms fix költség; 64 MiB-os darabnál (≥16k sor) ~1%.
+      f16 KV-nél nincs változás (nincs konverzió).
+
+| CUDA 1080 Ti, MTP n=1, `-fitt 512` | story pp | story tg | wiki pp | wiki tg |
+|---|---|---|---|---|
+| upstream | 472 | 49,7 | 667 | 42,3 |
+| saját (defer + `-bs`) | 499 | 51,9 | 662 | 44,2 |
+| saját + darabolt FA, alap fit (34/34, `-fitt` nélkül) | 501 | 52,1 | 663 | 43,5 |
+| + Pascal mmvq (18.) | 505 | 53,7 | 666 | 44,5 |
+| **+ Pascal FA GQA (19.), végleges** | **506** | **53,2** | **677** | **45,1** |
+| (alap fit, 31/34 réteg) upstream / saját | 231 / 220 | 31,7 / 34,0 | 507 / 505 | 25,1 / 26,0 |
+| (MTP nélkül, upstream) | 525 | 40,0 | 726 | 35,9 |
+
+18. **Pascal mmvq paraméterek** (`mmvq.cu`, új `MMVQ_PARAMETERS_PASCAL` tábla, sm_60–69): ncols_dst=1-nél 4 warp / 2 sor
+    blokkonként, 2–4 oszlopnál (MTP verify) 4 sor. llama-bench tg128 41,1 → 42,1, pp2 76,8 → 77,9. Izolált kernelben a
+    4 sor/blokk a legjobb (q6_K −9%), de a fúzionált gate/up úton lassabb (tg 40,5), ezért 2. L2 prefetch (DGX Spark
+    mintájára) +15..+70% lassabb Pascalon. `-DGGML_CUDA_MMVQ_PASCAL_{NW1,RPB1,RPB_SMALL}` felülírja.
+19. **Pascal FA: GQA-optimalizáció 4-es GQA aránynál prefillben is** (`fattn-tile.cuh`): eddig Pascalon gqa ≤ 4 és
+    Q > 16 sor esetén ki volt kapcsolva. Mért: minden [4,1] perf-eset −5..−10% (pl. hsk256 kv8704 nb512 q8_0
+    16,3 → 15,1 ms), a többi változatlan. gqa ≤ 2 és pre-Pascal marad a régi. pp2048@d16384 625 → 644 (upstream: 625).
+    KLD (wikitext, q8_0 KV) bitre azonos az upstream CUDA-val; a szerver rövid promptjainál a KV-felosztás más, ezért
+    a greedy kimenet eltérhet.
+20. **CUDA alatt a GeForce P2 állapotban fut: memória 5005 MHz vs Vulkan P0 5508 MHz** (−10% sávszélesség). Ez a
+    Vulkan 45 vs CUDA 42 tg különbség nagy része; a kernelek csúcshoz mért hatásfoka hasonló (q4_K 12288×4096: CUDA
+    61%, Vulkan 66%). `nvidia-smi --cuda-clocks` / `-lmc` csak Volta+, Pascalon nincs támogatott felülírás.
+    Rootként kipróbálva (driver 580.178): `-lgc 1936,1936`, `-lmc 5505,5505` és `-ac 5505,1936` mind
+    „not supported”; `-pm 1` mellett terhelés alatt továbbra is P2, SM 1911 MHz, memória 5005 MHz (tg256 42,8).
+    Az `nvidia-settings` Coolbits-os memória-offset X szervert igényel (Wayland + fej nélküli eGPU), és a
+    legfelső P-szintre hat, nem a P2-re. MTP nélküli generáláshoz Pascalon a Vulkan a gyorsabb.
+    MTP-vel ennek ellenére a CUDA nyer, mert a 2–3 tokenes verify olcsó (pp2 78 vs Vulkan 69).
+    - MTP draft hossz: n=1 a legjobb (n=2: story 52,4 / wiki 44,8; n=3: 43,7 / 42,7).
+    - `-ub 1024/2048` nem gyorsít prefillt (945 / 944 / 928).
+
+A kimenetek bitre azonosak (story/wiki sha upstream = saját). Pascalon a CUDA a gyorsabb backend (Vulkan v5: 307 /
+43,7 / 467 / 38,4).
+
 ## Hátra
 
 - FA prefill (coopmat1, Xe2): ~3,5 TFLOPS — a wiki pp kb. harmada. A Br=32 nem segít, a kernel szerkezete (kis
   tile-ok, shmem-softmax, sok barrier) a korlát; mélyebb átírás kellene.
 - Draft LM head (248320×4096 q6_K, 834 MB, 4,3 ms/lépés): kisebb bitszámú másolat vagy szűkített szótár.
+- CUDA darabolt FA az MMA (stream-k) úton is (Turing/Ampere: 2080 Ti, 3090).
+- Pascal FA prefill: a TILE kernel fp32 Q-tile-ja a 48 KB shared memory határán van (hsk=256), mélyebb átírás kellene.
 - Verify CPU-rögzítés ~7 ms/lépés (nagyrészt átfedésben a GPU-val).
 - Pontosság: kész (1–3. szint, fent) — a saját build a brew-val azonos pontosságú.

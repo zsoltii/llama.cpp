@@ -793,8 +793,11 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             break;
     }
 
+    // TILE and VEC launch without stream-k and can process the KV cache in chunks.
+    const bool can_chunk = kernel == BEST_FATTN_KERNEL_TILE || kernel == BEST_FATTN_KERNEL_VEC;
+    const int64_t kv_chunk = ggml_cuda_flash_attn_ext_get_kv_chunk(dst, need_f16_K, need_f16_V, can_chunk);
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
-        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V, kv_chunk);
 
     return f16_extra.end - (uintptr_t) dst->data;
 }

@@ -6,10 +6,30 @@
 #include <cstdint>
 #include <type_traits>
 
+// Pascal (no tensor cores, DP4A): more rows per block share the q8_1 loads and give more loads in flight.
+// GTX 1080 Ti, Qwen3.5-9B Q4_K_XL: 2 rows at ncols_dst = 1 tg 41.1 -> 42.1 t/s (4 rows is faster in isolation but
+// slower with the fused gate/up path), 4 rows at ncols_dst = 2..3 (MTP verify) pp2 76.8 -> 77.9 t/s.
+// L2 prefetch as on DGX Spark is +15..+70% slower there.
+#ifndef GGML_CUDA_MMVQ_PASCAL_NW1
+#define GGML_CUDA_MMVQ_PASCAL_NW1 4
+#endif
+#ifndef GGML_CUDA_MMVQ_PASCAL_RPB1
+#define GGML_CUDA_MMVQ_PASCAL_RPB1 2
+#endif
+#ifndef GGML_CUDA_MMVQ_PASCAL_RPB_SMALL
+#define GGML_CUDA_MMVQ_PASCAL_RPB_SMALL 4
+#endif
+#if defined(__CUDA_ARCH__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_PASCAL && __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
+#define MMVQ_IS_PASCAL_ARCH 1
+#else
+#define MMVQ_IS_PASCAL_ARCH 0
+#endif
+
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
 // has little exposed latency left to hide and the extra requests cost more than they save.
 // For perf data, see https://github.com/ggml-org/llama.cpp/pull/26705#issuecomment-5569335031
 #if __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+#define MMVQ_PREFETCH 1
 // returns true only for those quants that benefit from prefetch and false otherwise
 static constexpr __host__ __device__ bool mmvq_should_prefetch(ggml_type type) {
     switch (type) {
@@ -100,7 +120,8 @@ enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_RDNA2,
     MMVQ_PARAMETERS_RDNA3_0,
     MMVQ_PARAMETERS_RDNA4,
-    MMVQ_PARAMETERS_GB10
+    MMVQ_PARAMETERS_GB10,
+    MMVQ_PARAMETERS_PASCAL
 };
 
 static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
@@ -116,6 +137,8 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
     return MMVQ_PARAMETERS_TURING;
 #elif __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
     return MMVQ_PARAMETERS_GB10;
+#elif MMVQ_IS_PASCAL_ARCH
+    return MMVQ_PARAMETERS_PASCAL;
 #else
     return MMVQ_PARAMETERS_GENERIC;
 #endif
@@ -139,6 +162,9 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
     }
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_DGX_SPARK) {
         return MMVQ_PARAMETERS_GB10;
+    }
+    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_PASCAL && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_VOLTA) {
+        return MMVQ_PARAMETERS_PASCAL;
     }
     return MMVQ_PARAMETERS_GENERIC;
 }
@@ -474,7 +500,10 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 }
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC) {
+    if (table_id == MMVQ_PARAMETERS_PASCAL && ncols_dst == 1 && !small_k) {
+        return GGML_CUDA_MMVQ_PASCAL_NW1;
+    }
+    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_PASCAL) {
         switch (ncols_dst) {
             case 1:
             case 2:
@@ -625,11 +654,14 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
 #endif
 
 static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10 || table_id == MMVQ_PARAMETERS_PASCAL) {
         switch (ncols_dst) {
             case 1:
                 if (small_k) {
                     return nwarps;
+                }
+                if (table_id == MMVQ_PARAMETERS_PASCAL) {
+                    return mmvq_two_rows_ncols1(type) ? std::max(2, GGML_CUDA_MMVQ_PASCAL_RPB1) : GGML_CUDA_MMVQ_PASCAL_RPB1;
                 }
                 if (table_id == MMVQ_PARAMETERS_GB10) {
                     return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_S ? 2 : 1;
@@ -642,6 +674,9 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
                 // -17..-22% for K-quants at ncols_dst = 3; -DGGML_CUDA_MMVQ_TURING_RPB_SMALL=2 restores the old value
                 if (table_id == MMVQ_PARAMETERS_TURING) {
                     return GGML_CUDA_MMVQ_TURING_RPB_SMALL;
+                }
+                if (table_id == MMVQ_PARAMETERS_PASCAL) {
+                    return GGML_CUDA_MMVQ_PASCAL_RPB_SMALL;
                 }
                 return 2;
             case 5:
@@ -784,7 +819,7 @@ static __global__ void mul_mat_vec_q(
         // x block quant index when casting the quants to int
         const int kqs = vdr * (tid % (qi/vdr));
 
-#if __CUDA_ARCH__ == GGML_CUDA_CC_DGX_SPARK
+#ifdef MMVQ_PREFETCH
         // start the next iterations' weight loads early
         if constexpr (mmvq_should_prefetch(type)) {
             // loop iterations, not blocks; q3_K and q6_K keep the distance in blocks they had with vdr 1

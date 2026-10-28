@@ -50,8 +50,42 @@ struct ggml_cuda_flash_attn_ext_f16_extra_data {
     uintptr_t end;
 };
 
+// The f16 copy of a quantized K/V cache is part of the compute buffer and is sized for the full context at reserve
+// time (~0.5 GiB per context for a 9B model at 128k with q8_0). Kernels that support parallel_blocks can instead convert
+// and process the KV cache in chunks (64 MiB by default), merging the partial results.
+// GGML_CUDA_FA_KV_CHUNK_MB overrides the chunk size, 0 disables chunking.
+static inline int64_t ggml_cuda_flash_attn_ext_kv_chunk_bytes() {
+    static const int64_t bytes = []() {
+        const char * env = getenv("GGML_CUDA_FA_KV_CHUNK_MB");
+        return env ? int64_t(atof(env)*1024*1024) : int64_t(64)*1024*1024;
+    }();
+    return bytes;
+}
+
+// Returns the number of KV rows per chunk, or 0 if the whole KV cache is converted at once.
+// can_chunk must be false for stream-k and sparse launches, which cannot return partial results per chunk.
+static inline int64_t ggml_cuda_flash_attn_ext_get_kv_chunk(
+        const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V, const bool can_chunk) {
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+
+    const bool convert_K = need_f16_K && K->type != GGML_TYPE_F16;
+    const bool convert_V = need_f16_V && V->type != GGML_TYPE_F16 && !V_is_K_view;
+    const int64_t chunk_bytes = ggml_cuda_flash_attn_ext_kv_chunk_bytes();
+    if (!can_chunk || chunk_bytes <= 0 || (!convert_K && !convert_V)) {
+        return 0;
+    }
+
+    const int64_t row_bytes = sizeof(half)*((convert_K ? K->ne[0]*K->ne[2]*K->ne[3] : 0) + (convert_V ? V->ne[0]*V->ne[2]*V->ne[3] : 0));
+    const int64_t kv_chunk  = std::max<int64_t>(chunk_bytes/row_bytes/FATTN_KQ_STRIDE, 1)*FATTN_KQ_STRIDE;
+
+    return K->ne[1] > kv_chunk ? kv_chunk : 0;
+}
+
 static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_get_f16_extra_data(
-        const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V) {
+        const ggml_tensor * dst, const bool need_f16_K, const bool need_f16_V, const int64_t kv_chunk) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
 
     const ggml_tensor * K = dst->src[1];
@@ -62,13 +96,16 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
 
     const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
 
+    const int64_t ne1_K = kv_chunk > 0 ? std::min(K->ne[1], kv_chunk) : K->ne[1];
+    const int64_t ne1_V = kv_chunk > 0 ? std::min(V->ne[1], kv_chunk) : V->ne[1];
+
     ggml_cuda_flash_attn_ext_f16_extra_data data = {};
     data.end = (uintptr_t) dst->data + ggml_nbytes(dst);
 
     if (need_f16_K && K->type != GGML_TYPE_F16) {
         data.end = GGML_PAD(data.end, 128);
         data.K   = data.end;
-        data.end += ggml_nelements(K)*ggml_type_size(GGML_TYPE_F16);
+        data.end += K->ne[0]*ne1_K*K->ne[2]*K->ne[3]*ggml_type_size(GGML_TYPE_F16);
     }
 
     if (need_f16_V && V->type != GGML_TYPE_F16) {
@@ -77,7 +114,7 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
         } else {
             data.end = GGML_PAD(data.end, 128);
             data.V   = data.end;
-            data.end += ggml_nelements(V)*ggml_type_size(GGML_TYPE_F16);
+            data.end += V->ne[0]*ne1_V*V->ne[2]*V->ne[3]*ggml_type_size(GGML_TYPE_F16);
         }
     }
 
@@ -977,6 +1014,81 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// Merges the parallel_blocks partial results of one KV chunk into the running result kept unnormalized in dst,
+// with its KQ max and sum in acc_meta. The last chunk normalizes dst.
+template<int D>
+__launch_bounds__(D, 1)
+static __global__ void flash_attn_combine_kv_chunk(
+        const float  * VKQ_parts_ptr,
+        const float2 * VKQ_meta_ptr,
+        float * dst_ptr,
+        float2 * acc_meta_ptr,
+        const int parallel_blocks,
+        const bool first,
+        const bool last) {
+    ggml_cuda_pdl_lc();
+    const float  * GGML_CUDA_RESTRICT VKQ_parts = VKQ_parts_ptr;
+    const float2 * GGML_CUDA_RESTRICT VKQ_meta  = VKQ_meta_ptr;
+    float        * GGML_CUDA_RESTRICT dst       = dst_ptr;
+    float2       * GGML_CUDA_RESTRICT acc_meta  = acc_meta_ptr;
+
+    const int ne01 = gridDim.x;
+    const int ne02 = gridDim.y;
+
+    const int col      = blockIdx.x;
+    const int head     = blockIdx.y;
+    const int sequence = blockIdx.z;
+
+    const int j_dst_unrolled = (sequence*ne01 + col)*ne02 + head;
+
+    VKQ_parts += j_dst_unrolled * parallel_blocks*D;
+    VKQ_meta  += j_dst_unrolled * parallel_blocks;
+    dst       += j_dst_unrolled *                 D;
+
+    const int tid = threadIdx.x;
+    __builtin_assume(tid < D);
+
+    extern __shared__ float2 meta[];
+    ggml_cuda_pdl_sync();
+    for (int i = tid; i < 2*parallel_blocks; i += D) {
+        ((float *) meta)[i] = ((const float *)VKQ_meta) [i];
+    }
+
+    __syncthreads();
+
+    const float2 acc = first ? make_float2(-FLT_MAX/2.0f, 0.0f) : acc_meta[j_dst_unrolled];
+
+    float kqmax = acc.x;
+    for (int l = 0; l < parallel_blocks; ++l) {
+        kqmax = max(kqmax, meta[l].x);
+    }
+
+    float VKQ_numerator   = 0.0f;
+    float VKQ_denominator = 0.0f;
+    if (!first) {
+        const float acc_scale = expf(acc.x - kqmax);
+        VKQ_numerator   = acc_scale * dst[tid];
+        VKQ_denominator = acc_scale * acc.y;
+    }
+    for (int l = 0; l < parallel_blocks; ++l) {
+        const float KQ_max_scale = expf(meta[l].x - kqmax);
+
+        VKQ_numerator   += KQ_max_scale * VKQ_parts[l*D + tid];
+        VKQ_denominator += KQ_max_scale * meta[l].y;
+    }
+
+    if (last) {
+        dst[tid] = VKQ_numerator / VKQ_denominator;
+        return;
+    }
+
+    dst[tid] = VKQ_numerator;
+    __syncthreads();
+    if (tid == 0) {
+        acc_meta[j_dst_unrolled] = make_float2(kqmax, VKQ_denominator);
+    }
+}
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -1011,8 +1123,9 @@ void launch_fattn(
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
 
+    const int64_t kv_chunk = ggml_cuda_flash_attn_ext_get_kv_chunk(KQV, need_f16_K, need_f16_V, !stream_k && !use_sparse);
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
-        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
+        ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V, kv_chunk);
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
@@ -1028,7 +1141,7 @@ void launch_fattn(
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
 
-    if (need_f16_K && K->type != GGML_TYPE_F16) {
+    if (kv_chunk == 0 && need_f16_K && K->type != GGML_TYPE_F16) {
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
@@ -1056,7 +1169,7 @@ void launch_fattn(
         K_data = (char *) K_f16;
     }
 
-    if (need_f16_V && V->type != GGML_TYPE_F16) {
+    if (kv_chunk == 0 && need_f16_V && V->type != GGML_TYPE_F16) {
         if (V_is_K_view) {
             V_data = K_data;
             nb21   = nb11;
@@ -1114,7 +1227,7 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    const bool scan_mask = !use_sparse && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
+    const bool scan_mask = !use_sparse && kv_chunk == 0 && mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
     if (scan_mask) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
@@ -1138,7 +1251,7 @@ void launch_fattn(
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 
-    const int64_t n_kv = use_sparse ? n_kv_max : K->ne[1];
+    const int64_t n_kv = use_sparse ? n_kv_max : (kv_chunk > 0 ? kv_chunk : K->ne[1]);
     const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
 
     dim3 blocks_num;
@@ -1214,6 +1327,10 @@ void launch_fattn(
             }
         }
 
+        if (kv_chunk > 0) {
+            parallel_blocks = std::max(parallel_blocks, 2); // the chunks are merged using the partial results
+        }
+
         blocks_num.x = ntiles_x;
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
@@ -1248,6 +1365,77 @@ void launch_fattn(
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
     ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
+
+    if (kv_chunk > 0) {
+        ggml_cuda_pool_alloc<float2> acc_meta(pool, ggml_nrows(KQV));
+
+        const dim3 block_dim_combine(DV, 1, 1);
+        const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
+        const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
+        const ggml_cuda_kernel_launch_params launch_params_combine =
+            ggml_cuda_kernel_launch_params(blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream);
+
+        // Converts KV rows [i1_0, i1_0 + ne1) of src to contiguous f16, returns the row/head/sequence strides.
+        auto convert_rows = [&](const ggml_tensor * src, half * dst_f16, const int64_t i1_0, const int64_t ne1, size_t * nb) {
+            const size_t ts = ggml_type_size(src->type);
+            GGML_ASSERT(src->nb[0] == ts);
+            to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(src->type);
+            to_fp16((const char *) src->data + i1_0*src->nb[1], dst_f16, src->ne[0], ne1, src->ne[2], src->ne[3],
+                src->nb[1]/ts, src->nb[2]/ts, src->nb[3]/ts, main_stream);
+            nb[0] = src->ne[0]*sizeof(half);
+            nb[1] = ne1*nb[0];
+            nb[2] = src->ne[2]*nb[1];
+        };
+
+        for (int64_t i1_0 = 0; i1_0 < K->ne[1]; i1_0 += kv_chunk) {
+            const int64_t ne1 = std::min(kv_chunk, K->ne[1] - i1_0);
+
+            const char * K_chunk = (const char *) K->data + i1_0*K->nb[1];
+            size_t nbK[3] = {K->nb[1], K->nb[2], K->nb[3]};
+            if (need_f16_K && K->type != GGML_TYPE_F16) {
+                convert_rows(K, (half *) f16_extra.K, i1_0, ne1, nbK);
+                K_chunk = (const char *) f16_extra.K;
+            }
+
+            const char * V_chunk = (const char *) V->data + i1_0*V->nb[1];
+            size_t nbV[3] = {V->nb[1], V->nb[2], V->nb[3]};
+            if (need_f16_V && V->type != GGML_TYPE_F16) {
+                if (V_is_K_view) {
+                    V_chunk = K_chunk;
+                    nbV[0] = nbK[0];
+                    nbV[1] = nbK[1];
+                    nbV[2] = nbK[2];
+                } else {
+                    convert_rows(V, (half *) f16_extra.V, i1_0, ne1, nbV);
+                    V_chunk = (const char *) f16_extra.V;
+                }
+            }
+
+            ggml_cuda_kernel_launch(fattn_kernel, launch_params,
+                (const char *) Q->data,
+                K_chunk,
+                V_chunk,
+                mask ? ((const char *) mask->data) + i1_0*sizeof(half) : nullptr,
+                sinks && i1_0 == 0 ? ((const char *) sinks->data) : nullptr,
+                nullptr,
+                dst_tmp.ptr, dst_tmp_meta.ptr,
+                scale, max_bias, m0, m1, n_head_log2, logit_softcap,
+                Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
+                K->ne[0], ne1, K->ne[2], K->ne[3], nbK[0], nbK[1], nbK[2],
+                nbV[0], nbV[1], nbV[2],
+                mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
+                mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+            );
+            CUDA_CHECK(cudaGetLastError());
+
+            ggml_cuda_kernel_launch(flash_attn_combine_kv_chunk<DV>, launch_params_combine,
+                dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, acc_meta.ptr, parallel_blocks,
+                i1_0 == 0, i1_0 + ne1 >= K->ne[1]);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        return;
+    }
+
     ggml_cuda_kernel_launch(fattn_kernel, launch_params,
         (const char *) Q->data,
         K_data,

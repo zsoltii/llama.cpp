@@ -1248,8 +1248,11 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
 
     // On NVIDIA (Pascal and older) the GQA optimizations seem to be detrimental in some cases.
     // However, for DKQ == 576, DV == 512 only the kernel variant with GQA optimizations is implemented.
-    const bool nvidia = GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
-    const int gqa_limit = nvidia && gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
+    // On Pascal a GQA ratio of 4 is faster with the GQA optimizations at every batch size (GTX 1080 Ti, prefill: -5..-10%).
+    const int  cc     = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool nvidia = GGML_CUDA_CC_IS_NVIDIA(cc);
+    const int  gqa_max_limited = cc >= GGML_CUDA_CC_PASCAL && cc < GGML_CUDA_CC_VOLTA ? 2 : 4;
+    const int gqa_limit = nvidia && gqa_ratio <= gqa_max_limited && DV <= 256 ? 16 : INT_MAX;
     const bool use_gqa_opt = mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     if constexpr (DKQ == 320) {
