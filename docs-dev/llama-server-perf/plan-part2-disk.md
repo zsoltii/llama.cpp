@@ -1,157 +1,176 @@
-# llama.cpp gyorsítás — 2. RÉSZ: lemezhelyet igénylő terv
+# llama.cpp speedup — PART 2: plan that needs disk space
 
-Állapot: **RÉSZBEN VÉGREHAJTVA (2026-10-26)** — lemezhely megvan (142 GB szabad).
-- **2.1 (A0–A4) KÉSZ**, eredmény: **36. kör**. Rövid összefoglaló: a kvant-mix
-  MTP nélkül +12…+21% tg (v4), **MTP-vel nincs nyereség** (az MTP-út 146 GB/s-on
-  overhead-kötött) → a napi config marad az UD-Q4_K_XL; a mix csak MTP nélkül
-  vagy VRAM-célra hasznos.
-- **2.2 (C, 160 B-os repack) ELVETVE** — a C0 kapu nem nyert (21. kör).
-- **2.3 (E2) NYITOTT** (n-max 3 már részben mérve: a 3. draft-pozíció acceptance-e
-  0,478 volt), **2.4 → kiváltva** a `plan-part3-mtp-overhead.md` G3 pontjával
-  (csökkentett vocabú draft head, FR-Spec minta).
-Cél: a decode/MTP súlyforgalmának csökkentése új modellfájlokkal (custom kvant-mix), illetve — ha a mikrobenchmark nyer — új, 16 B-ra igazított súlyformátummal.
-Háttér: `plan-part1-nodisk.md`, `plan-ctranslate2.md` (rev. 2, archív).
+Status: **PARTLY EXECUTED (2026-10-26)** — disk space is available (142 GB free).
+- **2.1 (A0–A4) DONE**, results in **round 36**. In short:
+  - The quant mix gives +12…+21% tg without MTP (v4), but **no gain with MTP**: the MTP path is overhead-bound at 146 GB/s.
+  - So the daily config stays UD-Q4_K_XL. The mix is only useful without MTP or to save VRAM.
+- **2.2 (C, 160 B repack) DROPPED** — the C0 gate did not win (round 21).
+- **2.3 (E2) OPEN**. n-max 3 is partly measured already: the 3rd draft position had an acceptance of 0.478.
+- **2.4 → replaced** by G3 in `plan-part3-mtp-overhead.md` (reduced-vocabulary draft head, FR-Spec pattern).
+
+Goal: reduce the weight traffic of decode/MTP with new model files (a custom quant mix). If the micro-benchmark wins, also with a new weight format aligned to 16 B.
+
+Background: `plan-part1-nodisk.md`, `plan-ctranslate2.md` (rev. 2, archived).
 
 ---
 
-## Lemezigény (előfeltétel)
+## Disk requirements (prerequisite)
 
-| tétel | méret | megjegyzés |
+| item | size | note |
 |---|---|---|
-| **BF16 originál (forrás — user döntés)** | **~18 GB** | letöltés; a kvantálás után törölhető (18 GB felszabadul) |
-| 2.1 kvant-mix GGUF-k (A1–A4) | ~5,2–5,9 GB / db | a BF16-ból kvantálva; egyszerre 1–2 variáns tárolható |
-| 2.2 160 B-os repack (ha C0 nyer) | ~6,4 GB | +8,1% a jelenlegihez képest |
-| minőség-mérés (perplexity log) | <10 MB | — |
+| **BF16 original (source — user decision)** | **~18 GB** | download; can be deleted after quantizing (frees 18 GB) |
+| 2.1 quant-mix GGUFs (A1–A4) | ~5.2–5.9 GB each | quantized from BF16; 1–2 variants can be stored at a time |
+| 2.2 160 B repack (if C0 wins) | ~6.4 GB | +8.1% compared to the current one |
+| quality measurement (perplexity log) | <10 MB | — |
 
-→ **Csúcsigény a 2.1-hez: ~24–25 GB szabad hely** (BF16 18 GB + kimenet ~6 GB). A BF16 törlése a kvantálás után 18 GB-ot szabadít. **Alternatíva**: a kvantálás külső lemezen (a BF16 és a kimenet is ott), majd csak a kész ~5,5 GB-os GGUF visszamásolása.
+→ **Peak need for 2.1: ~24–25 GB free space** (BF16 18 GB + output ~6 GB).
+- Deleting the BF16 after quantizing frees 18 GB.
+- **Alternative:** quantize on an external disk (BF16 and output both there), then copy back only the finished ~5.5 GB GGUF.
 
 ---
 
-## 2.1 — A: Custom kvant-mix (0 kód, minden backenden hat)
+## 2.1 — A: custom quant mix (no code, affects every backend)
 
-**Miért**: a GGUF-elemzés szerint a modellben ~1,2 GB/lépés „felesleges" precizitás van:
-- **LM head (`output.weight`) Q6_K, 796 MB (*a 36. kör mérése szerint 834 MB*) — lépésenként 3× olvasva** (verify + 2 draft) = a lépés súlyforgalmának 34%-a;
-- `ffn_down` Q6_K: 883 MB;
-- `ssm_out` Q8_0: 408 MB (hibrid SSM-rétegek).
+**Why:** the GGUF analysis shows ~1.2 GB per step of "unnecessary" precision in the model:
+- **LM head (`output.weight`) Q6_K, 796 MB** (*834 MB as measured in round 36*). It is **read 3 times per step** (verify + 2 drafts), which is 34% of the step's weight traffic.
+- `ffn_down` Q6_K: 883 MB.
+- `ssm_out` Q8_0: 408 MB (hybrid SSM layers).
 
-**Eszköz**: `llama-quantize --output-tensor-type ... --tensor-type 'ffn_down=...' --tensor-type 'ssm_out=...'` (tensor-szintű felülírás létezik).
+**Tool:** `llama-quantize --output-tensor-type ... --tensor-type 'ffn_down=...' --tensor-type 'ssm_out=...'` (per-tensor overrides exist).
 
-**Változatok — MINDET meg kell mérni (user döntés), memóriatudatosan**
+**Variants — ALL of them must be measured (user decision), memory-aware**
 
-| verzió | tartalom | Δ forgalom | várható tg | VRAM |
+| version | contents | Δ traffic | expected tg | VRAM |
 |---|---|---|---|---|
-| A1 | head q5_K (700 MB) | −402 MB (−5,7%) | +4–6% | −96 MB |
-| A2 | head q4_K (546 MB) | −750 MB (−10,5%) | +8–10% | −250 MB |
+| A1 | head q5_K (700 MB) | −402 MB (−5.7%) | +4–6% | −96 MB |
+| A2 | head q4_K (546 MB) | −750 MB (−10.5%) | +8–10% | −250 MB |
 | A3 | A2 + ffn_down q5_K + ssm_out q5_K | ~−1014 MB (−14%) | +9–12% | −290 MB |
-| A4 | mind q4_K | ~−1197 MB (−17%) | +10–15% | −~700 MB |
+| A4 | all q4_K | ~−1197 MB (−17%) | +10–15% | −~700 MB |
 
-**Memóriatudatos szempont (user)**: a kisebb mix **több réteget enged a GPU-n** részleges offloadnál, és jobban befér más modellek mellé. Ezért a méréshez két értékelési szempont kell: (1) teljes GPU-offload tg/pp, (2) **vegyes GPU+CPU** mód (pl. `-ngl` ~8–16 réteggel a CPU-n) tg/pp + VRAM. A nyertes mixet mindkét módra jelenteni kell.
+**Memory-aware aspect (user):** a smaller mix lets **more layers fit on the GPU** with partial offload, and fits better next to other models.
+So the measurement needs two criteria, and the winning mix must be reported for both:
+1. full GPU offload, tg/pp;
+2. **mixed GPU+CPU** mode (e.g. `-ngl` with ~8–16 layers on the CPU), tg/pp + VRAM.
 
-**Vegyes GPU+CPU validáció**: a WP-D (CPU FA split-KV) és a `-ngl` hangolás külön méréssel; a kisebb mix előnye itt nagyobb lehet, mint teljes offloadnál.
+**Mixed GPU+CPU validation:** measure WP-D (CPU FA split-KV) and the `-ngl` tuning separately. The smaller mix may gain more here than with full offload.
 
-**Minőség-kapu (kötelező)**
-1. `llama-perplexity` a baseline (UD-Q4_K_XL) vs az új mix (ugyanaz a korpusz, pl. `corpus/`).
-2. KL-divergencia a baseline logits-hoz (ha van rá eszköz: `llama-perplexity --kl-divergence`).
-3. **Acceptance + mean len** ellenőrzés MTP-vel (a draft ugyanazt a headet használja → a head kvantálása az acceptance-et is érinti).
-4. Küszöb: perplexity +≤2% és acceptance ≥0,68 → elfogadható; különben lépcsőzés (q5_K).
+**Quality gate (mandatory)**
+1. `llama-perplexity` for the baseline (UD-Q4_K_XL) vs the new mix, on the same corpus (e.g. `corpus/`).
+2. KL divergence against the baseline logits, if a tool is available (`llama-perplexity --kl-divergence`).
+3. Check **acceptance and mean length** with MTP. The draft uses the same head, so quantizing the head also affects acceptance.
+4. Threshold: perplexity at most +2% and acceptance ≥0.68 is acceptable. Otherwise step back (q5_K).
 
-**Várható**: MTP +8–15%, no-MTP +4–8%; pp kb. változatlan; VRAM 5,9→~5,2 GB (szabad hely az f16 KV-hez!).
-
----
-
-## 2.2 — C: 160 B-os, 16 B-ra igazított q4_K + 16 B-os betöltések (csak ha C0 nyer)
-
-**Előfeltétel**: az 1.3 C0 mikrobenchmark ≥15%-os nyereséget mutat a 16 B-os betöltésre.
-
-**Terv**
-1. **C1 — új típus**: q4_K, **160 bájtos blokk** (128 B kvantum + 12 B skála + d/dmin + pad), 16 B-ra igazítva; **veszteségmentes repack** (+8,1% méret). Konverter: a meglévő GGUF-ból (llama.cpp tool vagy saját script).
-2. **C2 — CUDA/ROCm**: MMVQ 16 B-os (`uint4`) betöltésekkel + opcionális split-K; MMQ fallback a nagy batchre; ROCm automatikus (hipify), a fordulás az elfogadási kritérium.
-3. **C3 — CPU**: `vec_dot` 16 B-os (AVX2) betöltésekkel; **Vulkan**: matvec shader `vec4` betöltésekkel.
-4. Mérés: MTP + no-MTP + pp, a szokásos protokollal; helyesség: `detcheck.sh`.
-
-**Várható**: +20–40% decode (ha a hipotézis áll); pp akár +5–10% (kevesebb betöltési tranzakció).
-**Kockázat**: új ggml-típus minden backenden (nagy felület) → csak a C0 kapu után.
+**Expected:**
+- MTP +8–15%, no-MTP +4–8%; pp roughly unchanged.
+- VRAM 5.9 → ~5.2 GB, which frees room for f16 KV.
 
 ---
 
-## 2.3 — E2: újramérések a 2.1 után
+## 2.2 — C: 160 B q4_K aligned to 16 B + 16 B loads (only if C0 wins)
 
-- `--spec-draft-n-max 3` (olcsóbb head mellett a 3. draft ismét megérheti).
-- f16 KV kombináció (a 2.1 VRAM-nyeresége miatt biztosan befér).
-- `-ub` 512 vs 1024 az új súlyokkal.
-- A nyertesek beépítése a napi konfigba + docs.
+**Prerequisite:** the 1.3 C0 micro-benchmark shows at least a 15% gain for 16 B loads.
 
-## 2.4 — (opcionális) A draft külön, kisebb headje — KIVÁLTVA
+**Plan**
+1. **C1 — new type:** q4_K with a **160-byte block** (128 B quants + 12 B scales + d/dmin + pad), aligned to 16 B.
+   - It is a **lossless repack** (+8.1% size).
+   - Converter: from the existing GGUF (a llama.cpp tool or our own script).
+2. **C2 — CUDA/ROCm:**
+   - MMVQ with 16 B (`uint4`) loads plus optional split-K;
+   - MMQ fallback for large batches;
+   - ROCm comes automatically via hipify, and compiling cleanly there is the acceptance criterion.
+3. **C3 — CPU and Vulkan:**
+   - CPU: `vec_dot` with 16 B (AVX2) loads;
+   - Vulkan: mat-vec shader with `vec4` loads.
+4. Measure MTP, no-MTP and pp with the usual protocol. Correctness: `detcheck.sh`.
 
-> Helyette: `plan-part3-mtp-overhead.md` G3 (a gyakori ~32k token sorai a
-> meglévő headből, új GGUF-tenzor nélkül).
+**Expected:**
+- +20–40% decode, if the hypothesis holds;
+- pp possibly +5–10%, from fewer load transactions.
 
-Ha a közös head q4_K minősége nem elég a verify-nak: a GGUF-ba egy külön `mtp.head` tensor (Q4_K) + kód, hogy a draft azt használja, a verify a Q6_K-t. Várható: −500 MB/lépés, de az acceptance csökkenhet → mérni kell.
-
----
-
-## Mérési protokoll (ugyanaz, mint az 1. részben)
-
-- 170 W; lib/md5/env bizonyíték; interleaved A/B + anchor; 60 s cooldown; nincs szerkesztés/fordítás mérés közben.
-- **Modellváltásnál** (2.1): régi modell anchor → új modell → régi anchor újra (a ±10%-os session-drift miatt).
-- Minden változat csak mért győzelem esetén marad; a vesztesek a `results.md`-be.
-
-## Sorrend
-
-0. **BF16 originál letöltése** (~18 GB) → a kvantálás helyének biztosítása (belső vagy külső lemez).
-1. 2.1 **A1 → A2 → A3 → A4** (minden változat mérése, memóriatudatosan; egyszerre 1–2 fájl) → minőség-kapu.
-2. 2.3 E2 (n-max 3, f16 KV kombináció, `-ub`) + **vegyes GPU+CPU** validáció.
-3. (ha a C0 kapu nyert) 2.2 C1 → C2 → C3.
-4. 2.4 opcionális (draft külön head).
+**Risk:** a new ggml type on every backend is a large surface, so only after the C0 gate.
 
 ---
 
-## 2.0 — Unsloth Dynamic 3.0: mit jelent és hogyan alkalmazható
+## 2.3 — E2: re-measurements after 2.1
 
-**Mi az**: az Unsloth következő generációs dinamikus kvantálása (tiszta PTQ,
-QAT/QAD nélkül): sokkal jobb imatrix-kalibrációs adat (agentic coding, chat,
-többnyelvű), finomabb layer-szelekció és több kvantálási technika. Állításuk
-szerint **azonos méret mellett >10% top-1 nyereség** a 2.0-hoz/versenytársakhoz
-képest (KLD, Divergence-300@32 is jobb). A GGUF szabványos → llama.cpp-ben
-fut. Az MTP modult a `UD-Q2_K_XL` alatti (kisebb) kvantokból kiveszik
-(~500 MB spórolás), külön Q4_0 MTP modullal pótolható; a Q4_K_XL-ben marad.
+- `--spec-draft-n-max 3`: with a cheaper head the 3rd draft may pay off again.
+- Combine with f16 KV; thanks to the VRAM savings of 2.1 it will fit.
+- `-ub` 512 vs 1024 with the new weights.
+- Put the winners into the daily config and the docs.
 
-**Elérhető-e most nálunk?**
-- A `unsloth/Qwen3.5-9B-MTP-GGUF` repó utolsó módosítása **2026-05-16**, minden
-  fájl `UD-*` = **2.0-s mix** (Q4_K 3,02 + Q5_K 0,85 + Q6_K 1,76 + Q8_0 0,46 GB,
-  MXFP4 nélkül). Hivatalos 3.0-s kiadás eddig **Qwen3.8-27B**-hez van → a mi
-  modellünkhöz még nincs kész v3 fájl.
-- **DE**: a repóban van a modellhez tartozó **imatrix** (`imatrix_unsloth.gguf_file`,
-  5,2 MB) → a v3-stílusú mixet magunk is előállíthatjuk.
+## 2.4 — (optional) separate, smaller head for the draft — REPLACED
 
-**Recept (amikor lesz ~25 GB szabad hely):**
+> Instead: `plan-part3-mtp-overhead.md` G3 (the rows of the ~32k most frequent tokens, taken from the existing head,
+> without a new GGUF tensor).
 
-> **Figyelem (36. kör):** a regexes `--tensor-type` felülírás **nem
-> reprodukálható** (a default Q4_K-mix belső számlálói eltolják, mely rétegek
-> kapnak Q6_K-t). Helyette teljes, explicit tábla kell:
-> `~/llama-bench-results/mix-gen.py` → `--tensor-type-file` (`quant-mix.sh`).
-> Az alábbi parancs csak a szándékot mutatja.
+If the quality of a shared q4_K head is not good enough for the verify, add a separate `mtp.head` tensor (Q4_K) to the GGUF plus code, so that the draft uses it and the verify keeps Q6_K.
+Expected: −500 MB per step, but acceptance may drop, so it has to be measured.
+
+---
+
+## Measurement protocol (same as in part 1)
+
+- 170 W; lib/md5/env evidence; interleaved A/B with an anchor; 60 s cooldown; no edits or builds while measuring.
+- **When switching models** (2.1): old model anchor → new model → old anchor again, because of the ±10% session drift.
+- A variant stays only with a measured win. The losers go into `results.md`.
+
+## Order
+
+0. **Download the BF16 original** (~18 GB) and secure space for quantizing (internal or external disk).
+1. 2.1 **A1 → A2 → A3 → A4**, then the quality gate.
+   Measure every variant, memory-aware, with 1–2 files at a time.
+2. 2.3 E2 (n-max 3, f16 KV combination, `-ub`) + **mixed GPU+CPU** validation.
+3. (if the C0 gate won) 2.2 C1 → C2 → C3.
+4. 2.4 optional (separate draft head).
+
+---
+
+## 2.0 — Unsloth Dynamic 3.0: what it means and how to apply it
+
+**What it is:** Unsloth's next-generation dynamic quantization. It is pure PTQ, without QAT/QAD:
+- much better imatrix calibration data (agentic coding, chat, multilingual);
+- finer layer selection;
+- more quantization techniques.
+
+Their claims:
+- **More than 10% better top-1 at the same size** compared to 2.0 and competitors; KLD and Divergence-300@32 are also better.
+- The GGUF is standard, so it runs in llama.cpp.
+- The MTP module is removed from quants smaller than `UD-Q2_K_XL` (~500 MB saved). It can be replaced by a separate Q4_0 MTP module. It stays in Q4_K_XL.
+
+**Is it available to us now?**
+- The `unsloth/Qwen3.5-9B-MTP-GGUF` repo was last modified on **2026-05-16**.
+  - Every file there (`UD-*`) is a **2.0 mix**: Q4_K 3.02 + Q5_K 0.85 + Q6_K 1.76 + Q8_0 0.46 GB, without MXFP4.
+  - The official 3.0 release so far only exists for **Qwen3.8-27B**, so there is no ready v3 file for our model yet.
+- **BUT** the repo contains the model's **imatrix** (`imatrix_unsloth.gguf_file`, 5.2 MB), so we can produce a v3-style mix ourselves.
+
+**Recipe (once ~25 GB of free space is available):**
+
+> **Warning (round 36):** regex `--tensor-type` overrides are **not reproducible**. The internal counters of the default
+> Q4_K mix shift which layers get Q6_K. Use a complete, explicit table instead: `~/llama-bench-results/mix-gen.py` →
+> `--tensor-type-file` (`quant-mix.sh`). The command below only shows the intent.
 ```bash
 hf download unsloth/Qwen3.5-9B-MTP-GGUF \
   Qwen3.5-9B-BF16.gguf imatrix_unsloth.gguf_file --local-dir ~/models/qwen35mtp
-# v3-stílusú dinamikus mix: imatrix + tensor-szintű felülírások
+# v3-style dynamic mix: imatrix + per-tensor overrides
 llama-quantize --imatrix imatrix_unsloth.gguf_file \
   --tensor-type attn_v=Q6_K --tensor-type ffn_down=Q6_K \
   --tensor-type ssm_out=Q8_0 --output-tensor-type Q6_K \
   Qwen3.5-9B-BF16.gguf out-UD-Q4_K_XL-v3.gguf Q4_K
 ```
-(`--tensor-type tensor_név=típus`, `--tensor-type-file` teljes táblához;
-a pontos mixet a 2.1-es mérési eredmények + az Unsloth v3 arányai alapján kell
-kalibrálni, és a **MTP fejet** külön, legalább Q4_0/Q5_K szinten kell tartani,
-különben az elfogadási arány és így a tg esik.)
+Notes on the recipe:
+- Syntax: `--tensor-type tensor_name=type` for single tensors, `--tensor-type-file` for a full table.
+- Calibrate the exact mix from the 2.1 measurements and the Unsloth v3 ratios.
+- Keep the **MTP head** separately at Q4_0/Q5_K or better. Otherwise the acceptance rate drops, and with it tg.
 
-**Előnyök**: azonos méret mellett jobb minőség (ingyenes pontosság, futásidejű
-költség nélkül); nyilvános imatrix → reprodukálható; szabványos GGUF.
-**Hátrányok**: nincs kész v3 fájl a 9B-MTP-hez (magunknak kell kvantálni);
-~25 GB szabad lemez (BF16 18 GB + kimenet 6 GB) és több óra futás/validálás;
-a meglévő Q4_K_XL-ből **nem** szabad újrakvantálni (kétszeres veszteség) —
-BF16/Q8_0 alap kell; a minőség-nyereséget a saját harness-ünkkel kell igazolni.
+**Pros:**
+- better quality at the same size, i.e. free accuracy with no runtime cost;
+- the public imatrix makes it reproducible;
+- standard GGUF.
 
-**Döntés**: a 2.1-es custom kvant-mix terv **A0 lépése** legyen ez a v3-stílusú,
-Unsloth-imatrixos mix (a mostani A1–A4 mellé/elé), és figyeljük a hivatalos
-v3 megjelenését a 9B-MTP-hez.
+**Cons:**
+- No ready v3 file for 9B-MTP, so we have to quantize ourselves.
+- Needs ~25 GB free disk (BF16 18 GB + output 6 GB) and several hours of runs and validation.
+- We must **not** requantize from the existing Q4_K_XL (double loss); a BF16/Q8_0 base is needed.
+- The quality gain has to be proven with our own harness.
+
+**Decision:** step **A0** of the 2.1 custom quant-mix plan is this v3-style mix with the Unsloth imatrix, alongside or before the current A1–A4. Watch for an official v3 release of 9B-MTP.

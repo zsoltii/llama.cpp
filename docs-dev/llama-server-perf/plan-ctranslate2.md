@@ -1,174 +1,220 @@
-# llama.cpp gyorsítás — CTranslate2-inspirált terv (rev. 2)
+# llama.cpp speedup — CTranslate2-inspired plan (rev. 2)
 
-> **ÁLLAPOT: ARCHÍV (2026-10-26).** A tartalom beolvadt a
-> `plan-part1-nodisk.md` / `plan-part2-disk.md` tervekbe, és a két belőle
-> származó kísérlet **le van zárva**:
-> - **WP-C0** (16 B-os AWQ-GEMV betöltés + split-K) → 21. kör: **elvetve**,
->   a 4 B-os betöltés a leggyorsabb (540 GB/s), a 16 B −16,5%.
-> - **WP-D** (CPU FA split-KV kvantált KV-ra) → 23. kör: **elvetve** (+70%).
+> **STATUS: ARCHIVED (2026-10-26).** The content was merged into `plan-part1-nodisk.md` / `plan-part2-disk.md`.
+> The two experiments that came from it are **closed**:
+> - **WP-C0** (16 B AWQ-GEMV loads + split-K) → round 21: **dropped**. The 4 B load is the fastest (540 GB/s); 16 B is −16.5%.
+> - **WP-D** (CPU FA split-KV for quantized KV) → round 23: **dropped** (+70%).
 >
-> A rev. 2 premisszája (decode 231 GB/s a 408-as plafonhoz → 1,7× headroom)
-> a későbbi mérésekkel **részben felülíródott**: no-MTP 345 GB/s, az MTP-lépés
-> 146 GB/s (36. kör) → nem a betöltésszélesség, hanem az MTP-út overheadje a
-> szűk keresztmetszet.
+> Later measurements **partly overrode** the premise of rev. 2:
+> - The premise: decode at 231 GB/s against a 408 GB/s ceiling, i.e. 1.7× headroom.
+> - Measured since: no-MTP 345 GB/s, MTP step 146 GB/s (round 36).
+> - So the bottleneck is the overhead of the MTP path, not the load width.
 >
-> Eredeti hely: `~/.opencode/plan/llamacpp-perf-ctranslate2.md`. Az alábbi
-> szöveg változatlan (rev. 2), csak a státusz-header került elé.
+> Original location: `~/.opencode/plan/llamacpp-perf-ctranslate2.md`. The text below is rev. 2, with only the status
+> header added (translated to English on 2026-10-29).
 
 ---
 
 
-> **Végrehajtható változat két részre bontva (lemezkorlát miatt):**
-> - `llamacpp-perf-part1-nodisk.md` — ma: `plan-part1-nodisk.md` (mérés + kód)
-> - `llamacpp-perf-part2-disk.md` — ma: `plan-part2-disk.md` (quant-mix, repack)
-> A két fájl a `docs-dev/llama-server-perf/` alá kerül az implementáció első lépéseként.
+> **Executable version, split into two parts (because of the disk limit):**
+> - `llamacpp-perf-part1-nodisk.md` — now `plan-part1-nodisk.md` (measurements + code)
+> - `llamacpp-perf-part2-disk.md` — now `plan-part2-disk.md` (quant mix, repack)
+>
+> As the first implementation step, both files go under `docs-dev/llama-server-perf/`.
 
-Állapot: **terv, jóváhagyásra** (Plan mód; implementáláshoz agent-váltás kell)
-Cél: Qwen3.5-9B-MTP, RTX 2080 Ti, 170 W, 80k kontextus, q4_1 KV — minél nagyobb tg/pp nyereség, mérve, hordozhatóan (CPU/CUDA/Vulkan/ROCm).
+Status: **plan, awaiting approval** (Plan mode; implementing needs an agent switch).
 
----
-
-## 0. Vezetői összefoglaló — mi változott a rev. 1-hez képest
-
-1. **A prioritás megfordult.** A rev. 1 a CUDA-s GEMV/újraformázott súlyokat tette elsőnek (nagy, kockázatos, nem bizonyított). A kritikus átvizsgálás kimutatta, hogy a modellben **~1,2 GB/lépés "felesleges" precizitás** van, ami **nulla kóddal** kivehető, és **minden backenden azonnal hat** → ez lett a WP-A (első).
-2. **A 16 bájtos betöltés hipotézise kaput kapott**: előbb egy 30 perces szintetikus GEMV-mikrobenchmark dönt (4/8/16 B betöltés, azonos forgalom). Csak nyerés esetén indul a formátum-munka.
-3. **A formátum-terv egyszerűsödött**: nem AWQ-stílusú szétválasztott skálák, hanem **160 bájtos, 16 B-ra igazított q4_K blokk** (+8% méret, veszteségmentes repack) — ez egyszerre adja az igazítást és a széles betöltést.
-4. **Új tétel: a KV-típus kérdése** — a korábbi mérés szerint **f16 KV + MTP ≈ +4-5%** (62,18 vs 59-60 t/s), kód nélkül; a q4_1-et a user írta elő mérési standardként → **döntés kell**. Ha marad a q4_1, akkor jön a CUDA "KV-shadow" (a redundáns konverzió megszüntetése).
-5. **Új tétel: n-max újramérés** a WP-A után (a draft most 3× olvassa a headet; olcsóbb head mellett a 3. draft ismét megérheti).
-6. **Új apróság: `--no-mmproj`** (a vision projektor feleslegesen töltődik: RAM + load-idő).
+Goal: Qwen3.5-9B-MTP, RTX 2080 Ti, 170 W, 80k context, q4_1 KV. The largest measured tg/pp gain that stays portable across CPU, CUDA, Vulkan and ROCm.
 
 ---
 
-## 1. Tények (kód + mérés + GGUF-elemzés)
+## 0. Executive summary — what changed since rev. 1
 
-### A modell összetétele (UD-Q4_K_XL, GGUF fejlécből)
-| rész | méret |
+1. **Priorities were reversed.**
+   - Rev. 1 put the CUDA GEMV / reformatted weights first: large, risky and unproven.
+   - The critical review showed that the model carries **~1.2 GB per step of "unnecessary" precision**. It can be removed with **zero code** and **takes effect on every backend immediately**.
+   - That became WP-A (first).
+2. **The 16-byte load hypothesis got a gate.** First a 30-minute synthetic GEMV micro-benchmark decides (4/8/16 B loads, same traffic). The format work starts only if it wins.
+3. **The format plan got simpler.** Not AWQ-style separated scales, but a **160-byte q4_K block aligned to 16 B** (+8% size, lossless repack). It gives both the alignment and the wide loads.
+4. **New item: the KV type.**
+   - An earlier measurement showed **f16 KV + MTP ≈ +4–5%** (62.18 vs 59–60 t/s), with no code.
+   - The user had prescribed q4_1 as the measurement standard, so **a decision is needed**.
+   - If q4_1 stays, the CUDA "KV shadow" follows (removing the redundant conversion).
+5. **New item: re-measure n-max** after WP-A. The draft now reads the head 3 times; with a cheaper head a 3rd draft may pay off again.
+6. **New small item: `--no-mmproj`.** The vision projector is loaded needlessly (RAM + load time).
+
+---
+
+## 1. Facts (code + measurements + GGUF analysis)
+
+### Model composition (UD-Q4_K_XL, from the GGUF header)
+| part | size |
 |---|---|
-| rétegek 0-31 | 4431,7 MB |
-| MTP blokk (blk.32, 15 tensor) | 150,7 MB |
-| **LM head (`output.weight`, Q6_K, 248 320 szókincs)** | **795,7 MB** |
-| token_embd (Q4_K, gather → forgalom ~0) | 560,8 MB |
-| **összesen** | **5939 MB** |
+| layers 0-31 | 4431.7 MB |
+| MTP block (blk.32, 15 tensors) | 150.7 MB |
+| **LM head (`output.weight`, Q6_K, 248 320 vocabulary)** | **795.7 MB** |
+| token_embd (Q4_K, gather → traffic ~0) | 560.8 MB |
+| **total** | **5939 MB** |
 
-Típus-mix: Q4_K 2963 MB, Q6_K 1678 MB (ebből head 796, `ffn_down` 883), Q5_K 827 MB, Q8_0 442 MB (`ssm_out` 408 + `eh_proj` 34), F32 28 MB.
-A modell **hibrid**: 24 SSM-réteg (`ssm_out` Q8_0!) + 9 attention-réteg.
+Type mix:
 
-### MTP lépés forgalma (súlyok)
-- verify (32 réteg + head): **5228 MB**
-- 2 draft dekód (MTP blokk 151 + head 796): 2 × 947 = **1894 MB**
-- **összesen: 7120 MB/lépés; a head 34% (3× olvasás: verify + 2 draft)**
-- ehhez jön az FA konverzió (~700 MB) + f16 KV olvasás (~534 MB) → ~8,3 GB/lépés
+| type | size | of which |
+|---|---|---|
+| Q4_K | 2963 MB | |
+| Q6_K | 1678 MB | head 796, `ffn_down` 883 |
+| Q5_K | 827 MB | |
+| Q8_0 | 442 MB | `ssm_out` 408, `eh_proj` 34 |
+| F32 | 28 MB | |
 
-### Mért számok (170 W, q4_1)
-- no-MTP: 42 t/s → 231 GB/s effektív súly-sávszélesség
-- MTP R3: 59-60 t/s, 41,1 ms/lépés, acceptance 0,7177, mean len 2,43
-- pp: 1180-1300 t/s
-- memóriarendszer felső korlát (memcpy D2D, convbench): **408 GB/s** → a matvec ~1,7× a csúcs alatt
+The model is **hybrid**: 24 SSM layers (`ssm_out` is Q8_0!) and 9 attention layers.
 
-### CTranslate2 — mivel magyarázza a sebességet
-- Saját README/szerzői fórum: **precizió (fp16/int8) + vendor BLAS (MKL/cuBLAS, `CUBLAS_COMPUTE_16F` = 2× GeForce-on) + rétegfúzió (masked softmax, fuzionált QKV) + padding-kiküszöbölés + batch-rendezés + in-place/caching**.
-- Saját **AWQ int4 GEMV**: 16 bájtos (`float4`) súlybetöltés + split-K + warp-redukció (`src/ops/awq/gemv_gpu.cu`).
-- Saját FlashAttention: **csak sm_80+**, Turingon nem fut; a Python csomagból kivették („minimal performance gain").
-- Benchmark (opus-mt, 4 CPU thread): transformers 1023 → CT2 fp16 9297 tok/s; memória 4097→909 MB.
+### Weight traffic of one MTP step
+- verify (32 layers + head): **5228 MB**
+- 2 draft decodes (MTP block 151 + head 796): 2 × 947 = **1894 MB**
+- **total: 7120 MB per step; the head is 34% of it** (read 3 times: verify + 2 drafts)
+- on top: the FA conversion (~700 MB) + f16 KV reads (~534 MB) → ~8.3 GB per step
 
-### Mi már megvan a llama.cpp-ben
-split-KV FA mindhárom backenden (CUDA VEC `parallel_blocks` / MMA stream-K; Vulkan `fa_split_k_reduce`; CPU chunk-partials — **csak f16/f32 KV-ra**), fuzionált QKV/FFN, kvantált súlyok, caching allocator, CUDA graph, `GGML_CUDA_CUBLAS_COMPUTE_TYPE` env-kapcsoló.
+### Measured numbers (170 W, q4_1)
+- no-MTP: 42 t/s → 231 GB/s effective weight bandwidth
+- MTP R3: 59–60 t/s, 41.1 ms per step, acceptance 0.7177, mean length 2.43
+- pp: 1180–1300 t/s
+- Upper bound of the memory system (memcpy D2D, convbench): **408 GB/s**, so the mat-vec runs ~1.7× below the peak.
+
+### CTranslate2 — what explains its speed
+- Its own README and author forum list:
+  - precision (fp16/int8);
+  - vendor BLAS (MKL/cuBLAS; `CUBLAS_COMPUTE_16F` is 2× on GeForce);
+  - layer fusion (masked softmax, fused QKV);
+  - padding removal and batch reordering;
+  - in-place ops and caching.
+- Its own **AWQ int4 GEMV**: 16-byte (`float4`) weight loads + split-K + warp reduction (`src/ops/awq/gemv_gpu.cu`).
+- Its own FlashAttention: **sm_80+ only**, so it does not run on Turing. It was removed from the Python package ("minimal performance gain").
+- Benchmark (opus-mt, 4 CPU threads): transformers 1023 → CT2 fp16 9297 tok/s; memory 4097 → 909 MB.
+
+### What llama.cpp already has
+- split-KV FA on all three backends:
+  - CUDA: VEC `parallel_blocks` / MMA stream-K;
+  - Vulkan: `fa_split_k_reduce`;
+  - CPU: chunk partials, **for f16/f32 KV only**.
+- fused QKV/FFN, quantized weights, a caching allocator, CUDA graphs;
+- the `GGML_CUDA_CUBLAS_COMPUTE_TYPE` env switch.
 
 ---
 
-## 2. Kritikus átvizsgálás — a rev. 1 hibái
+## 2. Critical review — what was wrong with rev. 1
 
-1. **Prioritás**: a legnagyobb, legkockázatosabb tétel volt az első; a legolcsóbb, legnagyobb hozamú (quant-mix) ki sem volt emelve. → WP-A lett az első.
-2. **Bizonyítatlan hipotézis**: a 16 B-os betöltés haszna nem bizonyított → **C0 mikrobenchmark-kapu** kell előtte.
-3. **Túl nagy formátum-terv** (AWQ-stílus) → egyszerűbb 160 B-os igazított blokk (veszteségmentes, +8% méret).
-4. **Hiányzó KV-döntés**: f16 KV vs q4_1 → B1/B2 szétválasztva.
-5. **Hiányzó mérési kockázat**: esti drift ±10% → csak session-ön belüli, interleaved A/B + anchor; modellváltásnál külön anchor.
-6. **A head 3× olvasása** a rev. 1-ben nem szerepelt — ez a legnagyobb egyszeri tétel.
-7. **mmproj** felesleges betöltése → `--no-mmproj`.
+1. **Priority:** the largest and riskiest item came first, and the cheapest one with the biggest return (quant mix) was not even highlighted. → WP-A became first.
+2. **Unproven hypothesis:** the benefit of 16 B loads was not proven, so a **C0 micro-benchmark gate** comes first.
+3. **Format plan too big** (AWQ style) → a simpler 160 B aligned block (lossless, +8% size).
+4. **Missing KV decision:** f16 KV vs q4_1 → split into B1/B2.
+5. **Missing measurement risk:** evening drift is ±10%. Use only in-session, interleaved A/B with an anchor, and a separate anchor when switching models.
+6. **The head is read 3 times.** This was missing from rev. 1, and it is the largest single item.
+7. **mmproj** is loaded needlessly → `--no-mmproj`.
 
 ---
 
-## 3. Work package-ek (prioritás szerint)
+## 3. Work packages (by priority)
 
-### WP-A — Custom quant mix (0 kód, minden backenden hat) ★ első
-- **Mit**: a head és a túlprecíz tensorok újrakvantálása.
-- **Eszköz**: `llama-quantize --output-tensor-type q5_K|q4_K --tensor-type 'ffn_down=q5_K' --tensor-type 'ssm_out=q5_K'` (tensor-szintű felülírás létezik).
-- **Változatok / várható forgalom-csökkenés (MTP lépés)**:
-  - A1: head q5_K (700 MB) → −402 MB (−5,7%)
-  - A2: head q4_K (546 MB) → −750 MB (−10,5%)
+### WP-A — custom quant mix (no code, affects every backend) ★ first
+- **What:** requantize the head and the overly precise tensors.
+- **Tool:** `llama-quantize --output-tensor-type q5_K|q4_K --tensor-type 'ffn_down=q5_K' --tensor-type 'ssm_out=q5_K'` (per-tensor overrides exist).
+- **Variants / expected traffic reduction (MTP step):**
+  - A1: head q5_K (700 MB) → −402 MB (−5.7%)
+  - A2: head q4_K (546 MB) → −750 MB (−10.5%)
   - A3: A2 + ffn_down q5_K + ssm_out q5_K → ~−1014 MB (−14%)
-  - A4: mind q4_K → ~−1197 MB (−17%)
-- **Várható sebesség**: +8-15% tg (MTP), +4-8% no-MTP; pp kb. változatlan (compute-bound); VRAM 5,9→~5,2 GB (szabad hely f16 KV-hez!).
-- **Minőség-kapu**: `llama-perplexity` + KL a baseline-hoz, és **acceptance-ellenőrzés** (a draft ugyanazt a headet használja → az acceptance változhat; a mean len-t is nézni kell).
-- **Hordozhatóság**: automatikus (CPU/CUDA/Vulkan/ROCm ugyanazt a GGUF-ot eszi).
+  - A4: all q4_K → ~−1197 MB (−17%)
+- **Expected speed:**
+  - tg +8–15% with MTP, +4–8% without;
+  - pp roughly unchanged (compute-bound);
+  - VRAM 5.9 → ~5.2 GB, which frees room for f16 KV.
+- **Quality gate:**
+  - `llama-perplexity` + KL against the baseline;
+  - an **acceptance check**: the draft uses the same head, so acceptance may change; look at the mean length too.
+- **Portability:** automatic; CPU, CUDA, Vulkan and ROCm all consume the same GGUF.
 
-### WP-B — KV: f16 vs q4_1, illetve CUDA KV-shadow
-- **B1 (config, 0 kód)**: `-ctk f16 -ctv f16` újramérés MTP-vel; várható +4-5%; VRAM +450 MB @80k (7,75→8,2 GB, belefér; a WP-A még szabadít is rajta).
-- **B2 (kód, ha q4_1 marad)**: a CUDA MMA-út **KV-shadow**-ja: a KV-write mellé f16 másolat készül, az FA azt olvassa → a teljes-KV konverzió (700 MB/lépés) eltűnik. Kockázat: cache-shift/rollback invalidáció (epoch-számláló), a VEC út (batch 1) változatlan.
-- **Várható**: +4-7% MTP.
+### WP-B — KV: f16 vs q4_1, or a CUDA KV shadow
+- **B1 (config, no code):** re-measure `-ctk f16 -ctv f16` with MTP.
+  - Expected +4–5%.
+  - VRAM +450 MB at 80k (7.75 → 8.2 GB, fits; WP-A even frees some).
+- **B2 (code, if q4_1 stays):** a **KV shadow** for the CUDA MMA path.
+  - An f16 copy is made next to the KV write and FA reads it, so the full-KV conversion (700 MB per step) disappears.
+  - Risk: invalidation on cache shift/rollback (epoch counter). The VEC path (batch 1) is unchanged.
+- **Expected:** +4–7% with MTP.
 
-### WP-C — GEMV-mikrobenchmark → (ha nyer) 160 B-os igazított q4_K + 16 B betöltés
-- **C0 (kapu, ~30 perc)**: szintetikus kernel-benchmark: 4/8/16 B-os betöltés, azonos 5,5 GB forgalom → GB/s; eldönti, van-e egyáltalán sávszélesség-nyereség.
-- **C1**: új típus: q4_K, **160 bájtos blokk** (128 B kvantum + 12 B skála + d/dmin + pad), 16 B-ra igazítva, **veszteségmentes repack** (+8,1% méret).
-- **C2**: CUDA MMVQ (+MMQ fallback nagy batchre) 16 B-os betöltéssel; ROCm automatikus (hipify).
-- **C3**: CPU `vec_dot` (16 B/AVX2) és Vulkan matvec shader (`vec4`) ugyanarra az elrendezésre.
-- **Várható**: +20-40% a decode-on, **ha** a hipotézis áll; nagy munka (új ggml-típus + konverter + 3 backend).
+### WP-C — GEMV micro-benchmark → (if it wins) 160 B aligned q4_K + 16 B loads
+- **C0 (gate, ~30 min):** a synthetic kernel benchmark with 4/8/16 B loads and the same 5.5 GB of traffic → GB/s. It decides whether there is any bandwidth gain at all.
+- **C1:** new type: q4_K with a **160-byte block** (128 B quants + 12 B scales + d/dmin + pad), aligned to 16 B. A **lossless repack** (+8.1% size).
+- **C2:** CUDA MMVQ (+MMQ fallback for large batches) with 16 B loads; ROCm comes automatically via hipify.
+- **C3:** CPU `vec_dot` (16 B / AVX2) and a Vulkan mat-vec shader (`vec4`) for the same layout.
+- **Expected:** +20–40% on decode, **if** the hypothesis holds. A large amount of work: new ggml type + converter + 3 backends.
 
-### WP-D — CPU FA split-KV kvantált KV-ra (portabilitás)
-- `ggml/src/ggml-cpu/ops.cpp:9566`: a `kv_is_f32_or_f16` feltétel kiterjesztése kvantált KV-ra (a chunk-partial + LSE reduce út már megvan).
-- Várható: CPU hosszú kontextus +10-30%; CUDA/Vulkan változatlan; ROCm nem érintett.
+### WP-D — CPU FA split-KV for quantized KV (portability)
+- `ggml/src/ggml-cpu/ops.cpp:9566`: extend the `kv_is_f32_or_f16` condition to quantized KV. The chunk-partial + LSE reduce path already exists.
+- Expected: +10–30% on long CPU contexts; CUDA and Vulkan unchanged; ROCm not affected.
 
-### WP-E — Újramérések a WP-A után
-- `--spec-draft-n-max 3` (olcsóbb head mellett), `-ub`, FA-kernel választás, f16 KV kombináció.
-- Esetleg a draft **külön, kisebb headje** (extra GGUF-tensor + kód) — csak ha a közös head Q4_K minősége nem elég a verify-nak.
+### WP-E — re-measurements after WP-A
+- `--spec-draft-n-max 3` (with a cheaper head), `-ub`, FA kernel choice, combination with f16 KV.
+- Possibly a **separate, smaller head** for the draft (extra GGUF tensor + code), only if the quality of a shared Q4_K head is not good enough for the verify.
 
-### WP-F — Apróságok
-- `--no-mmproj` (RAM + load-idő).
-- Batch-reordering (hossz szerinti slot-rendezés) — csak több párhuzamos kérésnél; nálunk (`--parallel 1`) elhanyagolható.
+### WP-F — small items
+- `--no-mmproj` (RAM + load time).
+- Batch reordering (sorting slots by length) only matters with several parallel requests; for us (`--parallel 1`) it is negligible.
 
 ---
 
-## 4. Hordozhatósági mátrix
+## 4. Portability matrix
 
-| WP | CPU | CUDA | Vulkan | ROCm | Megjegyzés |
+| WP | CPU | CUDA | Vulkan | ROCm | Note |
 |---|---|---|---|---|---|
-| A quant-mix | ✓ | ✓ | ✓ | ✓ | csak GGUF, kód nélkül |
+| A quant mix | ✓ | ✓ | ✓ | ✓ | GGUF only, no code |
 | B1 f16 KV | ✓ | ✓ | ✓ | ✓ | config |
-| B2 KV-shadow | – | ✓ | – | ✓ (hipify) | CUDA-specifikus optimalizálás |
-| C repack | ✓ | ✓ | ✓ | ✓ | új típus; minden backenden kernel kell |
-| D CPU split | ✓ | – | – | – | CPU-only |
+| B2 KV shadow | – | ✓ | – | ✓ (hipify) | CUDA-specific optimization |
+| C repack | ✓ | ✓ | ✓ | ✓ | new type; every backend needs a kernel |
+| D CPU split | ✓ | – | – | – | CPU only |
 | F mmproj | ✓ | ✓ | ✓ | ✓ | config |
 
-ROCm: a `ggml-hip/CMakeLists.txt` a `../ggml-cuda/*.cu` forrásokat fordítja (hipify a buildben) → a CUDA-változás automatikusan átvihető, ha nincs CUDA-only API; **a fordulás az elfogadási kritérium**.
+ROCm: `ggml-hip/CMakeLists.txt` compiles the `../ggml-cuda/*.cu` sources (hipify in the build).
+So a CUDA change carries over automatically when it uses no CUDA-only API. **A clean build is the acceptance criterion.**
 
 ---
 
-## 5. Mérési protokoll (kötelező, a kampány szabályai szerint)
+## 5. Measurement protocol (mandatory, by the campaign rules)
 
-- 170 W ellenőrzés; lib-út + md5 + env bizonyíték-log; interleaved A/B + anchor; 60 s cooldown; nincs forrás-szerkesztés/fordítás mérés közben.
-- Értékelés: rep0 (Vulkan R3), medánok, delta-párok; `results/summary.csv` sorok; acceptance + mean len ellenőrzés.
-- **Modellváltásnál** (WP-A): régi modell anchor → új modell → régi anchor újra; különben a ±10%-os session-drift elnyeli a hatást.
-- Minden WP csak **mért győzelem** esetén marad; a vesztesek dokumentálva (results.md).
+- Before measuring:
+  - check 170 W;
+  - log evidence: lib path, md5, env.
+- During measuring:
+  - interleaved A/B with an anchor;
+  - 60 s cooldown;
+  - no source edits or builds.
+- Evaluation:
+  - rep0 (Vulkan R3), medians, delta pairs;
+  - rows in `results/summary.csv`;
+  - check acceptance and mean length.
+- **When switching models** (WP-A): old model anchor → new model → old anchor again. Otherwise the ±10% session drift swallows the effect.
+- A WP stays only with a **measured win**; the losers are documented (results.md).
 
 ---
 
-## 6. Nyitott döntések (a user válasza kell)
+## 6. Open decisions (need the user's answer)
 
-1. **WP-A head**: mehet-e a **q4_K** (legnagyobb nyereség, ~−10,5%), vagy a biztonságosabb **q5_K** (−5,7%)?
-2. **WP-A forrás**: a meglévő UD-Q4_K_XL-ből újrakvantáljunk (gyors, kész), vagy töltsük le a **BF16 originált** (jobb minőség, ~18 GB letöltés)?
-3. **WP-B**: elfogadható-e a **f16 KV** (+450 MB VRAM, +4-5%) a q4_1 helyett, vagy marad a q4_1 + CUDA shadow?
-4. **WP-C**: ha a C0 mikrobenchmark nyer, belevágunk a **160 B-os formátumba** (nagy munka: új típus + 3 backend + konverter)?
-5. **WP-E**: kell-e a draft külön headje (extra modell-tensor + kód), vagy elég a közös head?
+1. **WP-A head:** may it go to **q4_K** (largest gain, ~−10.5%), or the safer **q5_K** (−5.7%)?
+2. **WP-A source:**
+   - requantize from the existing UD-Q4_K_XL (fast, already available);
+   - or download the **BF16 original** (better quality, ~18 GB download).
+3. **WP-B:** is **f16 KV** acceptable (+450 MB VRAM, +4–5%) instead of q4_1, or does q4_1 stay with the CUDA shadow?
+4. **WP-C:** if the C0 micro-benchmark wins, do we start the **160 B format**? It is large work: new type + 3 backends + converter.
+5. **WP-E:** is a separate draft head needed (extra model tensor + code), or is the shared head enough?
 
 ---
 
-## 7. Sorrend (javasolt)
+## 7. Order (proposed)
 
-1. **WP-A1/A2** (quant-mix, 0 kód) — 1-2 óra mérés + minőség-kapu → várhatóan a legnagyobb olcsó nyereség.
-2. **WP-B1** (f16 KV) — 1 óra, ha a user engedi.
-3. **WP-E** (n-max, -ub újramérés) — 1 óra.
-4. **WP-C0** (mikrobenchmark-kapu) — 30 perc, döntés a nagy munkáról.
-5. **WP-D** (CPU split-KV) — fél nap, portabilitási demonstráció.
-6. **WP-C1-C3** (csak ha C0 nyer) — nagy munka.
+1. **WP-A1/A2** (quant mix, no code) — 1–2 hours of measurement + quality gate; expected to be the largest cheap gain.
+2. **WP-B1** (f16 KV) — 1 hour, if the user allows it.
+3. **WP-E** (n-max, -ub re-measurement) — 1 hour.
+4. **WP-C0** (micro-benchmark gate) — 30 minutes; decides on the large work.
+5. **WP-D** (CPU split-KV) — half a day; a portability demonstration.
+6. **WP-C1–C3** (only if C0 wins) — large work.
 
-**Implementáláshoz agent-váltás szükséges.**
+**Implementing requires an agent switch.**

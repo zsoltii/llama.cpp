@@ -1,155 +1,160 @@
-# llama.cpp gyorsítás — 3. RÉSZ: az MTP-lépés overheadje
+# llama.cpp speedup — PART 3: the overhead of the MTP step
 
-Állapot: **terv** (2026-10-26). Előzmény: 36. kör — az MTP-lépés 146 GB/s-on
-fut, az MTP nélküli decode 345 GB/s-on → a lépés nem byte-kötött. Ez a terv a
-kódból (`common/speculative.cpp`, `tools/server/server-context.cpp`,
-`src/llama-context.cpp`) azonosított konkrét overhead-forrásokat célozza.
+Status: **plan** (2026-10-26).
 
-## Mi történik egy MTP-lépésben (n_max = 2, qwen35)
+Background: round 36 showed that the MTP step runs at 146 GB/s while decode without MTP runs at 345 GB/s, so the step is not byte-bound.
+This plan targets concrete overhead sources identified in the code: `common/speculative.cpp`, `tools/server/server-context.cpp`, `src/llama-context.cpp`.
 
-| # | hívás | kontextus | batch | kimenet | gráf |
+## What happens in one MTP step (n_max = 2, qwen35)
+
+| # | call | context | batch | outputs | graph |
 |---|---|---|---|---|---|
-| 1 | verify (`llama_decode`) | tgt | 3 token | 3 | reuse |
-| 2 | `process()` catch-up (`speculative.cpp:1656`) | dft | 3 token | **0** | **mindig újraépül** |
-| 3 | `draft()` 1. lépés | dft | 1 token | 1 | **mindig újraépül** |
-| 4 | `draft()` 2. lépés | dft | 1 token | 1 | reuse |
+| 1 | verify (`llama_decode`) | tgt | 3 tokens | 3 | reuse |
+| 2 | `process()` catch-up (`speculative.cpp:1656`) | dft | 3 tokens | **0** | **always rebuilt** |
+| 3 | `draft()` step 1 | dft | 1 token | 1 | **always rebuilt** |
+| 4 | `draft()` step 2 | dft | 1 token | 1 | reuse |
 
-- Lépésenként **4 blokkoló `graph_compute`** + 3 CPU-oldali sampling/readback.
-- A catch-up a verify-batch **mindhárom** tokenét dekódolja a dft KV-ba, a
-  később elutasított draftokat is (az elfogadás ekkor még nem ismert).
-- **Gráf-újraépítés:** `get_gf_res_prev()` (`llama-context.cpp:2610`) két
-  slotot tart `n_outputs > 0` szerint, de reuse csak akkor van, ha a slot az
-  utoljára aktív (`gf_res_prev_active == res`, mert a sched-allokáció közös).
-  A 0-kimenetes catch-up és az 1-kimenetes draft váltakozása miatt a dft
-  kontextus **lépésenként 2× újraépít** (sched reset + alloc + Vulkan
-  gráf-optimalizálás / CUDA graph újracapture).
-- Becslés (rövid ctx, Vulkan, 250 W): verify ~19–22 ms, 2 draft-lépés
-  byte-alapon ~6 ms, catch-up ~1 ms → ~28–30 ms várható a mért **49,3 ms**
-  helyett. A ~20 ms-os rés a fő célpont. (Becslés, mérni kell — G0.)
+- Each step has **4 blocking `graph_compute` calls** plus 3 CPU-side sampling/readback steps.
+- The catch-up decodes **all three** tokens of the verify batch into the dft KV, including drafts that are rejected later (acceptance is not known yet at that point).
+- **Graph rebuilds:**
+  - `get_gf_res_prev()` (`llama-context.cpp:2610`) keeps two slots, keyed by `n_outputs > 0`.
+  - A graph is only reused when its slot was the last active one (`gf_res_prev_active == res`), because the sched allocation is shared.
+  - The 0-output catch-up and the 1-output draft alternate, so the dft context **rebuilds twice per step**: sched reset + alloc + Vulkan graph optimization / CUDA graph re-capture.
+- Estimate (short context, Vulkan, 250 W):
+  - verify ~19–22 ms, 2 draft steps ~6 ms by bytes, catch-up ~1 ms;
+  - that is ~28–30 ms expected, against the measured **49.3 ms**.
+  - The ~20 ms gap is the main target. (Estimate, must be measured — G0.)
 
-## Mérési hiba a meglévő instrumentációban — JAVÍTVA (38. kör)
+## Measurement bug in the existing instrumentation — FIXED (round 38)
 
-`LLAMA_GRAPH_TIMING` (`llama-context.cpp`, lokális patch): a
-`static int64_t n_graph` **függvény-statikus, tehát a tgt és a dft kontextus
-közös számlálója**, és csak minden 16. hívást írja ki. MTP-vel a ciklus
-pontosan 4 gráf/lépés → a 16-os mintavétel **mindig ugyanazt a pozíciót**
-(itt: az újraépülő catch-up gráfot) látja. A 36. kör megfigyelése („csak
-`built=1` sorokat ír") ennek az aliasingnak tűnik, nem a reuse hiányának
-általános jele. Javítás: kontextusonkénti számláló, minden hívás naplózása
-(vagy aggregált statisztika `(ctx_type, n_tokens, n_outputs, built)` szerint),
-`n_outputs` kiírása. Ugyanez a `synchronize()`-beli `n_sync % 16`-ra.
+`LLAMA_GRAPH_TIMING` (`llama-context.cpp`, local patch):
+- `static int64_t n_graph` is **function-static, so the tgt and dft contexts share one counter**, and only every 16th call is printed.
+- With MTP the cycle is exactly 4 graphs per step, so sampling every 16th call **always sees the same position** (here: the rebuilt catch-up graph).
+- The round 36 observation ("it only prints `built=1` lines") looks like this aliasing, not a general sign that reuse is missing.
 
-## Első eredmény (38. kör, előzetes)
+Fix:
+- one counter per context;
+- log every call, or aggregate statistics by `(ctx_type, n_tokens, n_outputs, built)`;
+- print `n_outputs`.
 
-Az instrumentáció-javítás kész. Rövid füstteszt (Vulkan, 170 W, 300 token):
-lépés ~44,8 ms, ebből a gráfokban ~23 ms (verify 15,0, 2 draft 2×2,1,
-catch-up 2,4, sync ~1,5) → **~22 ms a gráfokon kívül**. A catch-up és az 1.
-draft-gráf minden lépésben újraépül (22/22, 22/42). → A G0/2 (szerver-oldali
-időzítő) a legsürgősebb; a G1 a GPU-oldali részt (~3 ms) célozza.
+The same applies to `n_sync % 16` in `synchronize()`.
 
-## 39. kör — a felbontás eredménye (felülírja a fenti „~22 ms a gráfokon kívül” olvasatot)
+## First result (round 38, preliminary)
 
-- A rés **GPU-idő** volt (a Vulkan `graph_compute` nem blokkol végig).
-- Lépés (alap): verify ~32 ms (GPU 30,6), draft ~8 ms (GPU ~4,6),
-  catch-up ~3 ms (GPU ~1,3), szerver ~1 ms.
-- Fő ok: a verify n=3 k-quant matvec 2,6× lassabb az n=1-nél → új
-  **G5: `GGML_VK_KQ_BATCH_RM=4`** — verify −14%, t/s +10% (results.md 39. kör).
-- **G5 45k-n igazolva** (lépés −7,6%, tg +9,2%, results.md 39b) → napi parancsban.
-- Új prioritás: G1 (draft/catch-up CPU-oldal, ~4–5 ms)
-  → G2 → G3. CUDA MMVQ n=3 ellenőrzése.
+The instrumentation fix is done. Short smoke test (Vulkan, 170 W, 300 tokens):
+- the step takes ~44.8 ms;
+- ~23 ms of it is in graphs: verify 15.0, 2 drafts 2×2.1, catch-up 2.4, sync ~1.5;
+- so **~22 ms is outside the graphs**.
 
-## G0 — lépés-felbontás (instrumentáció, kód ~40 sor, env-gated)
+The catch-up and the 1st draft graph are rebuilt on every step (22/22, 22/42).
+→ G0/2 (server-side timer) is the most urgent; G1 targets the GPU-side part (~3 ms).
 
-1. ~~A `LLAMA_GRAPH_TIMING` javítása + a dft `n_reused` kiírása~~ — **KÉSZ** (38. kör).
-2. ~~Szerver-oldali lépés-időzítő~~ — **KÉSZ** (`LLAMA_SERVER_TIMING`, 39. kör): verify decode,
-   `common_speculative_process`, `common_speculative_draft`, verify-sampling +
-   accept, `yield_to_queue` várakozás — ms/lépés átlag 64 lépésenként.
-3. `GGML_VK_PERF_LOGGER=1` egy rövid MTP-futásra: a draft-gráf `TOP_K`
-   (248k vocab), `GET_ROWS`, a head `MUL_MAT` és az FA ideje.
-4. Ugyanez CUDA-n (`GGML_CUDA_DISABLE_GRAPHS=1` vs alap: a graph-recapture ára).
+## Round 39 — result of the breakdown (overrides the "~22 ms outside the graphs" reading above)
 
-**Kimenet:** a 49,3 ms felbontása → ez dönti el a G1–G4 sorrendjét.
+- The gap was **GPU time**: the Vulkan `graph_compute` does not block all the way through.
+- Step (baseline):
+  - verify ~32 ms (GPU 30.6);
+  - draft ~8 ms (GPU ~4.6);
+  - catch-up ~3 ms (GPU ~1.3);
+  - server ~1 ms.
+- Main cause: the verify n=3 k-quant mat-vec is 2.6× slower than n=1.
+  - New **G5: `GGML_VK_KQ_BATCH_RM=4`** — verify −14%, t/s +10% (results.md round 39).
+  - **G5 confirmed at 45k** (step −7.6%, tg +9.2%, results.md 39b), so it went into the daily command.
+- New priority: G1 (draft/catch-up CPU side, ~4–5 ms) → G2 → G3. Check CUDA MMVQ with n=3.
 
-## G1 — catch-up beolvasztása a draft 1. lépésébe (kód, `speculative.cpp`)
+## G0 — step breakdown (instrumentation, ~40 lines of code, env-gated)
 
-**Ötlet:** a `process()` generálási batchnél ne dekódoljon, csak jegyezze fel
-a (token, pos, h-sor) hármasokat; az `accept()` vágja le az elfogadott
-prefixre; a `draft()` 1. lépése egy batchben küldje: `[elfogadott catch-up
-tokenek (kimenet nélkül)] + [id_last (kimenettel)]`. Prefillnél (több ubatch)
-marad az azonnali catch-up.
+1. ~~Fix `LLAMA_GRAPH_TIMING` + print the dft `n_reused`~~ — **DONE** (round 38).
+2. ~~Server-side step timer~~ — **DONE** (`LLAMA_SERVER_TIMING`, round 39).
+   It reports the ms/step average over 64 steps for each of:
+   - the verify decode;
+   - `common_speculative_process`;
+   - `common_speculative_draft`;
+   - verify sampling + accept;
+   - the `yield_to_queue` wait.
+3. `GGML_VK_PERF_LOGGER=1` on a short MTP run: time of the draft graph's `TOP_K` (248k vocab), `GET_ROWS`, the head `MUL_MAT` and FA.
+4. The same on CUDA (`GGML_CUDA_DISABLE_GRAPHS=1` vs default: the cost of graph re-capture).
 
-- **−1 `graph_compute` + 1 szinkron lépésenként**, és nem kerülnek elutasított
-  tokenek a dft KV-ba.
-- A „0-kimenetes" gráf eltűnik a dft kontextusból → a slot-váltás miatti
-  egyik újraépítés is.
-- Upstream is ismert TODO: `[TAG_SPEC_AVOID_DRAFT_REEVAL]`
-  (`server-context.cpp:4619`).
-- Figyelni: a szerver dft-oldali `seq_rm`-je a már nem létező pozíciókra
-  (ártalmatlan kell legyen), a `pending_h` kezelése, `n_seq > 1`.
-- Helyesség: azonos prompt + temp 0 → **bitre azonos draftok és acceptance**
-  a régi úttal (a draft-tokenek nem változhatnak, csak a sorrend/batching).
-- Várható: −3…−6 ms/lépés (**+6…+12% tg**), minden backenden.
+**Output:** the breakdown of the 49.3 ms, which decides the order of G1–G4.
 
-## G2 — mohó draft-sampler a backend top-k(10) helyett (kód, ~10 sor)
+## G1 — merge the catch-up into the first draft step (code, `speculative.cpp`)
 
-A draft-lánc a backenden `top_k(10)`-et futtat a teljes 248k-s vocabon
-(`speculative.cpp:1509`), de mohó draftolásnál (`!params.probabilistic`) csak
-`cur_p->data[0]` kell. `llama_sampler_init_greedy()` → `ggml_argmax`
-(egymenetes redukció) a top-k helyett, lépésenként 2×. A `p_min` ág 0-s
-küszöbbel nem használja a `p`-t, de ellenőrizni kell.
+**Idea:**
+- For a generation batch, `process()` does not decode; it only records the (token, pos, h-row) triples.
+- `accept()` trims them to the accepted prefix.
+- Step 1 of `draft()` sends them in one batch: `[accepted catch-up tokens (no outputs)] + [id_last (with output)]`.
+- Prefill (several ubatches) keeps the immediate catch-up.
 
-- Olcsó kísérlet; a G0/3 `TOP_K` ideje mondja meg, mennyit ér.
-- Helyesség: azonos draftok (az argmax = top-k első eleme).
+What it gives:
+- **One `graph_compute` and one sync fewer per step**, and rejected tokens never enter the dft KV.
+- The "0-output" graph disappears from the dft context, removing one of the rebuilds caused by slot switching.
+- It is also a known upstream TODO: `[TAG_SPEC_AVOID_DRAFT_REEVAL]` (`server-context.cpp:4619`).
 
-## G3 — csökkentett vocab a draft headhez (FR-Spec minta; a 2.4 helyett)
+Watch out for:
+- the server's dft-side `seq_rm` on positions that no longer exist (should be harmless);
+- the handling of `pending_h`;
+- `n_seq > 1`.
 
-A head 3× olvasódik lépésenként (2,50 GB, a forgalom 35%-a); ebből 2× a
-draft. A draftnak elég a leggyakoribb ~32k token sora (FR-Spec: a vocab
-~13%-a fedi a tokenek túlnyomó részét).
+Correctness: same prompt + temp 0 → **bitwise identical drafts and acceptance** compared with the old path. The draft tokens must not change, only the ordering/batching.
 
-- A beágyazott `output.weight` sorai összefüggőek → a gyakori sorok
-  bájtmásolással kivághatók egy új tenzorba (Q6_K is), +~110 MB VRAM.
-- A visszaképzés mintája megvan: EAGLE-3 `d2t` (`src/models/eagle3.cpp:307`).
-- Gyakorisági lista: a saját korpusz + általános HU/EN szöveg tokenizálva
-  (`/tokenize`), vagy első közelítésként a BPE-sorrend.
-- Ára: kicsit kisebb acceptance (ha a target token kívül esik a 32k-n, a draft
-  biztosan elhibázza). Mérni: **ms/lépés + acceptance**, ≥2000 token.
-- Várható: −1,45 GB/lépés; a hatás attól függ, mennyire byte-kötött a draft
-  (G0/3) — ha a draft is overhead-kötött, ez keveset hoz. **G0 után döntsünk.**
-- Kódméret: közepes (modell-betöltés + qwen35 MTP-gráf + id-visszaképzés).
+Expected: −3…−6 ms per step (**+6…+12% tg**), on every backend.
 
-## G4 — a dft gráf-újraépítés ára (csak ha G0 szerint jelentős)
+## G2 — greedy draft sampler instead of the backend top-k(10) (code, ~10 lines)
 
-Ha G1 után is marad váltakozás (az 1. lépés batch-mérete az elfogadástól
-függően 2–4 token, a 2. lépésé 1), és a G0 szerint az újraépítés drága
-(CUDA graph recapture, Vulkan graph_optimize), akkor: az 1. lépés
-fix 1+n_max tokenre paddingolása (maszkolt, kimenet nélküli dummy sorokkal)
-→ állandó gráf-topológia. Bonyolultabb, ezért csak mérés után.
+- The draft chain runs `top_k(10)` on the backend over the full 248k vocabulary (`speculative.cpp:1509`).
+- With greedy drafting (`!params.probabilistic`), only `cur_p->data[0]` is needed.
+- Fix: `llama_sampler_init_greedy()` → `ggml_argmax` (a single-pass reduction) instead of top-k, twice per step.
+- The `p_min` branch with a threshold of 0 does not use `p`, but this must be checked.
 
-## Mérési protokoll
+- A cheap experiment; the G0/3 `TOP_K` time tells how much it is worth.
+- Correctness: identical drafts (argmax = the first element of top-k).
 
-- **170 W ellenőrzése minden mérés előtt** (36. kör: 250 W-on
-  futottunk, 60k-n thermál-throttling; 2026-10-26 este ismét 170 W él).
-- Rövid kontextus (2,8k) a stabil A/B-hez, 41k az igazoláshoz;
-  **ms/lépés + acceptance**, nem t/s. Interleaved A/B, 60 s cooldown, első
-  2 futás eldobva (bemelegedési szabály).
-- Minden kódváltozás env-kapcsolóval (régi út visszahívható), a megszokott
-  lib-izolációval (`LD_LIBRARY_PATH`).
+## G3 — reduced vocabulary for the draft head (FR-Spec pattern; replaces 2.4)
 
-## Sorrend
+The head is read 3 times per step (2.50 GB, 35% of the traffic), twice of that for the draft.
+The draft only needs the rows of the ~32k most frequent tokens (FR-Spec: ~13% of the vocabulary covers the vast majority of tokens).
 
-G0 (instrumentáció + a timing-aliasing javítása) → G2 (olcsó) → G1 → G0
-újra → G3 / G4 a felbontás alapján.
+How:
+- The rows of the embedded `output.weight` are contiguous, so the frequent rows can be cut into a new tensor with a byte copy (also Q6_K), for +~110 MB VRAM.
+- The remapping pattern already exists: EAGLE-3 `d2t` (`src/models/eagle3.cpp:307`).
+- Frequency list: our own corpus plus general HU/EN text tokenized via `/tokenize`, or as a first approximation the BPE order.
 
-## 40. kör után — állapot és következő lépések
+Cost and expected gain:
+- Acceptance drops slightly: if the target token falls outside the 32k, the draft surely misses it.
+  Measure **ms/step + acceptance** over at least 2000 tokens.
+- Expected: −1.45 GB per step. The effect depends on how byte-bound the draft is (G0/3); if the draft is overhead-bound too, this brings little. **Decide after G0.**
+- Code size: medium (model loading + qwen35 MTP graph + id remapping).
 
-- G1 kész (env, ~1%, nem éri meg), G2 elvetve, G5 Vulkanon env, CUDA-n
-  (rows_per_block 4) alapértelmezett.
-- **G6 (új, Vulkan, legnagyobb maradék):** FA több tokenre a GQA-ágon —
-  a `ggml_vk_flash_attn` `N <= 8` ágán a token×fej sorok egy workgroupba,
-  így a K/V egyszer olvasódik. Shader: `flash_attn_base.glsl` (`init_indices`,
-  `gqaStore`), `flash_attn.comp`, `flash_attn_cm1.comp`, `flash_attn_cm2.comp`
-  (Q/maszk 3D címzés, kimenet `(t, h)` szerint). Várható: 45k-n ~7 ms/verify
-  (Vulkan lépés −13%). Teszt: `test-backend-ops -o FLASH_ATTN_EXT`.
-- **G7 (CUDA):** a draft-lépés ~6 ms (2 draft, a fej 2× ~2 ms) — a G3
-  (szűkített vocabú draft head) itt a legnagyobb tétel.
+## G4 — the cost of dft graph rebuilds (only if G0 shows it matters)
+
+Condition:
+- some alternation remains after G1: step 1's batch size is 2–4 tokens depending on acceptance, step 2's is 1;
+- and G0 shows the rebuild is expensive (CUDA graph recapture, Vulkan graph_optimize).
+
+Then: pad step 1 to a fixed 1+n_max tokens with masked dummy rows without outputs, which gives a constant graph topology.
+This is more complicated, so only after measuring.
+
+## Measurement protocol
+
+- **Check 170 W before every measurement.** In round 36 we ran at 250 W and hit thermal throttling at 60k; since the evening of 2026-10-26, 170 W is active again.
+- Short context (2.8k) for stable A/B, 41k for confirmation.
+- Measure **ms/step + acceptance**, not t/s.
+- Interleaved A/B, 60 s cooldown, discard the first 2 runs (warm-up rule).
+- Every code change behind an env switch (the old path can be restored), with the usual lib isolation (`LD_LIBRARY_PATH`).
+
+## Order
+
+G0 (instrumentation + timing-aliasing fix) → G2 (cheap) → G1 → G0 again → G3 / G4 depending on the breakdown.
+
+## After round 40 — status and next steps
+
+- G1 done (env, ~1%, not worth it), G2 dropped. G5 is env-gated on Vulkan and the default on CUDA (rows_per_block 4).
+- **G6 (new, Vulkan, the largest remaining item):** FA for several tokens in the GQA path.
+  - Change: on the `N <= 8` branch of `ggml_vk_flash_attn`, put the token×head rows into one workgroup, so K/V is read once.
+  - Shaders:
+    - `flash_attn_base.glsl` (`init_indices`, `gqaStore`);
+    - `flash_attn.comp`, `flash_attn_cm1.comp`, `flash_attn_cm2.comp` (3D addressing of Q and the mask, output by `(t, h)`).
+  - Expected: ~7 ms per verify at 45k (Vulkan step −13%).
+  - Test: `test-backend-ops -o FLASH_ATTN_EXT`.
+  - *(Done later for the scalar shader: b50-results.md finding 24.)*
+- **G7 (CUDA):** the draft step takes ~6 ms (2 drafts, the head 2× ~2 ms). G3 (reduced-vocabulary draft head) is the largest item here.
