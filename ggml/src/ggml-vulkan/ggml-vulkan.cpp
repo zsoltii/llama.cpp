@@ -8419,6 +8419,32 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
 
+    // GQA with a few tokens (e.g. MTP verify): the scalar shader can put gqa_T tokens x gqa_ratio heads into one
+    // workgroup, so the tokens share the K/V reads instead of each token reading the whole KV cache.
+    // RTX 2080 Ti, kv=20736, 2 tokens, us: f16 395 -> 219, q8_0 409 -> 305, q4_0 415 -> 245.
+    // Not used on coopmat1 devices (not measured there). GGML_VK_FA_GQA_TOKENS caps gqa_T (1 disables).
+    static const uint32_t fa_gqa_tokens = [] {
+        const char * env = getenv("GGML_VK_FA_GQA_TOKENS");
+        return env ? (uint32_t) std::max(1, atoi(env)) : 8u;
+    }();
+    if (gqa_ratio > 1 && neq1 > 1 && fa_gqa_tokens > 1 && tuning_params.path != FA_COOPMAT1 &&
+            !(mask && ggml_get_op_params_i32(dst, 4) > 0)) {
+        uint32_t gqa_T = std::min<uint32_t>(std::min<uint32_t>(neq1, fa_gqa_tokens), std::max(1u, 8u / gqa_ratio));
+        if (gqa_T > 1) {
+            // all gqa_T * gqa_ratio rows have to fit into one block of rows
+            vk_fa_tuning_params merged = get_fa_tuning_params_scalar(ctx->device, HSK, HSV, gqa_T * gqa_ratio, KV, k_type_eff, v_type_eff, f32acc);
+            gqa_T = std::min(gqa_T, merged.block_rows / gqa_ratio);
+            if (gqa_T > 1) {
+                merged = get_fa_tuning_params_scalar(ctx->device, HSK, HSV, gqa_T * gqa_ratio, KV, k_type_eff, v_type_eff, f32acc);
+            }
+            if (gqa_T > 1 && merged.block_rows >= gqa_T * gqa_ratio) {
+                N = gqa_T * gqa_ratio;
+                workgroups_x = CEIL_DIV((uint32_t) neq1, gqa_T);
+                tuning_params = merged;
+            }
+        }
+    }
+
     float scale         = 1.0f;
     float max_bias      = 0.0f;
     float logit_softcap = 0.0f;

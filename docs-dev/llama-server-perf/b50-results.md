@@ -329,17 +329,40 @@ a quick tesztben (elfogadás 0,56 vs 0,62) brew 56,8 vs saját 61,9.
     1 oszlopnál k > 4096 esetén is a fp shader (q4_K 4096×12288 MMVQ 70 → 60 us). **q4_K/q5_K shader**: a min-tag
     B-összegei soronként helyett egyszer számolódnak (gyártófüggetlen): q4_K n=2 −6..−10%, n=3 −5..−8%, n=1 −2..−3%;
     q5_K −1..−3%. llama-bench pp2 101 → 129–135, tg128 68,6 → 70,4–70,8.
-    - Vulkan FA: nb=2 ≈ 2× nb=1 (a GQA-összevonás csak a fejeket vonja össze, a tokeneket külön munkacsoportok
-      olvassák végig a KV-n) — kv=20736 q8_0 215 vs 418 us. Shader-átírás kellene (tokenek × fejek egy blokkban).
+    - Vulkan FA: nb=2 ≈ 2× nb=1 (a GQA-összevonás csak a fejeket vonta össze, a tokeneket külön munkacsoportok
+      olvasták végig a KV-n) — kv=20736 q8_0 215 vs 418 us. → 24. pont.
     - Vulkan pp2@d20480 GPU-idő 21 ms: mat-vec ~12,9 ms, FA 3,3 ms, apró műveletek (ADD/CPY/RMS_NORM/SCALE,
       5–8 us/db) ~4 ms.
+
+24. **Vulkan FA: tokenek × GQA-fejek egy munkacsoportban** (`flash_attn.comp`, `ggml_vk_flash_attn`): a skaláris
+    shader sora r = token r / gqa, fej r % gqa; a munkacsoport gqa_T tokent kezel (gqa_T·gqa ≤ a blokk sorai), így a
+    tokenek egyszer olvassák a KV-t. Q/maszk/kimenet és a split_k részeredmények soronkénti címzéssel; gqa_T = 1
+    esetén a régi viselkedés. Alapból be (`GGML_VK_FA_GQA_TOKENS`, 1 = ki), kivéve coopmat1 (nincs mérve) és sparse.
+    kv=20736, 2 token, us: f16 395 → 219, q4_0 415 → 245, q8_0 409 → 305, q4_1 462 → 302, q5_0 511 → 372, q5_1 492 →
+    473, iq4_nl 619 → 583 (3 tokennél iq4_nl 872 → 947, a többi gyorsul). FA 5368/5368, teljes Vulkan 21371/21371.
+    Szerver (MTP n=1): q8_0 story 76,3 → 79,2, wiki 66,4 → 73,4; q4_0 wiki 68,4 → 72,9.
+
+K/V-típusok a szerveren (2080 Ti, MTP n=1, a 21–24. pont után; t/s story / wiki tg):
+
+| KV | CUDA | Vulkan (24. előtt) |
+|---|---|---|
+| q8_0 | 97,9 / 85,3 | 76,3 / 66,4 |
+| q4_0 | 95,6 / 84,7 | 74,4 / 68,4 |
+| q4_1 | 96,3 / 84,3 | 79,1 / 67,2 |
+| iq4_nl | 94,7 / 75,5 | 75,6 / 64,6 |
+| q5_0 | 95,2 / 76,0 | 75,3 / 63,6 |
+| q5_1 | 95,4 / 79,0 | 77,4 / 67,1 |
+| f16 | 11 / 9 (nem fér el: a fit CPU-ra tesz rétegeket) | nem indult el |
+
+Vulkanon az első futás egy új KV-típussal ~5 s shader-fordítás (a story pp ~20 t/s), utána a meghajtó gyorsítótárából
+tölt. A q6_0 nem létező KV-típus.
 
 ## Hátra
 
 - FA prefill (coopmat1, Xe2): ~3,5 TFLOPS — a wiki pp kb. harmada. A Br=32 nem segít, a kernel szerkezete (kis
   tile-ok, shmem-softmax, sok barrier) a korlát; mélyebb átírás kellene.
 - Draft LM head (248320×4096 q6_K, 834 MB, 4,3 ms/lépés): kisebb bitszámú másolat vagy szűkített szótár.
-- Vulkan FA: több token + GQA egy munkacsoportban (verify nb=2 a KV-t kétszer olvassa).
+- Vulkan FA token-összevonás coopmat1-en (Intel B50, RDNA3) mérése; iq4_nl/q5_1 lassú dequant a skaláris FA-ban.
 - Vulkan apró műveletek fúziója (~4 ms / verify lépés a 2080 Ti-n).
 - A 23. pont Turingon mérve; Ampere-en (3090) ellenőrizni.
 - Pascal FA prefill: a TILE kernel fp32 Q-tile-ja a 48 KB shared memory határán van (hsk=256), mélyebb átírás kellene.
