@@ -399,6 +399,28 @@ Promptok:
 - **Ajánlás:** a szerverparancshoz `--temp 1.0 --top-k 20 --top-p 0.95 --min-p 0 --presence-penalty 1.5`.
   Ha a webes felületen saját mintavételezési értékek vannak beállítva, ott a Presence penalty-t kell 1,5-re állítani.
 
+**Sebesség a hurokmentes mintavételezéssel** (2080 Ti, 2026-10-29). Mérés: `bench.py` `BENCH_SAMPLING=server`, a fenti
+Qwen-ajánlással, 3 futás medián, seed = 1 + futás, thinking off. t/s.
+
+| | story pp | story tg | wiki pp | wiki tg |
+|---|---|---|---|---|
+| brew Vulkan, MTP nélkül | 696 | 59,8 | 2055 | 54,6 |
+| brew Vulkan, MTP n=1 | 582 | 52,0 | 1801 | 49,8 |
+| eredeti kód, saját Vulkan build, MTP nélkül | 718 | 59,0 | 2123 | 54,2 |
+| eredeti kód, saját Vulkan build, MTP n=1 | 591 | 52,0 | 1856 | 51,1 |
+| eredeti kód, CUDA, MTP nélkül | 1035 | 70,6 | 1969 | 63,1 |
+| eredeti kód, CUDA, MTP n=1 (nem fér el, CPU-ra tesz rétegeket) | 208 | 18,4 | 737 | 16,6 |
+| **saját Vulkan, MTP n=1, defer + `-bs`** | 683 | **61,7** | 1821 | **58,4** |
+| **saját CUDA, MTP n=1, defer + `-bs`** | 1034 | **77,6** | 1798 | **71,2** |
+
+- Az eredeti kódban az MTP ezzel a mintavételezéssel lassít (Vulkan: 59 → 52 tg), a saját buildben gyorsít.
+- A saját build a legjobb eredeti konfighoz képest, tg-ben:
+  - Vulkan: +3% story, +7% wiki;
+  - CUDA: +10% story, +13% wiki.
+- A wiki pp MTP-vel ~10%-kal kisebb, mint MTP nélkül, mert a draft fej is feldolgozza a promptot. Ez az eredeti
+  kódban is így van (2123 → 1856).
+- A greedy mérésekhez (fent: CUDA 97/85, Vulkan 79/73) képest a tg ~20%-kal kisebb, mert a draft elfogadás ~0,6.
+
 **Validálási szabály mostantól:** minden gyorsítás után a pontossági és hallucinációs tesztek (1–3. szint) mellett ezt
 a hurok tesztet is le kell futtatni, minden érintett backenden, az upstreammel azonos mintavételezés mellett.
 - A gyorsítás csak akkor elfogadható, ha a hurok-arány nem rosszabb az upstreaménél (p1: 4/6 alapértelmezett, 0/6
