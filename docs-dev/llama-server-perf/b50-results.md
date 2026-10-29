@@ -410,13 +410,20 @@ Qwen-ajánlással, 3 futás medián, seed = 1 + futás, thinking off. t/s.
 | eredeti kód, saját Vulkan build, MTP n=1 | 591 | 52,0 | 1856 | 51,1 |
 | eredeti kód, CUDA, MTP nélkül | 1035 | 70,6 | 1969 | 63,1 |
 | eredeti kód, CUDA, MTP n=1 (nem fér el, CPU-ra tesz rétegeket) | 208 | 18,4 | 737 | 16,6 |
-| **saját Vulkan, MTP n=1, defer + `-bs`** | 683 | **61,7** | 1821 | **58,4** |
+| saját Vulkan, MTP nélkül | 767 | **63,8** | 2062 | 57,5 |
+| saját Vulkan, MTP n=1, defer + `-bs` | 683 | 61,7 | 1821 | **58,4** |
+| saját CUDA, MTP nélkül | 1100 | 70,6 | 1983 | 62,9 |
 | **saját CUDA, MTP n=1, defer + `-bs`** | 1034 | **77,6** | 1798 | **71,2** |
 
-- Az eredeti kódban az MTP ezzel a mintavételezéssel lassít (Vulkan: 59 → 52 tg), a saját buildben gyorsít.
-- A saját build a legjobb eredeti konfighoz képest, tg-ben:
-  - Vulkan: +3% story, +7% wiki;
-  - CUDA: +10% story, +13% wiki.
+- Az eredeti kódban az MTP ezzel a mintavételezéssel lassít (Vulkan: 59 → 52 tg).
+- A saját buildben:
+  - CUDA-n az MTP gyorsít: +10% story, +13% wiki az MTP nélküli futáshoz képest.
+  - Vulkanon az MTP nem ad gyorsulást: 61,7 / 58,4 MTP-vel, 63,8 / 57,5 nélküle. Mivel MTP nélkül a pp is
+    nagyobb, Vulkanon ennél a mintavételezésnél az MTP nélküli futás az ajánlott.
+- MTP nélkül:
+  - CUDA-n a saját és az eredeti kód azonos (70,6 / 62,9 vs 70,6 / 63,1), mert a CUDA-változtatások az MTP verify
+    lépést célozzák.
+  - Vulkanon a saját build +8% story és +6% wiki tg-t ad a Turing mat-vec beállítások (23. pont) miatt.
 - A wiki pp MTP-vel ~10%-kal kisebb, mint MTP nélkül, mert a draft fej is feldolgozza a promptot. Ez az eredeti
   kódban is így van (2123 → 1856).
 - A greedy mérésekhez (fent: CUDA 97/85, Vulkan 79/73) képest a tg ~20%-kal kisebb, mert a draft elfogadás ~0,6.
