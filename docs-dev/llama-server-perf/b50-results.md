@@ -357,6 +357,57 @@ K/V-típusok a szerveren (2080 Ti, MTP n=1, a 21–24. pont után; t/s story / w
 Vulkanon az első futás egy új KV-típussal ~5 s shader-fordítás (a story pp ~20 t/s), utána a meghajtó gyorsítótárából
 tölt. A q6_0 nem létező KV-típus.
 
+## Pontosság 4. szint: ismétlési hurok (végtelen token-ismétlés), 2026-10-29
+
+**Miért:** a felhasználó hosszú magyar meséknél gyakran kapott végtelen ismétlést Vulkanon és CUDA-n is. Két minta:
+- „épp csak épp csak …”;
+- bekezdésnyi blokkok újra és újra.
+
+A kérdés az volt, hogy a gyorsítások (FA darabolás, vec verify, Vulkan GQA-összevonás, MTP defer, `-bs`) rontják-e a
+numerikát vagy a mintavételezést.
+
+**Mit csináltam:** saját tesztet írtam (`~/llama-bench-results/loop-test/`).
+- `loop-test.py` elindítja a szervert a megadott konfiggal, 128k kontextussal, q8_0 KV-val.
+- A felhasználó két promptját küldi el streamelve, fix seedekkel (1–6), legfeljebb 12000 tokenig, alapértelmezett
+  mintavételezéssel.
+- A rövid periódusú hurkot menet közben felismeri, és megszakítja a generálást.
+- `loop-score.py` utólag pontoz: hurok, ha a kimenet utolsó 200 karaktere legalább háromszor előfordul az utolsó
+  12000 karakterben. Ez a bekezdésnyi (~1100 karakteres) periódust is elkapja.
+- `loop-run.sh` futtatja a konfigokat: cu-full, cu-mtp, cu-nomtp, up-nomtp, up-mtp, vk-full.
+
+Promptok:
+- p0: „tervezz meg egy 10000 szavas gyerekenek szóló mesét, amit később meg kell írnod”
+- p1: „csinálj 10000 szavas mesét avgy hosszabbat”
+
+**Eredmény (2080 Ti, CUDA, hurok / 6 futás):**
+
+| konfig | mintavételezés | p0 | p1 | p1 tg (t/s) |
+|---|---|---|---|---|
+| saját CUDA, MTP n=1, defer + `-bs` | alapértelmezett (temp 0,8, top_k 40, top_p 0,95, min_p 0,05, büntetés nélkül) | 0/6 | 4/6 | ~99–106 |
+| **módosítatlan upstream CUDA, MTP nélkül** | alapértelmezett | 0/6 | **4/6** | ~72 |
+| saját CUDA, MTP n=1, defer + `-bs` | Qwen-ajánlás: `--temp 1.0 --top-k 20 --top-p 0.95 --min-p 0 --presence-penalty 1.5` | – | **0/6** | ~82 |
+
+- A változtatások nem okoznak ismétlést: a módosítatlan upstream MTP nélkül ugyanannyiszor hurkol.
+- Ez a 9B Q4 modell viselkedése hosszú magyar szövegnél, büntetés nélküli mintavételezéssel. Az upstream hurkai
+  ugyanolyanok, mint a felhasználó példái, például „A toll a toll volt. A toll a toll volt. …”.
+- A hurkok alatt a draft elfogadás magas (~0,87, a szokásos ~0,7 helyett), ezért a tg is magasabb (~105 t/s). Ez a
+  bench-számokat torzíthatja (lásd a brew story ¹ megjegyzését).
+- A presence penalty 1,5 megszünteti a hurkot, és a szöveg értelmes marad. A `-bs` mellett is a GPU-n fut (a
+  penalties sampler backend-képes).
+- Ára: a magasabb temp és a büntetés miatt az elfogadás ~0,6-ra esik, a tg ~100 → ~82 t/s. Ez még mindig gyorsabb az
+  MTP nélküli upstreamnél (~72).
+- **Ajánlás:** a szerverparancshoz `--temp 1.0 --top-k 20 --top-p 0.95 --min-p 0 --presence-penalty 1.5`.
+  Ha a webes felületen saját mintavételezési értékek vannak beállítva, ott a Presence penalty-t kell 1,5-re állítani.
+
+**Validálási szabály mostantól:** minden gyorsítás után a pontossági és hallucinációs tesztek (1–3. szint) mellett ezt
+a hurok tesztet is le kell futtatni, minden érintett backenden, az upstreammel azonos mintavételezés mellett.
+- A gyorsítás csak akkor elfogadható, ha a hurok-arány nem rosszabb az upstreaménél (p1: 4/6 alapértelmezett, 0/6
+  Qwen-ajánlással).
+- Futtatás: `~/llama-bench-results/loop-test/loop-run.sh cu-full vk-full up-nomtp`.
+- Csak p1: `ONLY_P=1`.
+- Ismert hiba: a `loop-run.sh` `UP` útvonala ideiglenes könyvtárra mutat; ha hiányzik, újra kell építeni az
+  upstream buildet.
+
 ## Hátra
 
 - FA prefill (coopmat1, Xe2): ~3,5 TFLOPS — a wiki pp kb. harmada. A Br=32 nem segít, a kernel szerkezete (kis
@@ -367,4 +418,14 @@ tölt. A q6_0 nem létező KV-típus.
 - A 23. pont Turingon mérve; Ampere-en (3090) ellenőrizni.
 - Pascal FA prefill: a TILE kernel fp32 Q-tile-ja a 48 KB shared memory határán van (hsk=256), mélyebb átírás kellene.
 - Verify CPU-rögzítés ~7 ms/lépés (nagyrészt átfedésben a GPU-val).
-- Pontosság: kész (1–3. szint, fent) — a saját build a brew-val azonos pontosságú.
+- Pontosság: kész (1–4. szint, fent) — a saját build a brew-val azonos pontosságú, és nem hurkol gyakrabban az
+  upstreamnél. Minden új gyorsítás után mind a négy szintet újra kell futtatni.
+- Hurok teszt Vulkanon (`vk-full`) is: a 2080 Ti-n csak CUDA-n mértem, a felhasználó mindkettőn látta.
+- Köztes mintavételezés mérése: csak `--presence-penalty 1.5` a régi temp 0,8 mellett (vagy DRY, `--dry-multiplier
+  0.8`). Cél: hurok nélkül megtartani a ~100 t/s-ot, mert a Qwen-ajánlás ~18%-ot veszít a draft elfogadáson.
+- A hurok teszt kiterjesztése a többi KV-típusra (q4_0, q4_1, q5_x, iq4_nl) és MTP n=2-re.
+- Vulkan mat-vec n=2 újratervezése (~400 GB/s, CUDA-n ~510), apró műveletek fúziója mindkét backenden (~700 db, ~5 µs
+  egyenként; pl. RMS_NORM+SCALE a GDN l2-normban).
+- iq4_nl/q5_x FA dequant gyorsítása CUDA-n és Vulkanon.
+- Hardver: RTX 3090 (Ampere), RX 6900 XT (ROCm és Vulkan; a csomagokhoz és csoportokhoz sudo kell a felhasználótól).
+- Stabil méréshez: `sudo nvidia-smi -i 1 -lgc 1800,1800` (a felhasználónak kell futtatnia), a zaj most ±10–15%.
