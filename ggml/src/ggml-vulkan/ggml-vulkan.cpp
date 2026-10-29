@@ -5029,7 +5029,10 @@ vk_device ggml_vk_get_device(size_t idx) {
         descriptor_set_layout_create_info.setPNext(&dslbfci);
         device->dsl = device->device.createDescriptorSetLayout(descriptor_set_layout_create_info);
 
-        device->kq_batch_rm = 0;
+        // NVIDIA Turing+: for 2-3 columns (MTP verify) the fp K-quant shader with 4 rows beats MMVQ,
+        // RTX 2080 Ti n=2: q4_K 12288x4096 108 -> 76 us, q5_K 121 -> 87 us, q6_K 248320x4096 1620 -> 1476 us.
+        device->kq_batch_rm = device->vendor_id == VK_VENDOR_ID_NVIDIA &&
+            device->architecture != vk_device_architecture::NVIDIA_PRE_TURING ? 4 : 0;
         if (const char * env = getenv("GGML_VK_KQ_BATCH_RM")) {
             const int val = atoi(env);
             if (val >= 1 && val <= 8) {
@@ -6871,6 +6874,9 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
         switch (src0_type) {
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_Q8_0:
+        // Turing+: the fp K-quant shader is faster here, RTX 2080 Ti q4_K 4096x12288: MMVQ 70 us -> 60 us
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
             return device->architecture == vk_device_architecture::NVIDIA_PRE_TURING;
         default:
             return true;

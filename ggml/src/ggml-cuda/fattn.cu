@@ -439,6 +439,7 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(Q5_0, F16)
     FATTN_VEC_CASES_ALL_D(Q5_1, F16)
     FATTN_VEC_CASES_ALL_D(Q8_0, F16)
+    FATTN_VEC_CASES_ALL_D(IQ4_NL, F16)
     FATTN_VEC_CASES_ALL_D(BF16, F16)
 
     FATTN_VEC_CASES_ALL_D(F16,  Q4_0)
@@ -447,6 +448,7 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(Q5_0, Q4_0)
     FATTN_VEC_CASES_ALL_D(Q5_1, Q4_0)
     FATTN_VEC_CASES_ALL_D(Q8_0, Q4_0)
+    FATTN_VEC_CASES_ALL_D(IQ4_NL, Q4_0)
     FATTN_VEC_CASES_ALL_D(BF16, Q4_0)
 
     FATTN_VEC_CASES_ALL_D(F16,  Q4_1)
@@ -455,6 +457,7 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(Q5_0, Q4_1)
     FATTN_VEC_CASES_ALL_D(Q5_1, Q4_1)
     FATTN_VEC_CASES_ALL_D(Q8_0, Q4_1)
+    FATTN_VEC_CASES_ALL_D(IQ4_NL, Q4_1)
     FATTN_VEC_CASES_ALL_D(BF16, Q4_1)
 
     FATTN_VEC_CASES_ALL_D(F16,  Q5_0)
@@ -463,6 +466,7 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(Q5_0, Q5_0)
     FATTN_VEC_CASES_ALL_D(Q5_1, Q5_0)
     FATTN_VEC_CASES_ALL_D(Q8_0, Q5_0)
+    FATTN_VEC_CASES_ALL_D(IQ4_NL, Q5_0)
     FATTN_VEC_CASES_ALL_D(BF16, Q5_0)
 
     FATTN_VEC_CASES_ALL_D(F16,  Q5_1)
@@ -471,6 +475,7 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(Q5_0, Q5_1)
     FATTN_VEC_CASES_ALL_D(Q5_1, Q5_1)
     FATTN_VEC_CASES_ALL_D(Q8_0, Q5_1)
+    FATTN_VEC_CASES_ALL_D(IQ4_NL, Q5_1)
     FATTN_VEC_CASES_ALL_D(BF16, Q5_1)
 
     FATTN_VEC_CASES_ALL_D(F16,  Q8_0)
@@ -479,6 +484,7 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(Q5_0, Q8_0)
     FATTN_VEC_CASES_ALL_D(Q5_1, Q8_0)
     FATTN_VEC_CASES_ALL_D(Q8_0, Q8_0)
+    FATTN_VEC_CASES_ALL_D(IQ4_NL, Q8_0)
     FATTN_VEC_CASES_ALL_D(BF16, Q8_0)
 
     FATTN_VEC_CASES_ALL_D(F16,  BF16)
@@ -487,7 +493,17 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(Q5_0, BF16)
     FATTN_VEC_CASES_ALL_D(Q5_1, BF16)
     FATTN_VEC_CASES_ALL_D(Q8_0, BF16)
+    FATTN_VEC_CASES_ALL_D(IQ4_NL, BF16)
     FATTN_VEC_CASES_ALL_D(BF16, BF16)
+
+    FATTN_VEC_CASES_ALL_D(F16,  IQ4_NL)
+    FATTN_VEC_CASES_ALL_D(Q4_0, IQ4_NL)
+    FATTN_VEC_CASES_ALL_D(Q4_1, IQ4_NL)
+    FATTN_VEC_CASES_ALL_D(Q5_0, IQ4_NL)
+    FATTN_VEC_CASES_ALL_D(Q5_1, IQ4_NL)
+    FATTN_VEC_CASES_ALL_D(Q8_0, IQ4_NL)
+    FATTN_VEC_CASES_ALL_D(IQ4_NL, IQ4_NL)
+    FATTN_VEC_CASES_ALL_D(BF16, IQ4_NL)
 
     return nullptr;
 }
@@ -530,6 +546,7 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
+        case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_Q8_0:
             return true;
         default:
@@ -646,14 +663,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_auto(const int device, 
                     return BEST_FATTN_KERNEL_VEC;
                 }
             } else {
-                if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-                    if (Q->ne[1] <= 2) {
-                        return BEST_FATTN_KERNEL_VEC;
-                    }
-                } else {
-                    if (Q->ne[1] == 1) {
-                        return BEST_FATTN_KERNEL_VEC;
-                    }
+                // The MMA kernel converts the whole quantized KV cache to f16 on every call, the vector kernel reads it
+                // directly: MTP verify (2 tokens) at 20k context on RTX 2080 Ti 1266 -> 279 us.
+                if (Q->ne[1] <= 2) {
+                    return BEST_FATTN_KERNEL_VEC;
                 }
             }
             if (!gqa_opt_applies && Q->ne[1] == 1) {
@@ -793,8 +806,9 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             break;
     }
 
-    // TILE and VEC launch without stream-k and can process the KV cache in chunks.
-    const bool can_chunk = kernel == BEST_FATTN_KERNEL_TILE || kernel == BEST_FATTN_KERNEL_VEC;
+    // The KV cache can be processed in chunks unless the MMA kernel may use its sparse variant (needs n_kv_max > 0).
+    const bool can_chunk = kernel == BEST_FATTN_KERNEL_TILE || kernel == BEST_FATTN_KERNEL_VEC ||
+        (kernel == BEST_FATTN_KERNEL_MMA_F16 && ggml_get_op_params_i32(dst, 4) <= 0);
     const int64_t kv_chunk = ggml_cuda_flash_attn_ext_get_kv_chunk(dst, need_f16_K, need_f16_V, can_chunk);
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V, kv_chunk);

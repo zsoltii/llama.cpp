@@ -12,6 +12,16 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint v_im, 
     const uint y1_idx = i * QUANT_K + y_offset;
     const uint y2_idx = y1_idx + 128;
 
+    // The min term only needs the sums of the B values per sub-block, which are shared by all rows.
+    FLOAT_TYPE bsum10[NUM_COLS], bsum132[NUM_COLS], bsum20[NUM_COLS], bsum232[NUM_COLS];
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        const vec4 ones = vec4(1.0f);
+        bsum10[j]  = FLOAT_TYPE(dot(vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y1_idx) / 4    ]), ones));
+        bsum132[j] = FLOAT_TYPE(dot(vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y1_idx) / 4 + 8]), ones));
+        bsum20[j]  = FLOAT_TYPE(dot(vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y2_idx) / 4    ]), ones));
+        bsum232[j] = FLOAT_TYPE(dot(vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y2_idx) / 4 + 8]), ones));
+    }
+
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
         const uint ib0 = a_offset + (first_row+n)*num_blocks_per_row;
         const FLOAT_TYPEV2 dm = FLOAT_TYPEV2(data_a[ib0 + i].dm);
@@ -74,11 +84,7 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint v_im, 
             const FLOAT_TYPE sy = fma(FLOAT_TYPE(by132.x),     q4_4,  fma(FLOAT_TYPE(by132.y), q4_5,  fma(FLOAT_TYPE(by132.z), q4_6,  FLOAT_TYPE(by132.w) * q4_7)));
             const FLOAT_TYPE sz = fma(FLOAT_TYPE(by20.x),      q4_8,  fma(FLOAT_TYPE(by20.y),  q4_9,  fma(FLOAT_TYPE(by20.z),  q4_10, FLOAT_TYPE(by20.w) *  q4_11)));
             const FLOAT_TYPE sw = fma(FLOAT_TYPE(by232.x),     q4_12, fma(FLOAT_TYPE(by232.y), q4_13, fma(FLOAT_TYPE(by232.z), q4_14, FLOAT_TYPE(by232.w) * q4_15)));
-            const FLOAT_TYPE smin =
-                fma(FLOAT_TYPE(by10.x), sc2, fma(FLOAT_TYPE(by132.x), sc3, fma(FLOAT_TYPE(by20.x), sc6, fma(FLOAT_TYPE(by232.x), sc7,
-                fma(FLOAT_TYPE(by10.y), sc2, fma(FLOAT_TYPE(by132.y), sc3, fma(FLOAT_TYPE(by20.y), sc6, fma(FLOAT_TYPE(by232.y), sc7,
-                fma(FLOAT_TYPE(by10.z), sc2, fma(FLOAT_TYPE(by132.z), sc3, fma(FLOAT_TYPE(by20.z), sc6, fma(FLOAT_TYPE(by232.z), sc7,
-                fma(FLOAT_TYPE(by10.w), sc2, fma(FLOAT_TYPE(by132.w), sc3, fma(FLOAT_TYPE(by20.w), sc6,     FLOAT_TYPE(by232.w) * sc7)))))))))))))));
+            const FLOAT_TYPE smin = fma(bsum10[j], sc2, fma(bsum132[j], sc3, fma(bsum20[j], sc6, bsum232[j] * sc7)));
             temp[j][n] = fma(dm.x, fma(sx, sc0, fma(sy, sc1, fma(sz, sc4, sw * sc5))), fma(-dm.y, smin, temp[j][n]));
         }
     }

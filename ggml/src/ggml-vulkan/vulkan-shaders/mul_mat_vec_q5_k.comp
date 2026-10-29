@@ -12,6 +12,18 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint v_im, 
     const uint y1_idx = i * QUANT_K + y_offset;
     const uint y2_idx = y1_idx + 128;
 
+    // The min term only needs the sums of the B values per sub-block, which are shared by all rows.
+    FLOAT_TYPE bsum1[NUM_COLS], bsum3[NUM_COLS], bsum2[NUM_COLS], bsum4[NUM_COLS];
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        const uint b1 = (j*p.batch_stride_b + b_offset + y1_idx) / 2;
+        const uint b2 = (j*p.batch_stride_b + b_offset + y2_idx) / 2;
+        const vec2 ones = vec2(1.0f);
+        bsum1[j] = FLOAT_TYPE(dot(vec2(data_b_v2[b1     ]) + vec2(data_b_v2[b1 +  8]), ones));
+        bsum3[j] = FLOAT_TYPE(dot(vec2(data_b_v2[b1 + 16]) + vec2(data_b_v2[b1 + 24]), ones));
+        bsum2[j] = FLOAT_TYPE(dot(vec2(data_b_v2[b2     ]) + vec2(data_b_v2[b2 +  8]), ones));
+        bsum4[j] = FLOAT_TYPE(dot(vec2(data_b_v2[b2 + 16]) + vec2(data_b_v2[b2 + 24]), ones));
+    }
+
     [[unroll]] for (uint n = 0; n < num_rows; ++n) {
         const uint ib0 = a_offset + (first_row+n)*num_blocks_per_row;
         const FLOAT_TYPEV2 dm = FLOAT_TYPEV2(data_a[ib0 + i].dm);
@@ -106,11 +118,7 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint v_im, 
               fma(FLOAT_TYPE(by232.y), q4_13,
               fma(FLOAT_TYPE(by248.x), q4_14,
                  FLOAT_TYPE(by248.y) * q4_15)));
-            const FLOAT_TYPE smin =
-              fma(FLOAT_TYPE(by10.x) + FLOAT_TYPE(by10.y) + FLOAT_TYPE(by116.x) + FLOAT_TYPE(by116.y), sc2,
-              fma(FLOAT_TYPE(by132.x) + FLOAT_TYPE(by132.y) + FLOAT_TYPE(by148.x) + FLOAT_TYPE(by148.y), sc3,
-              fma(FLOAT_TYPE(by20.x) + FLOAT_TYPE(by20.y) + FLOAT_TYPE(by216.x) + FLOAT_TYPE(by216.y), sc6,
-                  (FLOAT_TYPE(by232.x) + FLOAT_TYPE(by232.y) + FLOAT_TYPE(by248.x) + FLOAT_TYPE(by248.y)) * sc7)));
+            const FLOAT_TYPE smin = fma(bsum1[j], sc2, fma(bsum3[j], sc3, fma(bsum2[j], sc6, bsum4[j] * sc7)));
             temp[j][n] = fma(dm.x, fma(sx, sc0, fma(sy, sc1, fma(sz, sc4, sw * sc5))), fma(-dm.y, smin, temp[j][n]));
         }
     }

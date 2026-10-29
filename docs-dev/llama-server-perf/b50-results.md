@@ -292,12 +292,56 @@ llama-bench (q8_0 KV): upstream / saját pp512 980 / 966, pp512@d8192 778 / 764,
 A kimenetek bitre azonosak (story/wiki sha upstream = saját). Pascalon a CUDA a gyorsabb backend (Vulkan v5: 307 /
 43,7 / 467 / 38,4).
 
+## NVIDIA RTX 2080 Ti (Turing, sm_75, Thunderbolt) — 2026-10-29
+
+Ugyanaz a parancs, MTP n=1, defer + `-bs`. Vulkan: `-dev Vulkan2` (NV_coopmat2), CUDA: `CUDA_VISIBLE_DEVICES=1 -dev CUDA0`.
+CUDA alatt P2 / 6800 MHz memória (Vulkan P0 / 7000 MHz, csak −3%).
+
+| 2080 Ti | story pp | story tg | wiki pp | wiki tg |
+|---|---|---|---|---|
+| brew Vulkan, MTP nélkül | 360 | 61,6 | 2061 | 54,6 |
+| brew Vulkan, MTP n=1 (ref) | 562 | 69,2 ¹ | 1796 | 53,6 |
+| saját Vulkan v5 | 341 | 64,2 | 1827 | 58,8 |
+| **saját Vulkan (22–23.)** | **690** | **74,1** | **1821** | **65,4** |
+| upstream CUDA, MTP nélkül | 1018 | 74,7 | 1949 | 65,5 |
+| upstream CUDA, MTP n=1 (29/34 réteg) | 187 | 19,3 | 723 | 16,6 |
+| saját CUDA + MMA darabolás (34/34) | 973 | 95,3 | 1786 | 61,6 |
+| **saját CUDA + vec verify (21.)** | **910–939** | **96,5–97,2** | **1773–1794** | **83,9–84,2** |
+
+¹ A brew a story-ban más szöveget generál (elfogadás 0,91, ismétlődő szöveg), ezért a story tg nem összevethető;
+a quick tesztben (elfogadás 0,56 vs 0,62) brew 56,8 vs saját 61,9.
+
+21. **CUDA darabolt FA az MMA (stream-k) úton is** (`fattn-mma-f16.cuh`, `fattn-common.cuh`, `fattn.cu`): darab módban
+    a kernel tile-onként egy blokkal fut, és a meglévő `needs_fixup` úton írja a nem normalizált tile-t + KQ max/rowsum
+    párost (`kv_chunk_mode`: meta-puffer + gridDim.x == tile-szám, ami normál indításnál nem fordul elő); az új
+    `flash_attn_combine_kv_chunk_tiles` fésüli össze a darabokat. A sparse variáns (op_params[4] > 0) nem darabol.
+    2080 Ti: target compute buffer 964 → 253 MiB, draft 681 → 245 MiB, 29/34 → 34/34 réteg. FA 4376/4376 (normál és
+    256 soros darabokkal). Darabonként ~0,1 ms (kv=8704, 256 soros darabok: 2,99 → 6,78 ms; 64 MiB-nál elhanyagolható).
+    **Kvantált KV + 2 tokenes verify Turing/Ampere-en a vec kernelt használja** (eddig csak Ada+): az MMA minden
+    hívásnál a teljes KV-t f16-ra konvertálja. FA kv=20736 nb=2 q8_0: 1266 → 279 us; pp2@d20480 83 → 120 t/s.
+22. **CUDA FA iq4_nl K/V**: eddig nem volt támogatott (a FA a CPU-ra esett). Új `vec_dot_fattn_vec_KQ_iq4_nl`,
+    `dequantize_V_iq4_nl`, f16-konverzió (`dequantize_iq4_nl_pair`), vec példányok; a `GGML_CUDA_FA_QUANTS`
+    alapértéke most minden azonos típusú KV-t tartalmaz (q4_0, q4_1, q5_0, q5_1, iq4_nl, q8_0, f16, bf16) — eddig a
+    q4_1/q5_x lassú f16 visszaesést kapott. FA (kv=20736, us, nb=1 / 2): f16 159/161, q8_0 219/287, q4_0 227/314,
+    q4_1 203/311, q5_0 344/421, q5_1 313/407, iq4_nl 415/517. (A q6_0 nem létező KV-típus.)
+23. **Vulkan, NVIDIA Turing+ mat-vec**: 2–3 oszlopnál (verify) a fp K-quant shader 4 sorral gyorsabb az MMVQ-nál
+    (`kq_batch_rm` = 4 alapból): n=2 q4_K 12288×4096 108 → 76 us, q5_K 121 → 87, q6_K 248320×4096 1620 → 1476.
+    1 oszlopnál k > 4096 esetén is a fp shader (q4_K 4096×12288 MMVQ 70 → 60 us). **q4_K/q5_K shader**: a min-tag
+    B-összegei soronként helyett egyszer számolódnak (gyártófüggetlen): q4_K n=2 −6..−10%, n=3 −5..−8%, n=1 −2..−3%;
+    q5_K −1..−3%. llama-bench pp2 101 → 129–135, tg128 68,6 → 70,4–70,8.
+    - Vulkan FA: nb=2 ≈ 2× nb=1 (a GQA-összevonás csak a fejeket vonja össze, a tokeneket külön munkacsoportok
+      olvassák végig a KV-n) — kv=20736 q8_0 215 vs 418 us. Shader-átírás kellene (tokenek × fejek egy blokkban).
+    - Vulkan pp2@d20480 GPU-idő 21 ms: mat-vec ~12,9 ms, FA 3,3 ms, apró műveletek (ADD/CPY/RMS_NORM/SCALE,
+      5–8 us/db) ~4 ms.
+
 ## Hátra
 
 - FA prefill (coopmat1, Xe2): ~3,5 TFLOPS — a wiki pp kb. harmada. A Br=32 nem segít, a kernel szerkezete (kis
   tile-ok, shmem-softmax, sok barrier) a korlát; mélyebb átírás kellene.
 - Draft LM head (248320×4096 q6_K, 834 MB, 4,3 ms/lépés): kisebb bitszámú másolat vagy szűkített szótár.
-- CUDA darabolt FA az MMA (stream-k) úton is (Turing/Ampere: 2080 Ti, 3090).
+- Vulkan FA: több token + GQA egy munkacsoportban (verify nb=2 a KV-t kétszer olvassa).
+- Vulkan apró műveletek fúziója (~4 ms / verify lépés a 2080 Ti-n).
+- A 23. pont Turingon mérve; Ampere-en (3090) ellenőrizni.
 - Pascal FA prefill: a TILE kernel fp32 Q-tile-ja a 48 KB shared memory határán van (hsk=256), mélyebb átírás kellene.
 - Verify CPU-rögzítés ~7 ms/lépés (nagyrészt átfedésben a GPU-val).
 - Pontosság: kész (1–3. szint, fent) — a saját build a brew-val azonos pontosságú.

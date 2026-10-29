@@ -1895,6 +1895,10 @@ static __global__ void flash_attn_ext_f16(
         KV_max = KV_max_ptr + int64_t(iter_j)*ne33*ne11;
     }
 
+    // KV chunk mode (see launch_fattn): one block per output tile and a meta buffer that a plain launch with one block
+    // per tile never gets. The tiles are then written unnormalized with their KQ max + rowsum, as for a stream-k fixup.
+    const bool kv_chunk_mode = dst_meta && gridDim.x == iter_j*iter_z_gqa*ne12*ne03;
+
     // kbc == k block continuous, current index in continuous ijk space.
     int       kbc      = int64_t(blockIdx.x + 0)*(iter_k*iter_j*iter_z_gqa*ne12*ne03) / gridDim.x;
     const int kbc_stop = int64_t(blockIdx.x + 1)*(iter_k*iter_j*iter_z_gqa*ne12*ne03) / gridDim.x;
@@ -1934,7 +1938,7 @@ static __global__ void flash_attn_ext_f16(
             kb0_stop = min(kb0_stop, KV_max[sequence*iter_j + jt] / nbatch_fa);
         }
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
-        if (kb0_start == 0) {
+        if (kb0_start == 0 && !kv_chunk_mode) {
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, use_sparse, needs_fixup, is_fixup>
                 (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
