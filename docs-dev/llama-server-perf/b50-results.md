@@ -798,6 +798,8 @@ Build b298513ba, q8_0 KV, 128k context, 6 seeds per row:
   on long prompts. Finding 1 fixes it; it could be proposed upstream.
 - Measure an intermediate sampling: only `--presence-penalty 1.5` with the old temp 0.8 (or DRY, `--dry-multiplier 0.8`).
   Goal: keep ~100 t/s without loops, since the Qwen recommendation loses ~18% through draft acceptance.
+- Run the attachment test standard run (`tests/README.md`, the user's command, 24 seeds) on every GPU and after every speedup.
+  - The B50 baseline is 0/24 loops at tg 22.1–22.9.
 - Extend the loop test to the other KV types (q4_0, q4_1, q5_x, iq4_nl) and to MTP n=2.
 - Redesign the Vulkan mat-vec for n=2 (~400 GB/s, ~510 on CUDA).
   Fuse small ops on both backends (~700 ops, ~5 µs each; e.g. RMS_NORM+SCALE in the GDN l2 norm).
