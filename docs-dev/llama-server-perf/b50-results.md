@@ -768,8 +768,13 @@ Build b298513ba, q8_0 KV, 128k context, 6 seeds per row:
 
 - **No loop reproduced in 36 runs.** The thinking is 6–11k characters and the answer 4–6k; every run finished with `stop`.
 - **The web UI fields** give the same tokens. `reasoning_control` arms a CPU sampler, which costs ~3% tg with default sampling.
-- **Still open:** the exact command, sampling settings and conversation of the user's looping run.
+- **The user's exact command** (Qwen sampling, MTP n=1, `-bs`, `LLAMA_MTP_DEFER_CATCHUP=1`; the `LLAMA_MTP_DRAFT_VOCAB_SEED` file did not exist, so it ran without a seed text) with web UI fields, seeds 7–30, max 32000 tokens:
+  - 0/24 loops.
+  - pp 446, tg 22.1–22.9, accept 0.68–0.73.
+  - The thinking was 4.8–10.5k characters.
+- **Still open:** the user's looping run is not reproduced after 36 runs with its settings (60 runs in total).
   - The web UI sends no seed, so every request takes a different trajectory.
+  - The server log or text of the looping run, or the conversation (multi-turn?), is needed.
 - **To do:** run this test on the other GPUs as well (speed and loops).
 
 ## Remaining work
