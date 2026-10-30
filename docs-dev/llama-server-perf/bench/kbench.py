@@ -10,7 +10,9 @@ bin_ = os.path.expanduser(os.environ.get("TBO", os.path.join(os.path.dirname(os.
 shapes = [("q4_K",12288,4096),("q4_K",4096,12288),("q5_K",12288,4096),("q5_K",4096,4096),("q6_K",4096,12288),
           ("q6_K",8192,4096),("q6_K",248320,4096),("q8_0",4096,4096),("q8_0",4096,8192)]
 out = subprocess.run([bin_, "perf", "-b", "Vulkan0", "-o", "MUL_MAT,FLASH_ATTN_EXT", "-p", "type_a=(q4_K|q5_K|q6_K|q8_0),type_b=f32,m=(12288|4096|8192|248320),n=[123],k=(4096|12288|8192),|kv=20736"],
-                     env=env, capture_output=True, text=True).stdout
+                     env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True).stdout
+dev = re.search(r"ggml_vulkan: 0 = (.*?) \|", out)
+print("device:", dev[1] if dev else "?", file=sys.stderr)
 res = {}
 for line in out.splitlines():
     m = re.search(r"MUL_MAT\(type_a=(\w+),type_b=f32,m=(\d+),n=(\d+),k=(\d+),bs=\[1,1\],nr=\[1,1\],per=\[0,1,2,3\],k_v=0,o=1.*?([\d.]+) us/run", line)

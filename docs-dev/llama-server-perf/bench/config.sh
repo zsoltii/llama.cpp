@@ -11,7 +11,9 @@ CUDA_BIN=${CUDA_BIN:-$REPO/build-cuda/bin}
 UP_BIN=${UP_BIN:-$REPO/../llama.cpp-upstream/build-cuda/bin}
 UPV_BIN=${UPV_BIN:-$REPO/../llama.cpp-upstream/build-vk/bin}
 
-# devices: llama-server -dev name, and the index for GGML_VK_VISIBLE_DEVICES (test-backend-ops then sees it as Vulkan0)
+# devices: llama-server -dev name, and the index for GGML_VK_VISIBLE_DEVICES (test-backend-ops then sees it as Vulkan0).
+# The order changes when an eGPU is attached or not: check with llama-server --list-devices. Without the eGPU,
+# index 2 can be llvmpipe (CPU), and the kernel benches print the device name for this reason.
 VK_DEV=${VK_DEV:-Vulkan2}
 VK_IDX=${VK_IDX:-2}
 CUDA_DEV=${CUDA_DEV:-CUDA0}
