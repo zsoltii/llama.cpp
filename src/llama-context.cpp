@@ -10,6 +10,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "llama-draft-vocab.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -561,6 +562,10 @@ llama_context::llama_context(
 
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size);
+        }
+
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+            dvoc = llama_draft_vocab::from_env(model.vocab);
         }
 
         sched_reserve();
@@ -1581,6 +1586,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         t_build_start = ggml_time_us();
     }
     bool graph_built = false;
+
+    if (dvoc) {
+        dvoc->add(ubatch);
+    }
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
@@ -2850,6 +2859,9 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.dvoc        =*/ dvoc.get(),
+        /*.dvoc_n_rows =*/ dvoc ? dvoc->n_rows()       : 0,
+        /*.dvoc_n_upd  =*/ dvoc ? dvoc->n_upd(ubatch) : 0,
     };
 }
 
@@ -3900,6 +3912,9 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
         for (const auto & [buft, size] : moe_cache->memory_breakdown()) {
             ret[buft].context += size;
         }
+    }
+    if (dvoc && dvoc->buffer()) {
+        ret[ggml_backend_buffer_get_type(dvoc->buffer())].context += ggml_backend_buffer_get_size(dvoc->buffer());
     }
     if (model.no_alloc()) {
         for (size_t i = 0; i < backends.size(); ++i) {

@@ -19,6 +19,7 @@
 struct llama_model;
 class llama_batch_allocr;
 class llama_moe_cache;
+class llama_draft_vocab;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -308,6 +309,9 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+
+    // reduced draft LM head of an MTP context (env LLAMA_MTP_DRAFT_VOCAB)
+    std::unique_ptr<llama_draft_vocab> dvoc;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

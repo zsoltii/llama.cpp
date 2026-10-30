@@ -695,11 +695,65 @@ Run it on every affected backend, with the same sampling as upstream.
 - p1 only: `ONLY_P=1`.
 - Known issue: the `UP` path in `loop-run.sh` points to a temporary directory; if it is missing, the upstream build has to be rebuilt.
 
+### 27. Reduced vocabulary for the MTP draft LM head (2026-10-30)
+
+The draft step runs the full LM head (248320×4096 q6_K, 834 MB): ~4.5 ms of the 7.6 ms draft step on the B50.
+The draft only has to propose a likely token, and the target verifies it over the full vocabulary. Restricting the draft to a subset of tokens therefore cannot change the output. It can only lower the acceptance when the right token is outside the subset.
+
+How the subset is chosen:
+- **The id prefix alone is not enough for Hungarian.** Story output tokenized with the Qwen3.5 tokenizer:
+  - ids < 32768 cover 76% of the tokens;
+  - ids < 151643 cover 87%;
+  - the rest are in the extended range (151k–248k).
+  - For English wiki text, ids < 32768 cover 90%.
+- **Prefix + the tokens already seen in the context** cover 93% of the Hungarian story (offline estimate).
+  - Adding a Hungarian seed text brings it to 97.7%.
+
+Implementation (`src/llama-draft-vocab.{h,cpp}`, `llm_graph_context::build_draft_lm_head`):
+- **Static part:** ids `[0, n_static)` are scored through a view of the LM head rows, with no copy.
+- **Dynamic part:**
+  - an F16 head `[n_embd, n_dyn+1]` lives on the LM head's device;
+  - every ctx_dft ubatch assigns rows to its new tokens;
+  - the same graph copies their LM head rows in with `get_rows` + `set_rows`;
+  - only the used rows are scored, rounded up to 1024, so the graph only changes when a chunk fills.
+- **Full-size logits:** the unscored tokens get −INF (fill + concat + set_rows scatter), so the samplers, backend sampling and the p_min check are unchanged.
+- **Control tokens** (`<|im_end|>`, `</think>`, ...) are added at start.
+- **Scope:** used by every MTP head that ends in `build_lora_mm(head_w, cur, head_s)` (qwen35, qwen35moe, qwen3next, deepseek2/32, glm*, mimo2, hy-v3, nemotron-h-moe), and not when the head has a scale tensor.
+- **Env:**
+  - `LLAMA_MTP_DRAFT_VOCAB=n_static` (default 32768; `-1` disables it);
+  - `LLAMA_MTP_DRAFT_VOCAB_DYN` (default 16384 rows, 128 MiB);
+  - `LLAMA_MTP_DRAFT_VOCAB_SEED=<text file>`: its tokens are added at start. Recommended for non-English chats.
+
+Server, B50, q8_0 KV, MTP n=1, defer + `-bs`, greedy (2 runs, median):
+
+| config | story tg | wiki tg | accept story / wiki |
+|---|---|---|---|
+| full vocab | 34.27 | 28.37 | 0.60 / 0.74 |
+| 32k + seen | 37.10 (+8.3%) | 29.64 (+4.5%) | 0.55→0.62 / 0.64→0.76 |
+| 32k + seen + Hungarian seed | 37.43 (+9.2%) | 30.03 (+5.9%) | 0.58→0.60 / 0.69→0.75 |
+| 16k + seed / 64k + seed | 37.59 / 36.96 | 30.08 / 29.88 | |
+| default (32k, no env) | 37.45 | 29.67 | |
+| n-max 3, CPU draft sampler: full → 32k | 26.79 → 31.48 (+17.5%) | 23.89 → 25.95 (+8.6%) | 0.31 / 0.46 both |
+
+- The output hash is identical in every configuration; only the speed changes.
+- The two accept values are the first and the second run of the same server. The dynamic set keeps growing across requests, so the second run has the Hungarian words of the first.
+- The wiki prompt is English but the answer is Hungarian, which is why the first run loses acceptance without a seed.
+- With n-max 3 the draft head runs three times per step, so the gain is the largest.
+
+Validation:
+- test-backend-ops SET_ROWS / GET_ROWS / FILL / CONCAT on the B50: all pass.
+- Wiki QA: 25/25, 5/5.
+- Loop test p1 (6 seeds):
+  - default sampling 6/6, Qwen sampling 2/6. The same seeds loop with the same token counts as before, because the output is unchanged.
+  - Loop-test tg under Qwen sampling: 31.2–33.4 → 33.2–36.2 t/s.
+- The CUDA build compiles. It is not measured, because no CUDA card is attached.
+
 ## Remaining work
 
 - FA prefill (coopmat1, Xe2): ~3.5 TFLOPS, about a third of the wiki pp.
   Br=32 does not help; the kernel structure (small tiles, shmem softmax, many barriers) is the limit. It would need a deeper rewrite.
-- Draft LM head (248320×4096 q6_K, 834 MB, 4.3 ms per step): a lower-bit copy or a reduced vocabulary.
+- Draft LM head: done (finding 27). Next options: persist the learned set across restarts, or a Q8_0 dynamic head.
+  Measure it on CUDA when a card is attached.
 - Measure the Vulkan FA token merge on coopmat1 (Intel B50, RDNA3); slow iq4_nl/q5_1 dequant in the scalar FA.
 - Fuse the small Vulkan ops (~4 ms per verify step on the 2080 Ti).
 - Finding 23 was measured on Turing; check it on Ampere (3090).

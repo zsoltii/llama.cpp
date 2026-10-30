@@ -23,6 +23,7 @@ struct llama_prec_policy;
 struct llama_hadamard;
 
 class llama_moe_cache;
+class llama_draft_vocab;
 
 struct llama_memory_context_i;
 
@@ -168,6 +169,24 @@ public:
 
     const int64_t n_embd       = 0;
     const int64_t n_embd_state = 0;
+};
+
+// row updates and logit map of the reduced draft LM head (see llama_draft_vocab)
+class llm_graph_input_draft_vocab : public llm_graph_input_i {
+public:
+    llm_graph_input_draft_vocab(llama_draft_vocab * dvoc) : dvoc(dvoc) {}
+    virtual ~llm_graph_input_draft_vocab() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    // the sizes are part of llm_graph_params::allow_reuse
+    bool can_reuse(const llm_graph_params & params) override { GGML_UNUSED(params); return true; }
+
+    ggml_tensor * upd_tok  = nullptr; // I32 [n_upd]  LM head rows to copy
+    ggml_tensor * upd_slot = nullptr; // I32 [n_upd]  their rows in the dynamic head
+    ggml_tensor * map      = nullptr; // I32 [n_rows] token of each dynamic row
+
+    llama_draft_vocab * dvoc;
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {
@@ -834,6 +853,11 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // reduced draft LM head, nullptr if disabled. the sizes are snapshots that decide the graph topology
+    llama_draft_vocab * dvoc = nullptr;
+    int32_t dvoc_n_rows = 0;
+    int32_t dvoc_n_upd  = 0;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -894,6 +918,10 @@ struct llm_graph_params {
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+            return false;
+        }
+
+        if (dvoc != other.dvoc || dvoc_n_rows != other.dvoc_n_rows || dvoc_n_upd != other.dvoc_n_upd) {
             return false;
         }
 
@@ -1067,6 +1095,10 @@ struct llm_graph_context {
 
     const llama_prec_policy * prec_policy;
 
+    llama_draft_vocab * dvoc;
+    const int32_t dvoc_n_rows;
+    const int32_t dvoc_n_upd;
+
     const llama_hadamard * hdmd;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
@@ -1224,6 +1256,12 @@ struct llm_graph_context {
              ggml_tensor * selected_experts_in = nullptr,
              ggml_tensor * post_exp_norm = nullptr,
                    float   post_exp_norm_eps = 1e-5f) const;
+
+    // logits of a draft LM head w over the reduced vocabulary (see llama_draft_vocab), full size with -INF for the
+    // tokens that are not scored. nullptr if the context has no reduced vocabulary, then use the full LM head
+    ggml_tensor * build_draft_lm_head(
+             ggml_tensor * w,
+             ggml_tensor * cur) const;
 
     // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
     ggml_tensor * build_moe_cache_slots(

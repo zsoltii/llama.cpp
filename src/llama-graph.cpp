@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "llama-draft-vocab.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
@@ -166,6 +167,20 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     res &= (!params.ubatch.embd_state) || (h      && h->ne[1]      == params.ubatch.n_tokens);
 
     return res;
+}
+
+void llm_graph_input_draft_vocab::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    std::vector<int32_t> data(std::max(upd_tok->ne[0], map->ne[0]));
+    std::vector<int32_t> data_slot(upd_slot->ne[0]);
+
+    dvoc->set_upd(data.data(), data_slot.data(), (int32_t) upd_tok->ne[0]);
+    ggml_backend_tensor_set(upd_tok,  data.data(),      0, ggml_nbytes(upd_tok));
+    ggml_backend_tensor_set(upd_slot, data_slot.data(), 0, ggml_nbytes(upd_slot));
+
+    dvoc->set_map(data.data(), (int32_t) map->ne[0]);
+    ggml_backend_tensor_set(map, data.data(), 0, ggml_nbytes(map));
 }
 
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
@@ -1585,6 +1600,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     moe_cache        (params.moe_cache),
     prec_policy      (params.prec_policy),
+    dvoc             (params.dvoc),
+    dvoc_n_rows      (params.dvoc_n_rows),
+    dvoc_n_upd       (params.dvoc_n_upd),
     hdmd             (params.hdmd),
     samplers         (params.samplers),
     cb_func          (params.cb),
@@ -2602,6 +2620,51 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(moe_out, "ffn_moe_out", il);
 
     return moe_out;
+}
+
+ggml_tensor * llm_graph_context::build_draft_lm_head(
+         ggml_tensor * w,
+         ggml_tensor * cur) const {
+    if (!dvoc || !dvoc->init(w)) {
+        return nullptr;
+    }
+
+    const int64_t n_embd  = w->ne[0];
+    const int64_t n_vocab = w->ne[1];
+    const int64_t n_out   = cur->ne[1];
+    const int64_t n_rows  = dvoc_n_rows;
+
+    auto inp = std::make_unique<llm_graph_input_draft_vocab>(dvoc);
+
+    inp->upd_tok  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, dvoc_n_upd);
+    inp->upd_slot = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, dvoc_n_upd);
+    inp->map      = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rows);
+    ggml_set_input(inp->upd_tok);
+    ggml_set_input(inp->upd_slot);
+    ggml_set_input(inp->map);
+
+    // copy the LM head rows of the newly seen tokens into the dynamic head
+    ggml_tensor * dyn = ggml_set_rows(ctx0, dvoc->dyn, ggml_get_rows(ctx0, w, inp->upd_tok), inp->upd_slot);
+    ggml_build_forward_expand(gf, dyn);
+
+    // static id prefix: a view of the LM head
+    ggml_tensor * logits = ggml_mul_mat(ctx0, ggml_view_2d(ctx0, w, n_embd, dvoc->n_static, w->nb[1], 0), cur);
+
+    // the other tokens are -INF, plus one dropped logit for the unused dynamic rows
+    ggml_tensor * tail = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_vocab + 1 - dvoc->n_static, n_out), -INFINITY);
+    logits = ggml_concat(ctx0, logits, tail, 0);
+
+    ggml_tensor * logits_dyn = ggml_mul_mat(ctx0, ggml_view_2d(ctx0, dyn, n_embd, n_rows, dyn->nb[1], 0), cur);
+    logits = ggml_set_rows(ctx0,
+            ggml_reshape_3d(ctx0, logits,     1, n_vocab + 1, n_out),
+            ggml_reshape_3d(ctx0, logits_dyn, 1, n_rows,      n_out),
+            inp->map);
+
+    logits = ggml_cont(ctx0, ggml_view_2d(ctx0, logits, n_vocab, n_out, (n_vocab + 1)*sizeof(float), 0));
+
+    res->add_input(std::move(inp));
+
+    return logits;
 }
 
 ggml_tensor * llm_graph_context::build_moe_cache_slots(

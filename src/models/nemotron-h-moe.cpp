@@ -152,7 +152,8 @@ llama_model_nemotron_h_moe::graph_mtp::graph_mtp(const llama_model & model, cons
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w != nullptr && "NEMOTRON_H_MOE MTP requires an output projection");
-    cur = build_lora_mm(head_w, cur, head_s);
+    ggml_tensor * logits_draft = head_s ? nullptr : build_draft_lm_head(head_w, cur);
+    cur = logits_draft ? logits_draft : build_lora_mm(head_w, cur, head_s);
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;
