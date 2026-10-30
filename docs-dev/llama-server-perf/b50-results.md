@@ -555,14 +555,22 @@ Story (short context): wall step 55.7 ms = draft 8.0 + verify 47.1 ms; GPU time 
 Wiki (20k context): GPU 59 ms per step. **FA of the 2-token verify: 12.4 ms per step (21%)**, 1.64 ms per call, against ~0.2 ms to read the q8_0 K/V once at 224 GB/s.
 In the 20k prefill, FA is ~39% and the q4_K GEMM ~27% of the GPU time.
 
-Not GPU work: the verify decode takes 47 ms wall against ~37 ms of GPU, i.e. ~10 ms per step of command recording / submit latency / readback over Thunderbolt.
+~~Not GPU work: the verify decode takes 47 ms wall against ~37 ms of GPU.~~
+**Correction:** that gap was the perf logger's own cost (per-op timestamps).
+- Without the logger the story step is 46.4 ms = verify 38.0 + draft 7.6 + ~0.8 ms other, and the verify wall time equals its GPU time.
+- The step is GPU-bound.
+
+The q8_0 mat-vec "57% of bandwidth" is a cold-read effect of the small 4096×4096 matrices in the real run:
+- the MMVQ kernel itself streams 4096×8192 q8_0 at ~200 GB/s;
+- on the B50 MMVQ beats the fp shader for every shape and n (by 25–74%);
+- more rows per workgroup (`GGML_VK_KQ_BATCH_RM=4`) is 24–48% slower.
+
+So the mat-vec defaults stay.
 
 Order of attack (plan-b50-kv.md):
-1. decode/verify FA per KV type;
-2. the non-GPU verify time;
-3. the q8_0 mat-vec at 57% of bandwidth;
-4. prefill FA;
-5. the draft LM head (needs a reduced-vocabulary head, larger project).
+1. decode/verify FA per KV type (finding 25);
+2. prefill FA (finding 26);
+3. the draft LM head (4.5 ms of the 7.6 ms draft; needs a reduced-vocabulary head, larger project).
 
 ### 25. B50 decode/verify FA per KV type (2026-10-30)
 
@@ -652,6 +660,33 @@ Server (B50, MTP n=1, greedy, wiki 20k prompt):
 
 - Story (short prompt) and tg are unchanged.
 - KLD is unchanged: q4_0 0.00510, q4_1 0.00510, q5_0 0.00269, q5_1 0.00329, iq4_nl 0.00584. The in-shader dequant also produced f16, so the values are identical.
+
+### Validation after findings 25–26 (B50, 2026-10-30)
+
+| check | result |
+|---|---|
+| test-backend-ops (B50, full, incl. the new dense-KV FA cases) | 21650/21650 |
+| wiki QA (answerable / abstained) | 25/25, 5/5 |
+| loop-free sampling, q8_0, MTP: story pp / tg, wiki pp / tg | 339 / 29.7, 612 / 25.4 (was 337 / 29.5, 612 / 24.9) |
+| loop-free sampling, q8_0, no MTP | 356 / 26.3, 680 / 22.4 |
+| loop test p1, default sampling (6 seeds) | 6/6 not ok (before: 5/6) |
+| loop test p1, Qwen sampling (12 seeds) | 2/12 not ok (before: 0/6) |
+| loop test p1, Qwen sampling + DRY (6 seeds) | 0/6 exact loops, 1 paraphrase runaway |
+
+Notes:
+- **The two Qwen-sampling loops** repeat whole paragraphs with a period of ~1500 characters (~400 tokens).
+  - The presence penalty only covers `--repeat-last-n` (default 64 tokens), so it cannot see such a cycle.
+  - Whether one forms depends on the trajectory. The FA change only moves the summation order (for q8_0 it only changes the split length), so it gives a different trajectory but not a systematic change.
+  - Seeds 7–12 had 0/6.
+- **DRY** (`--dry-multiplier 0.8 --dry-penalty-last-n 16384`):
+  - It removes the exact repetition. One run still ended in a paraphrased cycle ("Hol van itt most?" / "Most már itt vagyunk?" with small variations), a limit of the 9B Q4 model for a 10 000-word Hungarian story.
+  - DRY runs on the CPU, so the backend sampling chain is cut: tg ~29.5 vs ~31.5 t/s (−6%).
+- **One GPU device-lost during the night run (03:24).**
+  - The kernel log shows ~10 s of GuC timeouts (`Timed out wait for G2H`, `GuC PC query task state failed`), then a job timeout for a job that had **not started**, then a GT reset.
+  - This points to the GuC firmware or the Thunderbolt link rather than a long-running shader.
+  - It did not reproduce in the next 18 runs (~2.5 hours of generation).
+  - The devcoredump (`/sys/class/drm/card2/device/devcoredump/data`) is root-only; reading it needs the user.
+  - The earlier `Timedout job` lines of the night all came from `test-backend-ops perf` runs of experimental FA configurations (very long single submits).
 
 **Validation rule from now on:** after every speedup, run this loop test next to the accuracy and hallucination tests (levels 1–3).
 Run it on every affected backend, with the same sampling as upstream.
