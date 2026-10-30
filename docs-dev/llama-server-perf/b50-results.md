@@ -748,6 +748,30 @@ Validation:
   - Loop-test tg under Qwen sampling: 31.2–33.4 → 33.2–36.2 t/s.
 - The CUDA build compiles. It is not measured, because no CUDA card is attached.
 
+### Attachment test: Hungarian Fundamental Law (B50, 2026-10-30)
+
+The user reported a thinking-phase loop on Vulkan. To reproduce it, I added a new test (`tests/attach-test.py`, see `tests/README.md`):
+- the 2011 Fundamental Law (`testdata/alaptorveny-2011.txt`, 41 366 prompt tokens) is attached the way the web UI does it;
+- the prompt is "foglald össze a magyar alaptörvényt";
+- each run reprocesses the prompt.
+
+Build b298513ba, q8_0 KV, 128k context, 6 seeds per row:
+
+| config | pp t/s | tg t/s | accept | not ok |
+|---|---|---|---|---|
+| MTP n=1 + `-bs`, default sampling | 446 | 24.7 | 0.79 | 0/6 |
+| MTP, Qwen sampling | 446 | 22.6 | 0.71 | 0/6 |
+| MTP, Qwen + DRY | 446 | 22.2 | 0.69 | 0/6 |
+| no MTP, Qwen sampling | 501 | 19.6 | – | 0/6 |
+| MTP, default sampling + web UI fields (`reasoning_control` ...) | 446 | 23.9 | 0.79 | 0/6 |
+| MTP, Qwen sampling + web UI fields | 446 | 22.6 | 0.71 | 0/6 |
+
+- **No loop reproduced in 36 runs.** The thinking is 6–11k characters and the answer 4–6k; every run finished with `stop`.
+- **The web UI fields** give the same tokens. `reasoning_control` arms a CPU sampler, which costs ~3% tg with default sampling.
+- **Still open:** the exact command, sampling settings and conversation of the user's looping run.
+  - The web UI sends no seed, so every request takes a different trajectory.
+- **To do:** run this test on the other GPUs as well (speed and loops).
+
 ## Remaining work
 
 - FA prefill (coopmat1, Xe2): ~3.5 TFLOPS, about a third of the wiki pp.
