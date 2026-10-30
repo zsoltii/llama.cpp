@@ -564,6 +564,68 @@ Order of attack (plan-b50-kv.md):
 4. prefill FA;
 5. the draft LM head (needs a reduced-vocabulary head, larger project).
 
+### 25. B50 decode/verify FA per KV type (2026-10-30)
+
+Two findings on Intel Xe2:
+- With GQA the decode/verify FA has n_rows = 4 (the 4 heads of a KV group). So it does not take the "scalar for one row" shortcut and runs on **coopmat1 with a 16-row tile** (75% of the tile idle).
+- Every path is far from bandwidth: q8_0, 1 token, kv=20736 takes 731 us for ~45 MB of K/V (~60 GB/s of 224).
+
+Experiments (`test-backend-ops perf`, kv=20736, head 256, GQA 4):
+- Enabling subgroup ops for the scalar shader on Intel: ±1%, no effect.
+- Token merge (finding 24) on Intel: helps q5_1, but q8_0 2 tokens go 1.4 → 3.4 ms. Kept off on Intel.
+- Split sweep (workgroups per core 4–64, minimum keys per split 128/512): shorter splits help every type.
+  coopmat1 also wants 32 workgroups per core.
+- The scalar shader instead of coopmat1 helps K types f16, q4_0, q4_1 and q5_1. It hurts q8_0, q5_0 and iq4_nl.
+
+Change (`ggml-vulkan.cpp`, Intel Xe2 only; the other vendors are unchanged):
+- for n_rows ≤ 4 and K in {f16, q4_0, q4_1, q5_1}: scalar path instead of coopmat1;
+- split: at least 128 keys per split (was 256), and 32 workgroups per core on coopmat1 (was 16);
+- token merge off on Intel.
+
+The env overrides `GGML_VK_FA_WG_PER_CORE` / `GGML_VK_FA_MIN_KV_SPLIT` still apply.
+
+| FA us (kv=20736), 1 / 2 / 3 tokens | before | after |
+|---|---|---|
+| f16 | 702 / 1312 / 1793 | 588 / 1007 / 1399 (−16…−23%) |
+| q8_0 | 731 / 1361 / 2021 | 660 / 1200 / 1777 (−10…−12%) |
+| q4_0 | 711 / 1333 / 1937 | 677 / 1134 / 1553 (−5…−20%) |
+| q4_1 | 682 / 1278 / 1846 | 538 / 908 / 1279 (−21…−31%) |
+| q5_0 | 870 / 1666 / 2394 | 784 / 1494 / 2183 (−9…−10%) |
+| q5_1 | 773 / 1466 / 2104 | 650 / 1185 / 1836 (−13…−19%) |
+| iq4_nl | 741 / 1395 / 2122 | 663 / 1231 / 1807 (−11…−15%) |
+
+Prefill FA (512 × 8704) is unchanged.
+
+Server (B50, MTP n=1, greedy, story + wiki, 2 runs):
+- The outputs are not bit-identical to before: the new split changes the summation order, and greedy decoding diverges at near-tie tokens.
+  So the draft acceptance moves by up to ±0.06, which dominates raw tg. Normalized to MTP steps per second (tg / (1 + acceptance)), wiki (20k):
+
+| KV | wiki tg before → after | acceptance before → after | steps/s |
+|---|---|---|---|
+| q8_0 | 27.5 → 28.3 | 0.71 → 0.74 | +1.1% |
+| q4_0 | 29.3 → 28.4 | 0.78 → 0.72 | +0.3% |
+| q4_1 | 28.9 → 29.9 | 0.73 → 0.71 | +4.8% |
+| q5_0 | 26.8 → 27.6 | 0.73 → 0.76 | +1.0% |
+| q5_1 | 28.7 → 29.3 | 0.77 → 0.71 | +5.7% |
+| iq4_nl | 28.9 → 28.6 | 0.78 → 0.74 | +1.4% |
+
+- Story (short context) is unchanged within noise (pp 335–341, tg 33.2–34.9 for all types).
+- The gain grows with context length: FA is 21% of the step at 20k.
+- Tests: FLASH_ATTN_EXT on the B50 passes. KLD is unchanged (q8_0 0.000443, q4_1 0.0051): perplexity runs the prefill path, which did not change.
+
+KV types on the B50 after this change (MTP n=1, greedy, t/s):
+
+| KV | story pp / tg | wiki pp / tg |
+|---|---|---|
+| q8_0 | 337 / 34.2 | 612 / 28.3 |
+| q4_0 | 340 / 34.9 | 573 / 28.4 |
+| q4_1 | 340 / 34.6 | 585 / 29.9 |
+| q5_0 | 339 / 33.2 | 521 / 27.6 |
+| q5_1 | 339 / 34.3 | 559 / 29.3 |
+| iq4_nl | 335 / 34.7 | 564 / 28.6 |
+
+Every requested type was already implemented on Vulkan (no CPU fallback in the graph). wiki pp differs by type (q5_0 521 vs q8_0 612): that is the prefill FA dequant, the next item.
+
 **Validation rule from now on:** after every speedup, run this loop test next to the accuracy and hallucination tests (levels 1–3).
 Run it on every affected backend, with the same sampling as upstream.
 - A speedup is only acceptable if its loop rate is not worse than upstream's (p1: 4/6 with default sampling, 0/6 with the Qwen recommendation).

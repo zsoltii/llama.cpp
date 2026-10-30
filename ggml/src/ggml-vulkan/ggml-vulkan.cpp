@@ -1404,6 +1404,16 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
         path = FA_SCALAR;
     }
 
+    // Intel Xe2, decode/verify (GQA heads only, n_rows <= 4): coopmat1 uses a 16-row tile for 4 rows. For these
+    // K types the scalar shader is faster. Arc Pro B50, kv=20736, 1/2/3 tokens, us:
+    // f16 702/1312/1793 -> 587/1019/1401, q4_1 682/1278/1846 -> 537/909/1293, q5_1 773/1466/2104 -> 652/1200/1847,
+    // q4_0 711/1333/1937 -> 680/1133/1557. q8_0, q5_0 and iq4_nl stay on coopmat1 (scalar is 10-20% slower there).
+    if (path == FA_COOPMAT1 && n_rows <= 4 && device->vendor_id == VK_VENDOR_ID_INTEL &&
+            device->architecture == vk_device_architecture::INTEL_XE2 &&
+            (k_type == GGML_TYPE_F16 || k_type == GGML_TYPE_Q4_0 || k_type == GGML_TYPE_Q4_1 || k_type == GGML_TYPE_Q5_1)) {
+        path = FA_SCALAR;
+    }
+
     switch (path) {
     case FA_SCALAR:
         return get_fa_tuning_params_scalar(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
@@ -8422,12 +8432,14 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // GQA with a few tokens (e.g. MTP verify): the scalar shader can put gqa_T tokens x gqa_ratio heads into one
     // workgroup, so the tokens share the K/V reads instead of each token reading the whole KV cache.
     // RTX 2080 Ti, kv=20736, 2 tokens, us: f16 395 -> 219, q8_0 409 -> 305, q4_0 415 -> 245.
-    // Not used on coopmat1 devices (not measured there). GGML_VK_FA_GQA_TOKENS caps gqa_T (1 disables).
+    // Not used on coopmat1 paths, and not on Intel: on Arc Pro B50 the merged scalar tile is slower than separate
+    // tokens for most K types (q8_0 2 tokens 1.4 -> 3.4 ms). GGML_VK_FA_GQA_TOKENS caps gqa_T (1 disables).
     static const uint32_t fa_gqa_tokens = [] {
         const char * env = getenv("GGML_VK_FA_GQA_TOKENS");
         return env ? (uint32_t) std::max(1, atoi(env)) : 8u;
     }();
     if (gqa_ratio > 1 && neq1 > 1 && fa_gqa_tokens > 1 && tuning_params.path != FA_COOPMAT1 &&
+            ctx->device->vendor_id != VK_VENDOR_ID_INTEL &&
             !(mask && ggml_get_op_params_i32(dst, 4) > 0)) {
         uint32_t gqa_T = std::min<uint32_t>(std::min<uint32_t>(neq1, fa_gqa_tokens), std::max(1u, 8u / gqa_ratio));
         if (gqa_T > 1) {
@@ -8559,14 +8571,21 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // grid is tiny and a long KV split into only ~2 workgroups per core leaves the GPU latency-bound
     // (Arc B50: low-batch FA 2-3x faster with 16). Splits are kept >= fa_min_kv_per_split keys long,
     // so short contexts keep the old split. Overrides: GGML_VK_FA_WG_PER_CORE, GGML_VK_FA_MIN_KV_SPLIT.
-    static const uint32_t fa_wg_per_core = [] {
+    static const int fa_wg_per_core_env = [] {
         const char * env = getenv("GGML_VK_FA_WG_PER_CORE");
-        return env ? (uint32_t) std::max(1, atoi(env)) : 16u;
+        return env ? std::max(1, atoi(env)) : 0;
     }();
-    static const uint32_t fa_min_kv_per_split = [] {
+    static const int fa_min_kv_per_split_env = [] {
         const char * env = getenv("GGML_VK_FA_MIN_KV_SPLIT");
-        return env ? (uint32_t) std::max(1, atoi(env)) : 256u;
+        return env ? std::max(1, atoi(env)) : 0;
     }();
+    // Intel Xe2 (Arc Pro B50, kv=20736): shorter splits help every K type by 9-17%, and coopmat1 also wants more
+    // workgroups (32 per core), e.g. q8_0 1/2/3 tokens 731/1361/2021 -> 664/1199/1789 us.
+    const bool fa_xe2 = ctx->device->vendor_id == VK_VENDOR_ID_INTEL && ctx->device->architecture == INTEL_XE2;
+    const uint32_t fa_wg_per_core = fa_wg_per_core_env ? (uint32_t) fa_wg_per_core_env :
+                                    (fa_xe2 && tuning_params.path == FA_COOPMAT1) ? 32u : 16u;
+    const uint32_t fa_min_kv_per_split = fa_min_kv_per_split_env ? (uint32_t) fa_min_kv_per_split_env :
+                                         fa_xe2 ? 128u : 256u;
 
     GGML_ASSERT(Br == pipeline->wg_denoms[0]);
     const uint32_t Tr = CEIL_DIV(N, Br);
