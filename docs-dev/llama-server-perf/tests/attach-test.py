@@ -56,7 +56,7 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=16000)
     ap.add_argument("--port", type=int, default=8092)
     ap.add_argument("--env", action="append", default=[], help="KEY=VAL")
-    ap.add_argument("--out", default=os.path.expanduser("~/llama-bench-results/attach-test"))
+    ap.add_argument("--out", default=os.path.join(os.environ.get("BENCH_OUT", os.path.expanduser("~/llama-bench-results")), "attach-test"))
     ap.add_argument("--no-mtp", action="store_true")
     ap.add_argument("--no-ui", action="store_true", help="plain request, without the extra fields of the web UI")
     ap.add_argument("extra", nargs="*")
