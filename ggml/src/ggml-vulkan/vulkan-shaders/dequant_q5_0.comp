@@ -18,7 +18,7 @@ void main() {
         return;
     }
 
-    const uint b_idx = 1024*i + 32*ir + 8*il;
+    const uint b_idx = dequant_block_dst(ib) + 8*il;
 
     const float d = float(data_a[ib].d);
     const uint qh = uint(data_a[ib].qh[1]) << 16 | data_a[ib].qh[0];

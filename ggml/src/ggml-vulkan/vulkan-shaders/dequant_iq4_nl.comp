@@ -21,7 +21,7 @@ void main() {
     }
 
     const uint q_idx = 8*il;
-    const uint b_idx = 1024*i + 32*ir + q_idx;
+    const uint b_idx = dequant_block_dst(ib) + q_idx;
 
     const float d = float(data_a[ib].d);
 

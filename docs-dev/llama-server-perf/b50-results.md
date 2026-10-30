@@ -626,6 +626,33 @@ KV types on the B50 after this change (MTP n=1, greedy, t/s):
 
 Every requested type was already implemented on Vulkan (no CPU fallback in the graph). wiki pp differs by type (q5_0 521 vs q8_0 612): that is the prefill FA dequant, the next item.
 
+### 26. Prefill FA: dequant + transpose to an f16 scratch for every KV type (2026-10-30)
+
+For batches of ≥ 64 queries with a dense quantized KV cache, coopmat1 FA can dequantize K/V once into an f16 scratch and then run the f16 kernel (upstream #25494).
+- That shader (`dequant_q8_0_transpose`) only existed for q8_0.
+- The other types dequantized inside the FA inner loop on every tile. For example, 512 × 8704, head 256, q5_0 took 35.6 ms vs ~21.6 ms with f16.
+
+Change:
+- `dequant_head.glsl` gets `dequant_block_dst()`: the scratch index of a 32-element block, transposed under `DEQUANT_TRANSPOSE`.
+- q4_0, q4_1, q5_0, q5_1, iq4_nl and q8_0 use it.
+- The generator builds `dequant_<type>_transpose` for all six, and the device creates the pipelines.
+- The selection logic (`use_dequant_kv`) is unchanged, so it applies to every vendor where q8_0 already used it (not coopmat2, not Intel Xe1).
+- New test cases: dense, permuted quantized KV, 75 queries, head 64/128/256, all six types. The existing FA tests used non-dense KV views, so they never reached this path. B50: 27/27 pass, `dequant_kv=1` confirmed for every type.
+
+Server (B50, MTP n=1, greedy, wiki 20k prompt):
+
+| KV | wiki pp before → after |
+|---|---|
+| q5_0 | 521 → 608 (+16.7%) |
+| q5_1 | 559 → 609 (+8.9%) |
+| iq4_nl | 564 → 610 (+8.2%) |
+| q4_0 | 573 → 607 (+6.0%) |
+| q4_1 | 585 → 607 (+3.8%) |
+| q8_0 | 612 → 612 (already used it) |
+
+- Story (short prompt) and tg are unchanged.
+- KLD is unchanged: q4_0 0.00510, q4_1 0.00510, q5_0 0.00269, q5_1 0.00329, iq4_nl 0.00584. The in-shader dequant also produced f16, so the values are identical.
+
 **Validation rule from now on:** after every speedup, run this loop test next to the accuracy and hallucination tests (levels 1–3).
 Run it on every affected backend, with the same sampling as upstream.
 - A speedup is only acceptable if its loop rate is not worse than upstream's (p1: 4/6 with default sampling, 0/6 with the Qwen recommendation).
