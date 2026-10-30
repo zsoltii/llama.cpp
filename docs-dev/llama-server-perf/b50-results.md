@@ -517,6 +517,53 @@ LLAMA_MTP_DEFER_CATCHUP=1 ./build-vk/bin/llama-server \
   --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0 --presence-penalty 1.5
 ```
 
+### Upstream merge check on the B50 (2026-10-29 night)
+
+`origin/master` (79 upstream commits, through `418f905a4`) merged into `speedup` without conflicts (merge `15acaa296`;
+pre-merge state on branch `speedup-pre-merge-20261029`). Results on the B50:
+
+| check | before merge | after merge |
+|---|---|---|
+| test-backend-ops (Vulkan0 = B50, full) | – | 21632/21632 |
+| own MTP, loop-free sampling: story pp / tg, wiki pp / tg | 334 / 29.4, 612 / 24.9 | 337 / 29.5, 612 / 24.9 |
+| own no MTP: story pp / tg, wiki pp / tg | 356 / 26.5, 679 / 22.1 | 356 / 26.5, 679 / 22.1 |
+| KLD q8_0 (mean / same top-1 / PPL) | 0.00044 / 98.67% / 6.6911 | 0.000443 / 98.665% / 6.6911 |
+| wiki QA (answerable / abstained) | 25/25, 5/5 | 25/25, 5/5 |
+| loop test p1 (6 seeds), default sampling | – | 5/6 not ok |
+| loop test p1 (6 seeds), Qwen sampling | – | 0/6 |
+
+The loop scorer (`loop-score.py`) was fixed:
+- Runs that never leave the thinking phase were missed, because their tail contained the empty-content separator.
+- Runs aborted on the fly were not counted.
+- It now scores reasoning and content separately and also reports RUNAWAY runs (token limit without exact repetition).
+
+With default sampling, 3 of the 5 B50 failures loop inside the thinking phase ("Wait, I will ensure the story is …").
+
+### B50 profile (2026-10-30, q8_0 KV, MTP n=1, greedy)
+
+Tools: `GGML_VK_PERF_LOGGER=1` (per-op GPU time) + `LLAMA_SERVER_TIMING=1`.
+The logger does not flush exactly once per graph, so the decode numbers are the totals over the whole generation divided by the number of MTP steps.
+
+Story (short context): wall step 55.7 ms = draft 8.0 + verify 47.1 ms; GPU time 42.9 ms per step.
+
+| op (per step) | ms | share | effective bandwidth |
+|---|---|---|---|
+| weight mat-vecs n=2 (all) | ~31 | ~72% | q4_K ~185 GB/s, q6_K ~170, q5_K ~167, **q8_0 ~128** |
+| LM head q6_K 248320×4096, verify (n=2) + draft (n=1) | 4.6 + 4.5 | 21% | ~185 GB/s |
+| small ops (RMS_NORM, ADD, CPY, GDN, …) | ~3 | ~7% | |
+
+Wiki (20k context): GPU 59 ms per step. **FA of the 2-token verify: 12.4 ms per step (21%)**, 1.64 ms per call, against ~0.2 ms to read the q8_0 K/V once at 224 GB/s.
+In the 20k prefill, FA is ~39% and the q4_K GEMM ~27% of the GPU time.
+
+Not GPU work: the verify decode takes 47 ms wall against ~37 ms of GPU, i.e. ~10 ms per step of command recording / submit latency / readback over Thunderbolt.
+
+Order of attack (plan-b50-kv.md):
+1. decode/verify FA per KV type;
+2. the non-GPU verify time;
+3. the q8_0 mat-vec at 57% of bandwidth;
+4. prefill FA;
+5. the draft LM head (needs a reduced-vocabulary head, larger project).
+
 **Validation rule from now on:** after every speedup, run this loop test next to the accuracy and hallucination tests (levels 1–3).
 Run it on every affected backend, with the same sampling as upstream.
 - A speedup is only acceptable if its loop rate is not worse than upstream's (p1: 4/6 with default sampling, 0/6 with the Qwen recommendation).
