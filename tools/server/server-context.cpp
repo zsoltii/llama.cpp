@@ -2503,6 +2503,7 @@ private:
             if (llama_pooling_type(slot.ctx_tgt) != LLAMA_POOLING_TYPE_NONE) {
                 common_embd_normalize(embd, embd_res.data(), n_embd_out, slot.task->params.embd_normalize);
                 res->embedding.push_back(embd_res);
+                add_sparse(slot, *res);
                 break;
             }
 
@@ -2512,6 +2513,39 @@ private:
         SLT_DBG(slot, "%s", "sending embeddings\n");
 
         queue_results.send(std::move(res));
+    }
+
+    // lexical weights of the slot's sequence, max per token id without the special tokens (as BGE-M3 does)
+    void add_sparse(const server_slot & slot, server_task_result_embd & res) {
+        const int32_t n = llama_get_embeddings_sparse_seq(slot.ctx_tgt, slot.id, nullptr, nullptr, 0);
+        if (n < 0) {
+            return;
+        }
+
+        std::vector<llama_token> toks(n);
+        std::vector<float>       weights(n);
+        llama_get_embeddings_sparse_seq(slot.ctx_tgt, slot.id, toks.data(), weights.data(), n);
+
+        std::map<llama_token, float> best;
+        for (int32_t i = 0; i < n; ++i) {
+            if (weights[i] <= 0.0f || (llama_vocab_get_attr(vocab, toks[i]) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_UNKNOWN))) {
+                continue;
+            }
+            auto it = best.find(toks[i]);
+            if (it == best.end()) {
+                best.emplace(toks[i], weights[i]);
+            } else if (weights[i] > it->second) {
+                it->second = weights[i];
+            }
+        }
+
+        res.has_sparse = true;
+        res.sparse_ids.reserve(best.size());
+        res.sparse_vals.reserve(best.size());
+        for (const auto & [id, w] : best) {
+            res.sparse_ids.push_back(id);
+            res.sparse_vals.push_back(w);
+        }
     }
 
     void send_decision(const server_slot & slot, const common_batch & batch, int32_t i_batch) {
@@ -6978,6 +7012,22 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
         if (tokens.empty()) {
             res->error(format_error_response("Input content cannot be empty", ERROR_TYPE_INVALID_REQUEST));
             return res;
+        }
+    }
+
+    // truncate like the max_length of sentence-transformers: keep the head of the text and the trailing EOS
+    const int embd_truncate = json_value(body, "truncate", params.embd_truncate);
+    if (embd_truncate > 1) {
+        for (auto & tokens : tokenized_prompts) {
+            if (tokens.size() <= (size_t) embd_truncate || tokens.has_mtmd) {
+                continue;
+            }
+            const llama_token last     = tokens[tokens.size() - 1];
+            const bool        keep_eos = last == llama_vocab_eos(ctx_server.vocab) || last == llama_vocab_sep(ctx_server.vocab);
+            tokens.keep_first(keep_eos ? embd_truncate - 1 : embd_truncate);
+            if (keep_eos) {
+                tokens.push_back(last);
+            }
         }
     }
 

@@ -993,6 +993,7 @@ class MODEL_TENSOR(IntEnum):
     CLS                  = auto() # classifier
     CLS_OUT              = auto() # classifier output projection
     CLS_NORM             = auto()
+    SPARSE_OUT           = auto() # per-token lexical weight head (BGE-M3)
     DECISION_HIDDEN_NORM          = auto()
     DECISION_PROJ_MEMORY          = auto()
     DECISION_PROJ_QUESTION        = auto()
@@ -1850,6 +1851,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.CLS:                       "cls",
     MODEL_TENSOR.CLS_OUT:                   "cls.output",
     MODEL_TENSOR.CLS_NORM:                  "cls.norm",
+    MODEL_TENSOR.SPARSE_OUT:                "sparse_out",
     MODEL_TENSOR.DECISION_HIDDEN_NORM:          "decision.hidden_norm",
     MODEL_TENSOR.DECISION_PROJ_MEMORY:          "decision.proj_memory",
     MODEL_TENSOR.DECISION_PROJ_QUESTION:        "decision.proj_question",
@@ -2770,6 +2772,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.LAYER_OUT_NORM,
         MODEL_TENSOR.CLS,
         MODEL_TENSOR.CLS_OUT,
+        MODEL_TENSOR.SPARSE_OUT,
     ],
     MODEL_ARCH.MODERN_BERT: [
         MODEL_TENSOR.TOKEN_EMBD,

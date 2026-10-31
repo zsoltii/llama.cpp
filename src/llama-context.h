@@ -88,6 +88,7 @@ struct llama_context {
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
+    int32_t get_embeddings_sparse_seq(llama_seq_id seq_id, llama_token * tokens, float * weights, int32_t n_max);
 
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
@@ -352,6 +353,12 @@ private:
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
     std::map<llama_seq_id, std::vector<float>> embd_seq;
+
+    // per-token lexical weights of the last encoded batch, next to the token and its sequence
+    // populated only when the model has a sparse head and pooling_type != LLAMA_POOLING_TYPE_NONE
+    std::vector<float>        embd_sparse;
+    std::vector<llama_token>  embd_sparse_tok;
+    std::vector<llama_seq_id> embd_sparse_seq;
 
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;

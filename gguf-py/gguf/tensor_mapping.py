@@ -1642,6 +1642,10 @@ class TensorNameMap:
             "scorer.3",  # laya
         ),
 
+        MODEL_TENSOR.SPARSE_OUT: (
+            "sparse_linear", # bge-m3
+        ),
+
         MODEL_TENSOR.CLS_NORM: (
             "head.norm", # modern-bert
             "scorer.0",  # laya

@@ -954,6 +954,7 @@ public:
     ggml_tensor * get_logits()      const { return t_logits; }
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
+    ggml_tensor * get_embd_sparse() const { return t_embd_sparse; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
 
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
@@ -993,6 +994,7 @@ public:
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
+    ggml_tensor * t_embd_sparse = nullptr; // [1, n_tokens] lexical weight of each token
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
     std::vector<ggml_tensor *> t_layer_inp;
@@ -1491,6 +1493,11 @@ struct llm_graph_context {
             ggml_tensor * cls_out,
             ggml_tensor * cls_out_b,
             ggml_tensor * cls_norm) const;
+
+    // per-token lexical weights relu(w*h + b) next to the pooled embedding (BGE-M3 sparse head)
+    void build_sparse(
+            ggml_tensor * w,
+            ggml_tensor * b) const;
 
     //
     // logits

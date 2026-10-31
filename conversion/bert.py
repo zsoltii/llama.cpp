@@ -489,7 +489,16 @@ class XLMRobertaModel(BertModel):
                 fname = self.add_prefix_to_filename(self.fname_out, f"lora-{name}-")
                 self._lora_files[name] = gguf.GGUFWriter(fname, arch=gguf.MODEL_ARCH_NAMES[self.model_arch], endianess=self.endianess, use_temp_file=self.use_temp_file, dry_run=self.dry_run)
 
-        return super().generate_extra_tensors()
+        extra = list(super().generate_extra_tensors())
+
+        # BGE-M3 keeps its lexical weight head next to the transformer: relu(sparse_linear(hidden_state))
+        # https://huggingface.co/BAAI/bge-m3/blob/main/sparse_linear.pt
+        if (sparse_path := self.dir_model / "sparse_linear.pt").is_file():
+            head = torch.load(sparse_path, map_location="cpu", weights_only=True)
+            extra.append(("sparse_linear.weight", head["weight"].float()))
+            extra.append(("sparse_linear.bias",   head["bias"].float()))
+
+        return extra
 
     def set_type(self):
         for lora_writer in self._lora_files.values():

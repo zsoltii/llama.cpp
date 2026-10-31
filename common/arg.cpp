@@ -3319,6 +3319,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_DEBUG}));
     add_opt(common_arg(
+        {"--embd-truncate"}, "N",
+        string_format("truncate embedding inputs to N tokens, keeping the trailing EOS, like the max_length of sentence-transformers (default: %d, 0 = off)", params.embd_truncate),
+        [](common_params & params, int value) {
+            params.embd_truncate = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_EMBD_TRUNCATE"));
+    add_opt(common_arg(
         {"--embd-output-format"}, "FORMAT",
         "empty = default, \"array\" = [[],[]...], \"json\" = openai style, \"json+\" = same \"json\" + cosine similarity matrix, \"raw\" = plain whitespace-delimited output (one embedding per line)",
         [](common_params & params, const std::string & value) {

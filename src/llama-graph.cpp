@@ -498,11 +498,20 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
         using T = std::remove_reference_t<decltype(*data)>;
         std::fill(data, data + ne, llama_cast<T>(-INFINITY));
 
+        // without causality, SWA and ALiBi a row depends only on the sequence of its token,
+        // so a run of tokens of the same sequence copies the first row (O(n_tokens) per run instead of per token)
+        const bool row_per_seq = !causal && n_swa == 0 && !hparams.use_alibi;
+
         for (int i1 = 0; i1 < n_tokens; ++i1) {
             const llama_seq_id s1 = ubatch->seq_id[i1][0];
             const llama_pos    p1 = ubatch->pos[i1];
 
             const uint64_t idst = i1*n_kv;
+
+            if (row_per_seq && i1 > 0 && ubatch->seq_id[i1 - 1][0] == s1) {
+                std::copy(data + idst - n_kv, data + idst, data + idst);
+                continue;
+            }
 
             for (int i0 = 0; i0 < n_tokens; ++i0) {
                 const llama_seq_id s0 = ubatch->seq_id[i0][0];
@@ -1424,6 +1433,7 @@ void llm_graph_result::reset() {
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
+    t_embd_sparse = nullptr;
     t_h_nextn     = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
@@ -1468,6 +1478,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     }
     if (t_embd_pooled != nullptr) {
         ggml_set_output(t_embd_pooled);
+    }
+    if (t_embd_sparse != nullptr) {
+        ggml_set_output(t_embd_sparse);
     }
     if (t_h_nextn != nullptr) {
         ggml_set_output(t_h_nextn);
@@ -4277,6 +4290,26 @@ void llm_graph_context::build_pooling(
 
     cb(cur, "result_embd_pooled", -1);
     res->t_embd_pooled = cur;
+
+    ggml_build_forward_expand(gf, cur);
+}
+
+void llm_graph_context::build_sparse(
+        ggml_tensor * w,
+        ggml_tensor * b) const {
+    // the weights are only read next to a pooled embedding, a per-token context outputs the hidden states as is
+    if (!cparams.embeddings || pooling_type == LLAMA_POOLING_TYPE_NONE || w == nullptr || res->t_embd == nullptr) {
+        return;
+    }
+
+    ggml_tensor * cur = ggml_mul_mat(ctx0, w, res->t_embd);
+    if (b) {
+        cur = ggml_add(ctx0, cur, b);
+    }
+    cur = ggml_relu(ctx0, cur);
+
+    cb(cur, "result_embd_sparse", -1);
+    res->t_embd_sparse = cur;
 
     ggml_build_forward_expand(gf, cur);
 }

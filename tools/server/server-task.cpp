@@ -1483,18 +1483,26 @@ json server_task_result_embd::to_json() {
 }
 
 json server_task_result_embd::to_json_non_oaicompat() {
-    return json {
+    json res = json {
         {"index",     index},
         {"embedding", embedding},
     };
+    if (has_sparse) {
+        res["sparse"] = json {{"indices", sparse_ids}, {"values", sparse_vals}};
+    }
+    return res;
 }
 
 json server_task_result_embd::to_json_oaicompat() {
-    return json {
+    json res = json {
         {"index",            index},
         {"embedding",        embedding[0]},
         {"tokens_evaluated", n_tokens},
     };
+    if (has_sparse) {
+        res["sparse"] = json {{"indices", sparse_ids}, {"values", sparse_vals}};
+    }
+    return res;
 }
 
 //

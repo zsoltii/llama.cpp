@@ -1169,6 +1169,16 @@ extern "C" {
     // otherwise: float[n_embd] (1-dimensional)
     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
 
+    // Get the per-token lexical weights of a sequence from the model's sparse head (e.g. BGE-M3 sparse_linear)
+    // Copies at most n_max (token, weight) pairs in the order of the sequence's tokens in the last batch
+    // Returns the number of tokens of the sequence, or -1 if the model has no sparse head or pooling_type is LLAMA_POOLING_TYPE_NONE
+    LLAMA_API int32_t llama_get_embeddings_sparse_seq(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                     llama_token * tokens,
+                           float * weights,
+                         int32_t   n_max);
+
     //
     // backend sampling API [EXPERIMENTAL]
     // note: use only if the llama_context was created with at least one llama_sampler_seq_config

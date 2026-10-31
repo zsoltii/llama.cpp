@@ -1592,6 +1592,9 @@ json format_embeddings_response_oaicompat(
                 {"object", "embedding"}
             };
         }
+        if (elem.contains("sparse")) {
+            embedding_obj["sparse"] = elem.at("sparse");
+        }
         data.push_back(embedding_obj);
 
         n_tokens += json_value(elem, "tokens_evaluated", 0);

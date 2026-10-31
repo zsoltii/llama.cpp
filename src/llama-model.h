@@ -792,6 +792,10 @@ struct llama_model {
     struct ggml_tensor * cls_norm  = nullptr;
     struct ggml_tensor * cls_norm_b = nullptr;
 
+    // per-token lexical weight head (BGE-M3 sparse_linear)
+    struct ggml_tensor * sparse_out   = nullptr;
+    struct ggml_tensor * sparse_out_b = nullptr;
+
     struct ggml_tensor * conv1d   = nullptr;
     struct ggml_tensor * conv1d_b = nullptr;
 

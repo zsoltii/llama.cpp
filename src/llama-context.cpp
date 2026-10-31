@@ -1164,6 +1164,26 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
     return it->second.data();
 }
 
+int32_t llama_context::get_embeddings_sparse_seq(llama_seq_id seq_id, llama_token * tokens, float * weights, int32_t n_max) {
+    if (embd_sparse.empty()) {
+        return -1;
+    }
+
+    int32_t n = 0;
+    for (size_t i = 0; i < embd_sparse.size(); ++i) {
+        if (embd_sparse_seq[i] != seq_id) {
+            continue;
+        }
+        if (n < n_max) {
+            tokens[n]  = embd_sparse_tok[i];
+            weights[n] = embd_sparse[i];
+        }
+        n++;
+    }
+
+    return n;
+}
+
 float * llama_context::get_embeddings_nextn() {
     output_reorder();
 
@@ -1719,10 +1739,11 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
 
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed
-    if (!embd_seq.empty()) {
+    if (!embd_seq.empty() || !embd_sparse.empty()) {
         synchronize();
     }
     embd_seq.clear();
+    embd_sparse.clear();
 
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
@@ -1834,6 +1855,20 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
                     GGML_ABORT("unknown pooling type");
                 }
         }
+    }
+
+    // extract the per-token lexical weights (sparse head)
+    if (auto * t_sparse = res->get_embd_sparse(); t_sparse && ubatch.token) {
+        ggml_backend_t backend_sparse = ggml_backend_sched_get_tensor_backend(sched.get(), t_sparse);
+        GGML_ASSERT(backend_sparse != nullptr);
+
+        embd_sparse.resize(n_tokens);
+        embd_sparse_tok.assign(ubatch.token, ubatch.token + n_tokens);
+        embd_sparse_seq.resize(n_tokens);
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            embd_sparse_seq[i] = ubatch.seq_id[i][0];
+        }
+        ggml_backend_tensor_get_async(backend_sparse, t_sparse, embd_sparse.data(), 0, n_tokens*sizeof(float));
     }
 
     // extract nextn embeddings (hidden state before the final output norm)
@@ -2011,10 +2046,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed
-    if (!embd_seq.empty()) {
+    if (!embd_seq.empty() || !embd_sparse.empty()) {
         synchronize();
     }
     embd_seq.clear();
+    embd_sparse.clear();
 
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
@@ -4455,6 +4491,12 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     ctx->synchronize();
 
     return ctx->get_embeddings_seq(seq_id);
+}
+
+int32_t llama_get_embeddings_sparse_seq(llama_context * ctx, llama_seq_id seq_id, llama_token * tokens, float * weights, int32_t n_max) {
+    ctx->synchronize();
+
+    return ctx->get_embeddings_sparse_seq(seq_id, tokens, weights, n_max);
 }
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {

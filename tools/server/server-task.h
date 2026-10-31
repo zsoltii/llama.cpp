@@ -541,6 +541,11 @@ struct server_task_result_cmpl_partial : server_task_result {
 struct server_task_result_embd : server_task_result {
     std::vector<std::vector<float>> embedding;
 
+    // lexical weights per token id, from the model's sparse head (empty if it has none)
+    bool                     has_sparse = false;
+    std::vector<llama_token> sparse_ids;
+    std::vector<float>       sparse_vals;
+
     int32_t n_tokens;
 
     // response formatting
