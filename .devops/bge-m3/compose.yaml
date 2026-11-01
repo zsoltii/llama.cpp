@@ -1,0 +1,69 @@
+# BGE-M3 hybrid embedding server, hardened.
+#   hf download BAAI/bge-m3                                   # once, on the host
+#   docker compose -f .devops/bge-m3/compose.yaml --profile cuda   up -d
+#   docker compose -f .devops/bge-m3/compose.yaml --profile vulkan up -d
+# The convert service turns the hub cache into the GGUF once (offline, read-only input), the server waits for it.
+# HF_HUB_CACHE: the host hub cache (default ~/.cache/huggingface/hub). BGE_PORT: host port (default 127.0.0.1:8080).
+# GPU access needs nvidia-container-toolkit on the host (NVIDIA), or /dev/dri for AMD/Intel (vulkan, see README.md).
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ ALL ]
+  security_opt: [ "no-new-privileges:true" ]
+  tmpfs: [ "/tmp:rw,noexec,nosuid,nodev,size=64m" ]
+  pids_limit: 256
+  user: "10001:10001"
+
+x-server: &server
+  <<: *hardening
+  restart: unless-stopped
+  depends_on:
+    convert:
+      condition: service_completed_successfully
+  ports: [ "${BGE_PORT:-127.0.0.1:8080}:8080" ]
+  volumes: [ "bge-models:/models:ro" ]
+  environment:
+    LLAMA_ARG_MODEL: /models/bge-m3-hybrid-${BGE_OUTTYPE:-f32}.gguf
+    # set an API key in production (or LLAMA_ARG_API_KEY_FILE with a docker secret)
+    LLAMA_API_KEY: ${LLAMA_API_KEY:-}
+  mem_limit: 4g
+  ulimits:
+    nofile: { soft: 65536, hard: 65536 }
+
+services:
+  convert:
+    <<: *hardening
+    image: llama-bge-m3:convert
+    build: { context: ../.., dockerfile: .devops/bge-m3/convert.Dockerfile }
+    network_mode: none
+    mem_limit: 8g
+    volumes:
+      - "${HF_HUB_CACHE:-~/.cache/huggingface/hub}:/hf:ro"
+      - "bge-models:/models"
+    environment:
+      BGE_OUTTYPE: ${BGE_OUTTYPE:-f32}
+      BGE_REVISION: ${BGE_REVISION:-main}
+    profiles: [ cuda, vulkan ]
+
+  bge-m3-cuda:
+    <<: *server
+    image: llama-bge-m3:cuda
+    build: { context: ../.., dockerfile: .devops/bge-m3/cuda.Dockerfile }
+    deploy:
+      resources:
+        reservations:
+          devices: [ { driver: nvidia, count: 1, capabilities: [ gpu ] } ]
+    profiles: [ cuda ]
+
+  bge-m3-vulkan:
+    <<: *server
+    image: llama-bge-m3:vulkan
+    build: { context: ../.., dockerfile: .devops/bge-m3/vulkan.Dockerfile }
+    deploy:
+      resources:
+        reservations:
+          devices: [ { driver: nvidia, count: 1, capabilities: [ gpu, graphics ] } ]
+    profiles: [ vulkan ]
+
+volumes:
+  bge-models:
