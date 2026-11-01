@@ -1907,6 +1907,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             // NVIDIA without tensor cores (Pascal, DP4A): the 128-thread tile keeps 64-128 accumulators per thread,
             // which limits occupancy. 16 warps with 2x1 thread tiles: GTX 1080 Ti, pp512 MMQ 1.7-2.1x faster.
             l_warptile_mmq_int = l_warptile_mmq_int_k = { 512, 128, 128, 32, 32, 32, 2, 2, 1, 1, mm_warp_8 };
+            // Same for the f32/f16 matmul: 8 warps with 2x1 thread tiles and BK=32.
+            // GTX 1080 Ti, BERT-large encode (f32 and f16 weights): pp512 2.2k -> 5.3-5.4k t/s, pp3584 2.6k -> 4.5k t/s.
+            l_warptile = { 256, 128, 128, 32, 32, 64, 2, 2, 1, 1, mm_warp_8 };
+            // mul_mm.comp packs two rows of a thread tile per accumulator (TM even) and every load pass fills
+            // whole tile rows (BLOCK_SIZE * LOAD_VEC / BK <= BM, BN; LOAD_VEC is up to 8 for the fp16 shaders)
+            GGML_ASSERT(l_warptile[7] % 2 == 0 && l_warptile[0] * 8 / l_warptile[3] <= std::min(l_warptile[1], l_warptile[2]));
         }
 
         l_mmq_wg_denoms = l_wg_denoms = {128, 128, 1 };
