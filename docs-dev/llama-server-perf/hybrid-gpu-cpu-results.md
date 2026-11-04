@@ -92,7 +92,15 @@ ub2048 and ncmoe3 at ub>=1024 do not fit in 11 GB VRAM at d15k. ncmoe5 trades ~3
    had 4 rows, so heads 4-7 were never written and the model produced garbage. The GQA
    path is now dropped when the block is smaller than the ratio. New test-backend-ops
    case with a sliding-window mask, KV 768, gqa 8.
-3. Vulkan OOM during the run (not at reserve) aborts with an uncaught
+3. `vulkan: Pascal MUL_MAT_ID int-dot tile`. The earlier Pascal MMQ tile (16 warps) was only
+   applied to MUL_MAT; MUL_MAT_ID kept the 128-thread default. 8 warps with 64x32 warp tiles,
+   n512: mxfp4 9.4 -> 5.5 ms, q4_0 6.6 -> 4.1 ms, q4_K 7.5 -> 4.7 ms. gpt-oss own-vk pp2048
+   (ncmoe5 ub1024, t10): 548 -> 790 t/s at d0, 401 -> 459 at d15k; server prompt of 43.6k
+   tokens 280 -> 395 t/s. A tile with WMITER=1 and TN=2 looked 1.2-1.9x faster but leaves half
+   of each warp tile unwritten (NaN perplexity on Qwen3-14B, while test-backend-ops passed);
+   an assert now rejects such tiles. Tests: MUL_MAT/MUL_MAT_ID 3541/3541, gpt-oss KLD 0.035321
+   (bit-identical), Qwen3-14B PPL 6.4980 (CUDA 6.4997), attach 0/3 bad, wiki QA 25/25, 4/5.
+4. Vulkan OOM during the run (not at reserve) aborts with an uncaught
    `vk::SystemError` instead of a clean error (seen once at ncmoe4 ub1024 d15k).
    Not fixed yet.
 

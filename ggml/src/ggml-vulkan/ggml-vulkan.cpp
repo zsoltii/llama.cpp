@@ -1907,6 +1907,23 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             // NVIDIA without tensor cores (Pascal, DP4A): the 128-thread tile keeps 64-128 accumulators per thread,
             // which limits occupancy. 16 warps with 2x1 thread tiles: GTX 1080 Ti, pp512 MMQ 1.7-2.1x faster.
             l_warptile_mmq_int = l_warptile_mmq_int_k = { 512, 128, 128, 32, 32, 32, 2, 2, 1, 1, mm_warp_8 };
+            // MUL_MAT_ID (MoE prefill) prefers 8 warps with 64x32 warp tiles. GTX 1080 Ti, n512:
+            // mxfp4 9.4 -> 5.5 ms, q4_0 6.6 -> 4.1 ms, q4_K 7.5 -> 4.7 ms (n_mats 128, m 768, k 2048).
+            l_warptile_mmqid_int   = { 256, 128, 128, 32, 64, 32, 2, 2, 1, 1, mul_mat_mm_warp_8 };
+            l_warptile_mmqid_int_k = { 256, 128, 128, 32, 64, 32, 1, 2, 1, 1, mul_mat_mm_warp_16 };
+            // mul_mmq.comp covers a warp tile only if the threads of a warp fill it exactly: WSUBM / TM threads
+            // per column group must divide WARP, and the WNITER sub-tiles must span WN (else rows stay unwritten).
+            const auto mmq_tile_ok = [](const std::vector<uint32_t> & w) {
+                const uint32_t bs = w[0], bm = w[1], bn = w[2], wm = w[4], wn = w[5], wmiter = w[6], tm = w[7], tn = w[8], warp = w[10];
+                if (bs != (bm / wm) * (bn / wn) * warp || (wm * wn) % (warp * tm * tn * wmiter) != 0) {
+                    return false;
+                }
+                const uint32_t wnitr = (wm * wn) / (warp * tm * tn * wmiter);
+                const uint32_t rows = (wm / wmiter) / tm;
+                return warp % rows == 0 && (wn / wnitr) == tn * (warp / rows);
+            };
+            GGML_ASSERT(mmq_tile_ok(l_warptile_mmq_int) && mmq_tile_ok(l_warptile_mmq_int_k));
+            GGML_ASSERT(mmq_tile_ok(l_warptile_mmqid_int) && mmq_tile_ok(l_warptile_mmqid_int_k));
             // Same for the f32/f16 matmul: 8 warps with 2x1 thread tiles and BK=32.
             // GTX 1080 Ti, BERT-large encode (f32 and f16 weights): pp512 2.2k -> 5.3-5.4k t/s, pp3584 2.6k -> 4.5k t/s.
             l_warptile = { 256, 128, 128, 32, 32, 64, 2, 2, 1, 1, mm_warp_8 };
