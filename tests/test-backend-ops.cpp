@@ -193,6 +193,28 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
 }
 
+// sliding window: each row sees one contiguous run of n_win keys (the window of a SWA layer in its small
+// ring buffer), so whole stretches of the KV are masked, including whole split_k chunks
+static void init_tensor_kq_mask_window(ggml_tensor * tensor, int64_t n_win) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_F16);
+    GGML_ASSERT(n_win > 0 && n_win <= tensor->ne[0]);
+
+    const int64_t ne0 = tensor->ne[0];
+    const int64_t nrows = ggml_nrows(tensor);
+    std::vector<float> data_f32(ggml_nelements(tensor), -INFINITY);
+    std::vector<ggml_fp16_t> data_f16(ggml_nelements(tensor));
+
+    for (int64_t row = 0; row < nrows; ++row) {
+        const int64_t start = (ne0 - n_win) * (row % 3) / 2;
+        for (int64_t i = start; i < start + n_win; ++i) {
+            data_f32[row*ne0 + i] = 0.0f;
+        }
+    }
+
+    ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), data_f16.size());
+    ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+}
+
 static void init_tensor_kq_mask_sparse(ggml_tensor * tensor, int64_t n_kv_max) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F16);
     GGML_ASSERT(n_kv_max > 0 && n_kv_max <= tensor->ne[0]);
@@ -8736,7 +8758,9 @@ struct test_flash_attn_ext : public test_case {
 
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
         ggml_flash_attn_ext_add_sinks(out, s);
-        ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
+        if (n_kv_max > 0) {
+            ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
+        }
         ggml_prec_set_acc(out, prec);
         ggml_set_name(out, "out");
 
@@ -8751,6 +8775,8 @@ struct test_flash_attn_ext : public test_case {
             } else if (strcmp(t->name, "m") == 0) {
                 if (n_kv_max > 0) {
                     init_tensor_kq_mask_sparse(t, n_kv_max);
+                } else if (n_kv_max < 0) {
+                    init_tensor_kq_mask_window(t, -n_kv_max);
                 } else {
                     init_tensor_kq_mask(t);
                 }
@@ -12236,6 +12262,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // gpt-oss SWA decode: 128-key window in a 768-cell ring buffer, with sinks (n_kv_max < 0: contiguous window)
+    for (ggml_type type_KV : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        for (int nb : {1, 2, 8, 512}) {
+            for (bool sinks : {false, true}) {
+                test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 768, nb, true, sinks, 0, 0, GGML_PREC_F32,
+                                                                type_KV, type_KV, {0, 1, 2, 3}, true, false, -128));
             }
         }
     }

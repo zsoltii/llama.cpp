@@ -8440,6 +8440,16 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
 
+    // The GQA shader keeps all gqa_ratio rows of a token in one block of rows (i == 0). max_gqa comes from the
+    // 512-row tuning, and the tuning for the gqa_ratio rows can pick fewer block rows (e.g. the fp32 16x16 prefill
+    // tile vs 4 rows for a short KV on NVIDIA Pascal): the rows past the first block would never be computed.
+    if (gqa_ratio > 1 && tuning_params.block_rows < N) {
+        gqa_ratio = 1;
+        N = (uint32_t)neq1;
+        workgroups_y *= qk_ratio;
+        tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
+    }
+
     // GQA with a few tokens (e.g. MTP verify): the scalar shader can put gqa_T tokens x gqa_ratio heads into one
     // workgroup, so the tokens share the K/V reads instead of each token reading the whole KV cache.
     // RTX 2080 Ti, kv=20736, 2 tokens, us: f16 395 -> 219, q8_0 409 -> 305, q4_0 415 -> 245.
