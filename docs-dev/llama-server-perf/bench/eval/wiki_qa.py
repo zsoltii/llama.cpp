@@ -51,27 +51,32 @@ SYSTEM = ("Answer questions using ONLY the article below. Reply with a short ans
           "does not contain the answer, reply exactly NOT_IN_TEXT.\n\n=== ARTICLE ===\n")
 
 
-def ask(port, article, q):
+def ask(port, article, q, max_tokens=48, template_kwargs=None):
     body = {"messages": [{"role": "system", "content": SYSTEM + article},
                          {"role": "user", "content": q}],
-            "temperature": 0, "max_tokens": 48, "cache_prompt": True,
-            "chat_template_kwargs": {"enable_thinking": False}}
+            "temperature": 0, "max_tokens": max_tokens, "cache_prompt": True,
+            "chat_template_kwargs": template_kwargs or {"enable_thinking": False}}
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", json.dumps(body).encode(),
                                  {"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=1800) as r:
-        return json.load(r)["choices"][0]["message"]["content"].strip()
+        # some models (gpt-oss) write narrow no-break spaces: "Aelia\u202fCapitolina"
+        return re.sub(r"[\u00a0\u202f]", " ", json.load(r)["choices"][0]["message"]["content"]).strip()
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", required=True)
     ap.add_argument("--port", type=int, default=8080)
+    # models that always reason (gpt-oss) need room for the reasoning, e.g.
+    # --max-tokens 1024 --template-kwargs '{"reasoning_effort": "low"}'
+    ap.add_argument("--max-tokens", type=int, default=48)
+    ap.add_argument("--template-kwargs", type=json.loads, default=None)
     a = ap.parse_args()
     article = open(ARTICLE, encoding="utf-8").read()
     rows, ok_ans, ok_abst, n_ans, n_abst, halluc = [], 0, 0, 0, 0, 0
     t0 = time.time()
     for q, gold in QA:
-        out = ask(a.port, article, q)
+        out = ask(a.port, article, q, a.max_tokens, a.template_kwargs)
         refused = "NOT_IN_TEXT" in out.upper().replace(" ", "_")
         if gold is None:
             n_abst += 1

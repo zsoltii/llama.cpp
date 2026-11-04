@@ -58,6 +58,8 @@ def main():
     ap.add_argument("--env", action="append", default=[], help="KEY=VAL")
     ap.add_argument("--out", default=os.path.join(os.environ.get("BENCH_OUT", os.path.expanduser("~/llama-bench-results")), "attach-test"))
     ap.add_argument("--no-mtp", action="store_true")
+    ap.add_argument("--model", help="GGUF path instead of the default Qwen3.5-9B (implies --no-mtp)")
+    ap.add_argument("--ctx", type=int, default=128000)
     ap.add_argument("--no-ui", action="store_true", help="plain request, without the extra fields of the web UI")
     ap.add_argument("extra", nargs="*")
     a = ap.parse_args()
@@ -70,8 +72,9 @@ def main():
         k, v = kv.split("=", 1)
         env[k] = v
 
-    mtp = [] if a.no_mtp else ["-ctkd", "q8_0", "-ctvd", "q8_0", "--spec-type", "draft-mtp", "--spec-draft-n-max", "1", "-bs"]
-    cmd = [a.bin, "-hf", "unsloth/Qwen3.5-9B-MTP-GGUF:UD-Q4_K_XL", "-c", "128000", "-fa", "on", "--parallel", "1",
+    mtp = [] if a.no_mtp or a.model else ["-ctkd", "q8_0", "-ctvd", "q8_0", "--spec-type", "draft-mtp", "--spec-draft-n-max", "1", "-bs"]
+    model = ["-m", a.model] if a.model else ["-hf", "unsloth/Qwen3.5-9B-MTP-GGUF:UD-Q4_K_XL"]
+    cmd = [a.bin] + model + ["-c", str(a.ctx), "-fa", "on", "--parallel", "1",
            "-t", "16", "-tb", "16", "-dev", a.dev, "--port", str(a.port), "-ctk", "q8_0", "-ctv", "q8_0"] \
           + mtp + SAMPLING[a.sampling] + a.extra
     print("CMD:", " ".join(a.env), " ".join(cmd), flush=True)

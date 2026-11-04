@@ -1245,6 +1245,16 @@ struct ggml_backend_sched {
 
     int debug;
 
+    // per-backend split timing [GGML_SCHED_PROF], printed when the scheduler is freed; every split is
+    // synchronized after its input copies and after its compute, so this serializes the backends
+    bool    prof;
+    int64_t prof_copy_us   [GGML_SCHED_MAX_BACKENDS];
+    int64_t prof_compute_us[GGML_SCHED_MAX_BACKENDS];
+    int64_t prof_splits    [GGML_SCHED_MAX_BACKENDS];
+    int64_t prof_wbytes    [GGML_SCHED_MAX_BACKENDS];
+    int64_t prof_graphs;
+    char    prof_names     [GGML_SCHED_MAX_BACKENDS][32];
+
     // graph size of the current and the previous scheduling, used by the realloc callback and for debugging
     // graph reallocations [GGML_SCHED_DEBUG_REALLOC]
     // ref: https://github.com/ggml-org/llama.cpp/pull/17617
@@ -2230,6 +2240,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    if (sched->prof) {
+        sched->prof_graphs++;
+    }
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -2247,6 +2261,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         bool user_synced = false;
 
+        const int64_t prof_t0 = sched->prof ? ggml_time_us() : 0;
+
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -2257,6 +2273,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
                 ggml_backend_sched_copy_input(sched, split, split->inputs[input_id], &user_synced);
+            }
+        }
+
+        int64_t prof_t1 = 0;
+        if (sched->prof) {
+            ggml_backend_synchronize(split_backend);
+            prof_t1 = ggml_time_us();
+            sched->prof_copy_us[split_backend_id] += prof_t1 - prof_t0;
+            for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+                if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {
+                    sched->prof_wbytes[split_backend_id] += ggml_nbytes(split->inputs[input_id]);
+                }
             }
         }
 
@@ -2299,6 +2327,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (sched->prof) {
+            ggml_backend_synchronize(split_backend);
+            sched->prof_compute_us[split_backend_id] += ggml_time_us() - prof_t1;
+            sched->prof_splits[split_backend_id]++;
+        }
+
         // record the event of this split
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
@@ -2324,6 +2358,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
     struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
 
     sched->input_stage_disable = getenv("GGML_SCHED_SYNC_INPUTS") != NULL;
+    sched->prof = getenv("GGML_SCHED_PROF") != NULL;
+    for (int b = 0; sched->prof && b < n_backends; b++) {
+        // the backends may be freed before the scheduler
+        snprintf(sched->prof_names[b], sizeof(sched->prof_names[b]), "%s", ggml_backend_name(backends[b]));
+    }
 
     const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
@@ -2387,6 +2426,15 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    if (sched->prof && sched->prof_graphs > 0) {
+        GGML_LOG_INFO("%s: split timing over %lld graphs (per graph):\n", __func__, (long long) sched->prof_graphs);
+        for (int b = 0; b < sched->n_backends; b++) {
+            const double g = (double) sched->prof_graphs;
+            GGML_LOG_INFO("%s:   %-10s splits %6.1f  copy %8.3f ms  compute %8.3f ms  host weights %8.1f MiB\n", __func__,
+                sched->prof_names[b], sched->prof_splits[b] / g, sched->prof_copy_us[b] / g / 1000.0,
+                sched->prof_compute_us[b] / g / 1000.0, sched->prof_wbytes[b] / g / 1048576.0);
+        }
     }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
