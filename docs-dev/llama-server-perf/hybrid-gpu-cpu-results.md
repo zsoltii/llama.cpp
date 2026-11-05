@@ -100,9 +100,18 @@ ub2048 and ncmoe3 at ub>=1024 do not fit in 11 GB VRAM at d15k. ncmoe5 trades ~3
    of each warp tile unwritten (NaN perplexity on Qwen3-14B, while test-backend-ops passed);
    an assert now rejects such tiles. Tests: MUL_MAT/MUL_MAT_ID 3541/3541, gpt-oss KLD 0.035321
    (bit-identical), Qwen3-14B PPL 6.4980 (CUDA 6.4997), attach 0/3 bad, wiki QA 25/25, 4/5.
-4. Vulkan OOM during the run (not at reserve) aborts with an uncaught
-   `vk::SystemError` instead of a clean error (seen once at ncmoe4 ub1024 d15k).
-   Not fixed yet.
+4. `vulkan: return GGML_STATUS_ALLOC_FAILED on device OOM during graph compute`. The scratch
+   buffers grow inside graph_compute; a full device threw `vk::SystemError` and aborted the
+   process (seen at ncmoe4 ub1024 d15k). Now llama_decode returns -2 and the context stays
+   usable (injected failure in llama-server: the next requests answer correctly).
+5. `tests: cover the large matmul tiles for every type`. MUL_MAT/MUL_MAT_ID tests with m, n > 64
+   existed only for f16, f32 and q4_0; the invalid k-quant tile of item 3 now fails 4 cases.
+6. `llama: load CPU-overridden weights into pinned memory in --load-mode auto`. With a GPU and a
+   `-ot ...=CPU` / `-ncmoe` override, auto now loads without mmap (pinned host buffers) when the
+   model is smaller than 80% of free RAM; `--load-mode mmap` keeps the old behaviour.
+   gpt-oss -ncmoe 5 ub1024 pp2048, default load mode: CUDA 484 -> 1023 t/s, Vulkan 352 -> 783 t/s;
+   tg128 unchanged (29.4-31.7 t/s for auto and mmap, t10/t20, with and without interleave).
+   Attach test on CUDA with the default load mode: 0/2 bad, pp ~495 t/s at 43.6k tokens.
 
 ## Tests
 

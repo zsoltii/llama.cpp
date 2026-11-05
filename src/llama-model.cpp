@@ -1621,6 +1621,30 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // Weights overridden to the CPU (-ot ...=CPU, --n-cpu-moe) are copied to the GPU for large batches.
+    // Mapped from the file they are pageable memory, and these copies run at a fraction of the PCIe
+    // bandwidth (GTX 1080 Ti, gpt-oss-20b -ncmoe 5: pp2048 512 -> 1007 t/s with pinned memory).
+    // In AUTO, load them into the pinned host buffers instead, when the model fits in free RAM.
+    if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO && !devices.empty() && n_gpu_layers > 0 &&
+        !params.no_host && params.tensor_buft_overrides) {
+        bool cpu_override = false;
+        for (const auto * o = params.tensor_buft_overrides; o->pattern != nullptr; ++o) {
+            cpu_override |= o->buft == ggml_backend_cpu_buffer_type();
+        }
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        size_t free = 0;
+        size_t total = 0;
+        if (cpu_override && cpu_dev) {
+            ggml_backend_dev_memory(cpu_dev, &free, &total);
+        }
+        // leave room for the KV cache, compute buffers and the rest of the system
+        if (cpu_override && ml.n_bytes < free / 10 * 8) {
+            LLAMA_LOG_INFO("%s: tensor overrides to CPU with a GPU: loading without mmap into pinned memory "
+                "(use --load-mode mmap to keep mmap)\n", __func__);
+            ml.use_mmap = false;
+        }
+    }
+
     // resolve AUTO on systems without mmap support (e.g. iGPUs): fall back to OFF; see #28160
     if (ml.lazy.mode == LLAMA_LAZY_MODE_AUTO) {
         for (const auto & dev : devices) {
