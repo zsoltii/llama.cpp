@@ -14703,7 +14703,29 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
+static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph);
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    // Scratch buffers (prealloc_x/y, split_k, ...) grow on demand during compute, after the scheduler
+    // reserved its buffers. When the device is full, report an allocation failure instead of letting the
+    // exception terminate the process.
+    try {
+        return ggml_backend_vk_graph_compute_impl(backend, cgraph);
+    } catch (const vk::SystemError & e) {
+        if (e.code() != vk::Result::eErrorOutOfDeviceMemory && e.code() != vk::Result::eErrorOutOfHostMemory) {
+            throw;
+        }
+        GGML_LOG_ERROR("%s: %s\n", __func__, e.what());
+        ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+        // discard the partially recorded command buffers and wait for the submitted ones
+        ctx->compute_ctx.reset();
+        ggml_vk_synchronize(ctx);
+        ggml_vk_graph_cleanup(ctx);
+        return GGML_STATUS_ALLOC_FAILED;
+    }
+}
+
+static ggml_status ggml_backend_vk_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
