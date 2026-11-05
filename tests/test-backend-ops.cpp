@@ -11232,6 +11232,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // long enough that the loop wraps, else the stride is never exercised
         test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  1, 16*256, { 1,  1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  8, 16*256, { 1,  1}, {1, 1}));
+        // m, n > 64 select the large matmul tiles (Vulkan: l_warptile*), which the shapes above never reach:
+        // two tiles in m and a full plus a partial tile in n
+        test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 256, 192, 256, { 1,  1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, false, 256, 160, 256));
     }
 
     // Multi-column MMVQ coverage for the Q4_K weight-reuse path and a Q5_K control.
