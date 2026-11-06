@@ -78,6 +78,17 @@ ub2048 and ncmoe3 at ub>=1024 do not fit in 11 GB VRAM at d15k. ncmoe5 trades ~3
 - **Scheduler profile.** `GGML_SCHED_PROF=1` prints per-backend split counts, copy and
   compute time and host-weight bytes per graph when the scheduler is freed
   (llama-bench needs `-v` to show it).
+- **VRAM headroom with explicit placement.** `-ngl`/`-ncmoe`/`-ot` disable `fit`, so nothing moves
+  to the CPU when another process holds VRAM. gpt-oss `-ncmoe 5 -ub 1024` d15k on CUDA allocates
+  9993 MiB (model 8927, KV 233, compute 833) and peaks at 10196 MiB; the CUDA pool peaks at 34 MiB,
+  the rest is the CUDA context. A desktop session holding ~900 MiB of the 11 GiB leaves less than that
+  and the run aborts with a CUDA OOM at the first launch after the reserve. With the default `fit`
+  (no `-ngl`/`-ncmoe`) the same server works with the desktop running: 49k ctx pp 544 / tg 21.1 t/s,
+  128k ctx pp 496 / tg 15.5 t/s (43.6k-token attach prompt, 0/1 bad each).
+- **Master merge of 2026-11-05 (127 upstream commits).** A/B against the pre-merge build at the best
+  configs of all four models (Vulkan and CUDA, d0 and d15k): all within +-3%. The upstream CUDA Q8_1
+  correction-sum fix (8fc037672) moves gemma-4-12b CUDA PPL 439 -> 413 (Vulkan 424); the kv_rows FA
+  path is not supported on Vulkan and only used with a unified KV cache.
 
 ## Fixes on the speedup branch
 
