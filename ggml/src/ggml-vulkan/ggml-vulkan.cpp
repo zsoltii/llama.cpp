@@ -8696,8 +8696,24 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // Intel Xe2 (Arc Pro B50, kv=20736): shorter splits help every K type by 9-17%, and coopmat1 also wants more
     // workgroups (32 per core), e.g. q8_0 1/2/3 tokens 731/1361/2021 -> 664/1199/1789 us.
     const bool fa_xe2 = ctx->device->vendor_id == VK_VENDOR_ID_INTEL && ctx->device->architecture == INTEL_XE2;
-    const uint32_t fa_wg_per_core = fa_wg_per_core_env ? (uint32_t) fa_wg_per_core_env :
-                                    (fa_xe2 && tuning_params.path == FA_COOPMAT1) ? 32u : 16u;
+    // NVIDIA Pascal (GTX 1080 Ti, decode): 16 per core only pays off with 2-4 heads per KV head and quantized K with
+    // hsk >= 256 (Qwen3.5 q4_0 kv=20736: 902 -> 397 us) or hsk >= 512. Otherwise 4 is best with up to 4 heads per
+    // KV head or hsk == 128 (8 from kv >= 8192: Qwen3-14B gqa5 tg64@d15k 20.7 -> 21.4 t/s), and the old 2 for the rest:
+    // gpt-oss hd64 gqa8 q8_0 kv=7680 263 -> 195 us, hd512 gqa1 1.4x.
+    uint32_t fa_wg_per_core_default = (fa_xe2 && tuning_params.path == FA_COOPMAT1) ? 32u : 16u;
+    if (ctx->device->architecture == vk_device_architecture::NVIDIA_PRE_TURING) {
+        const bool k_quant = ggml_is_quantized(k_type_eff);
+        if (qk_ratio > 1 && qk_ratio <= 4 && ((k_quant && HSK >= 256) || HSK >= 512)) {
+            fa_wg_per_core_default = 16u;
+        } else if (HSK == 128) {
+            fa_wg_per_core_default = KV >= 8192 ? 8u : 4u;
+        } else if (qk_ratio <= 4 && HSK <= 256) {
+            fa_wg_per_core_default = 4u;
+        } else {
+            fa_wg_per_core_default = 2u;
+        }
+    }
+    const uint32_t fa_wg_per_core = fa_wg_per_core_env ? (uint32_t) fa_wg_per_core_env : fa_wg_per_core_default;
     const uint32_t fa_min_kv_per_split = fa_min_kv_per_split_env ? (uint32_t) fa_min_kv_per_split_env :
                                          fa_xe2 ? 128u : 256u;
 

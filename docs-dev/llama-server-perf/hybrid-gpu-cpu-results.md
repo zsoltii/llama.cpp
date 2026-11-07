@@ -89,6 +89,13 @@ ub2048 and ncmoe3 at ub>=1024 do not fit in 11 GB VRAM at d15k. ncmoe5 trades ~3
   configs of all four models (Vulkan and CUDA, d0 and d15k): all within +-3%. The upstream CUDA Q8_1
   correction-sum fix (8fc037672) moves gemma-4-12b CUDA PPL 439 -> 413 (Vulkan 424); the kv_rows FA
   path is not supported on Vulkan and only used with a unified KV cache.
+- **Vulkan FA decode split on Pascal.** The 16-workgroups-per-core FA split (tuned on Arc B50 and Qwen3.5) made
+  gpt-oss Vulkan tg at d15k ~8% slower than upstream with ncmoe4 ub512 (interleaved A/B, 12 reps: 27.0 vs 29.4 t/s).
+  A sweep of the 125 decode FA perf shapes at 2/4/8/16 workgroups per core showed that 16 only wins with 2-4 heads per
+  KV head and quantized K at hsk >= 256 (Qwen3.5) or hsk >= 512, and that hd64 gqa8 (gpt-oss) and hd512 gqa1 want the
+  old 2. The new NVIDIA pre-Turing rule is 1.10x faster than 16 and 1.08x faster than upstream's 2 (geomean of the
+  125 shapes, within 2% of the per-shape best). tg64 @ d15k, new vs 16: gpt-oss ncmoe4 ub512 +6.7%, ncmoe5 ub1024
+  +5.4%, gemma-4-12b +7.9%, Qwen3.5-9B +0.8%, Qwen3-14B +1%.
 
 ## Fixes on the speedup branch
 
