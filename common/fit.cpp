@@ -614,8 +614,9 @@ static void common_params_fit_impl(
         uint32_t n_layer = 0; // number of total layers
         uint32_t n_part  = 0; // number of partial layers, <= n_layer
 
-        // for the first partial layer varying parts can overflow, all further layers use LAYER_FRACTION_MOE:
+        // for the first partial layer varying parts can overflow, all further layers use rest_type:
         common_layer_fraction_t overflow_type = LAYER_FRACTION_MOE;
+        common_layer_fraction_t rest_type     = LAYER_FRACTION_MOE;
 
         uint32_t n_full() const {
             assert(n_layer >= n_part);
@@ -654,7 +655,7 @@ static void common_params_fit_impl(
                     throw common_params_fit_exception("llama_max_tensor_buft_overrides() == "
                         + std::to_string(ntbo) + " is insufficient for model");
                 }
-                tensor_buft_overrides[itbo].pattern = get_overflow_pattern(il, il == il0 ? ngl_per_device[id].overflow_type : LAYER_FRACTION_MOE);
+                tensor_buft_overrides[itbo].pattern = get_overflow_pattern(il, il == il0 ? ngl_per_device[id].overflow_type : ngl_per_device[id].rest_type);
                 tensor_buft_overrides[itbo].buft = il == il0 ? overflow_bufts[id] : ggml_backend_cpu_buffer_type();
                 itbo++;
             }
@@ -808,6 +809,83 @@ static void common_params_fit_impl(
             "%s:   - %s: %2" PRIu32 " layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
     }
+
+    // step 3b: for a dense model with layers left in system memory, try to keep every layer on the first device and
+    //   only move the FFN tensors of its last layers to system memory instead: about the same bytes end up in system
+    //   memory, but attention, recurrent state and KV cache of all layers stay on the device. Whole CPU layers also
+    //   run attention over their KV cache on the CPU, which dominates at long context
+    //   (Qwen3.8-27B IQ4_XS, GTX 1080 Ti, tg @ d16k: 1.95 -> 3.15 t/s). LLAMA_FIT_NO_DENSE_FFN=1 disables it.
+    if (hp_nex == 0 && getenv("LLAMA_FIT_NO_DENSE_FFN") == nullptr) {
+        uint32_t n_assigned = 0;
+        for (size_t id = 0; id < nd; id++) {
+            n_assigned += ngl_per_device[id].n_layer;
+        }
+        const uint32_t n_cpu = hp_ngl + 1 - n_assigned;
+        if (n_cpu > 0 && ngl_per_device[0].n_part == 0) {
+            // the output layer of the last device cannot be partial, its slot in the partial range matches no tensor
+            const uint32_t n_out = nd == 1 ? 1 : 0;
+            std::vector<ngl_t> ngl_test = ngl_per_device;
+            ngl_test[0].n_layer      += n_cpu;
+            ngl_test[0].overflow_type = LAYER_FRACTION_ATTN;
+            ngl_test[0].rest_type     = LAYER_FRACTION_ATTN;
+
+            // smallest number of FFN-overflow layers that fits, memory use decreases monotonically with it
+            uint32_t lo = 0;                                    // does not fit: n_cpu layers need more room
+            uint32_t hi = ngl_test[0].n_layer - n_out;          // all layers of the device overflow
+            ngl_test[0].n_part = hi + n_out;
+            std::vector<int64_t> mem_hi = get_memory_for_layers(__func__, ngl_test, overflow_bufts);
+            if (mem_hi[0] <= targets[0]) {
+                std::vector<int64_t> mem_best = mem_hi;
+                while (hi - lo > 1) {
+                    const uint32_t mid = lo + (hi - lo) / 2;
+                    ngl_test[0].n_part = mid + n_out;
+                    const std::vector<int64_t> mem_mid = get_memory_for_layers(__func__, ngl_test, overflow_bufts);
+                    if (mem_mid[0] <= targets[0]) {
+                        hi       = mid;
+                        mem_best = mem_mid;
+                    } else {
+                        lo = mid;
+                    }
+                }
+                ngl_test[0].n_part = hi + n_out;
+                ngl_per_device     = ngl_test;
+                mem                = mem_best;
+                LOG_INF("%s: dense model: %" PRIu32 " layers in system memory -> all layers on %s, FFN of the last %"
+                    PRIu32 " in system memory, %" PRId64 " MiB free\n",
+                    __func__, n_cpu, dev_names[0].c_str(), hi, (dmds_full[0].free - mem[0])/MiB);
+            } else {
+                // even the FFN of every layer in system memory does not leave room for the rest (e.g. a long KV cache):
+                // keep the FFN of every device layer in system memory and the first layers there entirely
+                // (Qwen3.8-27B IQ4_XS, 128k ctx, 20k-token prompt: pp 73 -> 135 t/s, tg 1.12 -> 1.59 t/s)
+                uint32_t lo_w = 0;        // does not fit
+                uint32_t hi_w = n_cpu;    // fits: fewer bytes on the device than the whole-layer split
+                ngl_t best = ngl_per_device[0];
+                std::vector<int64_t> mem_best = mem;
+                while (hi_w - lo_w > 1) {
+                    const uint32_t mid = lo_w + (hi_w - lo_w) / 2;
+                    std::vector<ngl_t> ngl_mid = ngl_per_device;
+                    ngl_mid[0].n_layer      += n_cpu - mid;
+                    ngl_mid[0].n_part        = ngl_mid[0].n_layer;
+                    ngl_mid[0].overflow_type = LAYER_FRACTION_ATTN;
+                    ngl_mid[0].rest_type     = LAYER_FRACTION_ATTN;
+                    const std::vector<int64_t> mem_mid = get_memory_for_layers(__func__, ngl_mid, overflow_bufts);
+                    if (mem_mid[0] <= targets[0]) {
+                        hi_w = mid; best = ngl_mid[0]; mem_best = mem_mid;
+                    } else {
+                        lo_w = mid;
+                    }
+                }
+                if (hi_w < n_cpu) {
+                    ngl_per_device[0] = best;
+                    mem = mem_best;
+                    LOG_INF("%s: dense model: %" PRIu32 " layers in system memory -> %" PRIu32 " whole layers and the FFN of"
+                        " all others in system memory, %" PRId64 " MiB free\n",
+                        __func__, n_cpu, hi_w, (dmds_full[0].free - mem[0])/MiB);
+                }
+            }
+        }
+    }
+
     if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
         return;
