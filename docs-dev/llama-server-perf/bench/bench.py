@@ -15,7 +15,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 CORPUS = os.path.join(ROOT, "corpus")
 OUT = os.environ.get("BENCH_OUT", os.path.expanduser("~/llama-bench-results"))
 
-BASE_ARGS = ["-hf", "unsloth/Qwen3.5-9B-MTP-GGUF:UD-Q4_K_XL", "-c", "128000", "-fa", "on",
+BASE_ARGS = ["-hf", os.environ.get("BENCH_MODEL_HF", "unsloth/Qwen3.5-9B-MTP-GGUF:UD-Q4_K_XL"), "-c", "128000", "-fa", "on",
              "--parallel", "1", "-t", "16", "-tb", "16", "-dev", os.environ.get("VK_DEV", "Vulkan2"),
              "-ctv", "q8_0", "-ctk", "q8_0"]
 

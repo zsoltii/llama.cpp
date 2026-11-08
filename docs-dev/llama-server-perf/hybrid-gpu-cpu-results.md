@@ -96,6 +96,33 @@ ub2048 and ncmoe3 at ub>=1024 do not fit in 11 GB VRAM at d15k. ncmoe5 trades ~3
   old 2. The new NVIDIA pre-Turing rule is 1.10x faster than 16 and 1.08x faster than upstream's 2 (geomean of the
   125 shapes, within 2% of the per-shape best). tg64 @ d15k, new vs 16: gpt-oss ncmoe4 ub512 +6.7%, ncmoe5 ub1024
   +5.4%, gemma-4-12b +7.9%, Qwen3.5-9B +0.8%, Qwen3-14B +1%.
+- **Dense models larger than VRAM (Qwen3.8-27B UD-IQ4_XS, 14.3 GB; Qwen3-14B at long context).** The old fit
+  moved whole front layers to the CPU, so their attention ran on the CPU over a CPU KV cache, and tg collapsed
+  with depth. The new fit keeps attention, recurrent state and KV of all layers on the GPU and moves only FFN
+  tensors (or, when even that does not fit, the fewest whole layers plus the FFN of all others). It costs some tg
+  at short depth when the KV cache is large (more FFN bytes end up on the CPU) and wins clearly with depth:
+
+  | model, ctx, CUDA (llama-bench, `-lm none`, numa interleave) | tg d0 old -> new | tg deep old -> new |
+  |---|---|---|
+  | Qwen3-14B Q4_K_M, 32k | 8.5 -> 7.6 | d16k 3.3 -> 6.9 |
+  | Qwen3-14B Q4_K_M, 64k | 5.5 -> 3.7 | d48k 0.9 -> 3.3 |
+  | Qwen3-14B Q4_K_M, 128k | 3.7 -> 2.7 | d48k 0.6 -> 0.8 |
+  | Qwen3.8-27B, 32k (fitt 1024) | 2.91 -> 3.00 | d16k 1.78 -> 2.98 |
+
+  Qwen3.8-27B server, 128k ctx with mmproj and the default fit (bench.py, 1 run): CUDA story tg 1.87 (MTP 2.12),
+  wiki pp 136 / tg 1.57 (MTP 122 / 1.77; whole-layer fit: 73 / 1.12). `LLAMA_FIT_NO_DENSE_FFN=1` restores the old
+  placement. Tests: KLD vs upstream Vulkan f16 KV (q8_0 KV) own-vk 0.0012, own-cuda 0.0026; wiki QA 25/25, 5/5;
+  story loop and attach: no repetition (capped at 4000 / 8000 tokens).
+- **Pinned load for partial `-ngl`.** The pinned load of fix 6 only triggered with a CPU tensor override, so a
+  whole-layer split stayed in mapped memory: Qwen3.8-27B on Vulkan loaded in 8 minutes and prompt processing ran at
+  47 t/s; now 40 s and 89 t/s.
+- **Vulkan hybrid tg and GPU power states.** In hybrid decode the GPU idles while the CPU computes the FFN, and with
+  Vulkan the GTX 1080 Ti memory clock drops to 405/810 MHz for 50-75% of the time (CUDA holds 5005 MHz from d4k).
+  GPU matvecs then run 6-7x slower (Qwen3.8 output head 3.6 -> 26 ms per token from d4k on), which is why Vulkan
+  trails CUDA by ~25% at depth (tg @ d16k mixed placement: 1.3 vs 1.7). The FFN-only placement has two GPU bursts
+  per layer and suffers more at short depth (Vulkan d0: 1.6 vs 2.1 for whole layers, CUDA 1.9 vs 2.1); with depth
+  it still wins on Vulkan (server wiki tg 1.09 -> 1.20). Forcing maximum performance needs driver settings
+  (PowerMizer "prefer maximum performance", or `nvidia-smi -lmc` as root).
 
 ## Fixes on the speedup branch
 

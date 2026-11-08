@@ -19,8 +19,10 @@ VK_IDX=${VK_IDX:-2}
 CUDA_DEV=${CUDA_DEV:-CUDA0}
 CUDA_ENV=${CUDA_ENV:-"CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1"}
 
-# model: downloaded by llama-server -hf on the first start; the perplexity tools need the file path
-MODEL_HF=unsloth/Qwen3.5-9B-MTP-GGUF:UD-Q4_K_XL
+# model: downloaded by llama-server -hf on the first start; the perplexity tools need the file path.
+# BENCH_MODEL_HF (also read by bench.py, loop-test.py, attach-test.py) and MODEL select another model.
+export BENCH_MODEL_HF=${BENCH_MODEL_HF:-unsloth/Qwen3.5-9B-MTP-GGUF:UD-Q4_K_XL}
+MODEL_HF=$BENCH_MODEL_HF
 MODEL=${MODEL:-$(ls "$HOME"/.cache/huggingface/hub/models--unsloth--Qwen3.5-9B-MTP-GGUF/snapshots/*/Qwen3.5-9B-UD-Q4_K_XL.gguf 2>/dev/null | head -1)}
 
 # the serving config that is measured

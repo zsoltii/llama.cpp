@@ -7,6 +7,7 @@
 set -e
 source "$(dirname "$0")/../config.sh"
 D=$BENCH_OUT/eval/data; R=$BENCH_OUT/eval
+BASE=${KLD_BASE:-$D/base-f16.kld}  # per-model reference logits
 COMMON=(-m "$MODEL" -f $D/wiki.test.raw -c 4096 --chunks 6 -fa on -t 16 -dev "${DEV:-$VK_DEV}" -b 512 -ub 512)
 export GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1
 mkdir -p $R
@@ -14,11 +15,11 @@ mkdir -p $R
 case "$1" in
 base)
     "${2:-$UPV_BIN/llama-perplexity}" "${COMMON[@]}" -ctk f16 -ctv f16 \
-        --kl-divergence-base $D/base-f16.kld 2>&1 | tee $R/kld-base-f16.txt | grep -E "^\[|Final estimate"
+        --kl-divergence-base $BASE 2>&1 | tee $R/kld-base-f16.txt | grep -E "^\[|Final estimate"
     ;;
 run)
     name=$2; bin=$3; kv=$4
-    "$bin" "${COMMON[@]}" -ctk "$kv" -ctv "$kv" --kl-divergence-base $D/base-f16.kld --kl-divergence \
+    "$bin" "${COMMON[@]}" -ctk "$kv" -ctv "$kv" --kl-divergence-base $BASE --kl-divergence \
         > "$R/kld-$name.txt" 2>&1
     grep -E "Mean PPL\(Q\)|Mean    KLD|Maximum KLD|99.9%   KLD|Same top p|RMS Δp" "$R/kld-$name.txt"
     ;;

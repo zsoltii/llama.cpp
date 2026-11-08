@@ -16,7 +16,7 @@ PROMPTS = [
 env = dict(os.environ)
 for e in envs.split():
     k, v = e.split("=", 1); env[k] = v
-args = [binp, "-hf", "unsloth/Qwen3.5-9B-MTP-GGUF:UD-Q4_K_XL", "-c", "128000", "-fa", "on", "--parallel", "1",
+args = [binp, "-hf", os.environ.get("BENCH_MODEL_HF", "unsloth/Qwen3.5-9B-MTP-GGUF:UD-Q4_K_XL"), "-c", "128000", "-fa", "on", "--parallel", "1",
         "-t", "16", "-tb", "16", "--port", "8091", "-ctk", "q8_0", "-ctv", "q8_0"] + extra.split()
 log = open(f"{S}/loop-{name}.srv.log", "w")
 p = subprocess.Popen(args, env=env, stdout=log, stderr=subprocess.STDOUT)

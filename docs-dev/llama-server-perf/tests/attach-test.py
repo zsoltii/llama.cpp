@@ -73,7 +73,7 @@ def main():
         env[k] = v
 
     mtp = [] if a.no_mtp or a.model else ["-ctkd", "q8_0", "-ctvd", "q8_0", "--spec-type", "draft-mtp", "--spec-draft-n-max", "1", "-bs"]
-    model = ["-m", a.model] if a.model else ["-hf", "unsloth/Qwen3.5-9B-MTP-GGUF:UD-Q4_K_XL"]
+    model = ["-m", a.model] if a.model else ["-hf", os.environ.get("BENCH_MODEL_HF", "unsloth/Qwen3.5-9B-MTP-GGUF:UD-Q4_K_XL")]
     cmd = [a.bin] + model + ["-c", str(a.ctx), "-fa", "on", "--parallel", "1",
            "-t", "16", "-tb", "16", "-dev", a.dev, "--port", str(a.port), "-ctk", "q8_0", "-ctv", "q8_0"] \
           + mtp + SAMPLING[a.sampling] + a.extra
