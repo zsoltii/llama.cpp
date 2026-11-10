@@ -139,6 +139,42 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// concat in dim 0 with a transposed src1 (the delta-net conv input: conv state + transposed qkv of the ubatch):
+// a 32 x 32 tile of dst goes through shared memory, so that both the reads of src1 and the writes are coalesced
+template <typename T>
+static __global__ void __launch_bounds__(256) concat_dim0_transposed(
+        const char * src0, const char * src1, char * dst,
+        const int64_t ne00, const int64_t ne0, const int64_t ne1, const int64_t ne2,
+        const uint64_t nb00, const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
+        const uint64_t nb10, const uint64_t nb11, const uint64_t nb12, const uint64_t nb13,
+        const uint64_t nb0,  const uint64_t nb1,  const uint64_t nb2,  const uint64_t nb3) {
+    __shared__ T tile[32][33];
+
+    const int64_t i0_base = (int64_t) blockIdx.x*32;
+    const int64_t i1_base = (int64_t) blockIdx.y*32;
+    const int64_t i2      = blockIdx.z % ne2;
+    const int64_t i3      = blockIdx.z / ne2;
+
+    // threadIdx.x runs along dim 1 here, which is the contiguous dim of src1
+    for (int k = threadIdx.y; k < 32; k += 8) {
+        const int64_t i0 = i0_base + k;
+        const int64_t i1 = i1_base + threadIdx.x;
+        if (i0 < ne0 && i1 < ne1) {
+            const char * x = i0 < ne00 ? src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00
+                                       : src1 + i3*nb13 + i2*nb12 + i1*nb11 + (i0 - ne00)*nb10;
+            tile[k][threadIdx.x] = *(const T *) x;
+        }
+    }
+    __syncthreads();
+    for (int k = threadIdx.y; k < 32; k += 8) {
+        const int64_t i0 = i0_base + threadIdx.x;
+        const int64_t i1 = i1_base + k;
+        if (i0 < ne0 && i1 < ne1) {
+            *(T *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0) = tile[threadIdx.x][k];
+        }
+    }
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -160,6 +196,15 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
 
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data,         src0->data, size0, cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
+    } else if (dim == 0 && !ggml_is_quantized(src0->type) && src1->nb[0] > src1->nb[1] && dst->ne[1] >= 32 &&
+               (dst->ne[1] + 31)/32 <= 65535) {
+        const dim3 grid_dim((dst->ne[0] + 31)/32, (dst->ne[1] + 31)/32, dst->ne[2]*dst->ne[3]);
+        concat_dim0_transposed<T><<<grid_dim, dim3(32, 8, 1), 0, stream>>>(
+            (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+            src0->ne[0], dst->ne[0], dst->ne[1], dst->ne[2],
+            src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+            src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+            dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 

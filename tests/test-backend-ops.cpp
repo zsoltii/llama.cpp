@@ -12442,6 +12442,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // transposed src1 with enough rows for the tiled kernels, partial tiles in both dims
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {3, 1000, 1, 1}, 512, 0, 16));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {5, 70, 3, 2}, 37, 0, 16));
+    test_cases.emplace_back(new test_concat(GGML_TYPE_I32, {3, 64, 1, 1}, 33, 0, 16));
+
     // few long rows, which backends may split across workgroups
     for (int dim : { 0, 1 }) {
         test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {98304, 8, 1, 1}, dim == 0 ? 288 : 2, dim, 0));

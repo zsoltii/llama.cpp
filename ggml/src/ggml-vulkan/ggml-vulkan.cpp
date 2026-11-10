@@ -326,6 +326,14 @@ bool ggml_vk_concat_supported(const ggml_tensor * src0, const ggml_tensor * src1
     // Quantized tensor rows are block-aligned when created.
     return ggml_is_contiguous_rows(src0) && ggml_is_contiguous_rows(src1) && ggml_is_contiguous_rows(dst);
 }
+
+// concat in dim 0 with a transposed src1 (the delta-net conv input: conv state + transposed qkv of the ubatch): the
+// tiles of dst are transposed in shared memory, so that the reads of src1 are coalesced
+static bool ggml_vk_concat_tiled(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    return !ggml_is_quantized(dst->type) && ggml_vk_concat_unit_size(dst->type) == 4 && ggml_get_op_params_i32(dst, 0) == 0 &&
+           src1->nb[0] > src1->nb[1] && dst->ne[1] >= 32;
+}
+
 static bool vk_instance_initialized = false;
 
 vk_instance_t vk_instance;
@@ -3571,6 +3579,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_concat_i8, "concat_i8", concat_i8_len, concat_i8_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_concat_i16, "concat_i16", concat_i16_len, concat_i16_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_concat_i32, "concat_i32", concat_i32_len, concat_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_concat_i32_tiled, "concat_i32_tiled", concat_i32_tiled_len, concat_i32_tiled_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_concat_i64, "concat_i64", concat_i64_len, concat_i64_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_upscale_nearest_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_NEAREST}, 1);
@@ -9326,7 +9335,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         case 2:
             return ctx->device->pipeline_concat_i16;
         case 4:
-            return ctx->device->pipeline_concat_i32;
+            return ggml_vk_concat_tiled(src0, src1, dst) ? ctx->device->pipeline_concat_i32_tiled : ctx->device->pipeline_concat_i32;
         case 8:
             return ctx->device->pipeline_concat_i64;
         default:
@@ -10265,6 +10274,10 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             if (op == GGML_OP_CONCAT && ggml_is_quantized(dst->type)) {
                 ne = ne / ggml_blck_size(dst->type) * ggml_type_size(dst->type) / ggml_vk_concat_unit_size(dst->type);
             }
+            if (op == GGML_OP_CONCAT && ggml_vk_concat_tiled(src0, src1, dst)) {
+                // one 512-thread workgroup per 32 x 32 tile
+                ne = CEIL_DIV(dst->ne[0], 32) * CEIL_DIV(dst->ne[1], 32) * dst->ne[2] * dst->ne[3] * 512;
+            }
             // copy_to_quant has block size of 32, and each thread does QUANT_K elements.
             // Splitting into 512x512xZ wouldn't work well since each workgroup does 1024 elements.
             // So divide by block size here before splitting into 512x512 groups.
@@ -11057,8 +11070,12 @@ void ggml_vk_concat(ggml_backend_vk_context * ctx, vk_context& subctx, const ggm
     const uint32_t nb10 = quantized ? 1 : src1->nb[0] / unit_size;
     const uint32_t nb20 = quantized ? 1 :  dst->nb[0] / unit_size;
 
+    const uint32_t n_threads = ggml_vk_concat_tiled(src0, src1, dst) ?
+        CEIL_DIV(ne20, 32) * CEIL_DIV((uint32_t)dst->ne[1], 32) * (uint32_t)dst->ne[2] * (uint32_t)dst->ne[3] * 512 :
+        ne20 * (uint32_t)dst->ne[1] * (uint32_t)dst->ne[2] * (uint32_t)dst->ne[3];
+
     vk_op_concat_push_constants pc {{
-        ne20 * (uint32_t)dst->ne[1] * (uint32_t)dst->ne[2] * (uint32_t)dst->ne[3],
+        n_threads,
         ne00, (uint32_t)src0->ne[1], (uint32_t)src0->ne[2],(uint32_t)src0->ne[3], nb00, (uint32_t)src0->nb[1] / unit_size, (uint32_t)src0->nb[2] / unit_size, (uint32_t)src0->nb[3] / unit_size,
         ne10, (uint32_t)src1->ne[1], (uint32_t)src1->ne[2],(uint32_t)src1->ne[3], nb10, (uint32_t)src1->nb[1] / unit_size, (uint32_t)src1->nb[2] / unit_size, (uint32_t)src1->nb[3] / unit_size,
         ne20, (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],(uint32_t) dst->ne[3], nb20, (uint32_t) dst->nb[1] / unit_size, (uint32_t) dst->nb[2] / unit_size, (uint32_t) dst->nb[3] / unit_size,

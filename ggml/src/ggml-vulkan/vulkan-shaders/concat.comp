@@ -5,6 +5,51 @@
 
 layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
 
+#ifdef TILED
+// dim 0 with a transposed src1 (the delta-net conv input: conv state + transposed qkv of the ubatch): one workgroup
+// per 32 x 32 tile of dst, which goes through shared memory, so that both the reads of src1 and the writes are
+// coalesced. p.ne is the number of threads, a multiple of 512, so a workgroup returns as a whole.
+shared D_TYPE tile[32][33];
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+
+    if (idx >= p.ne) {
+        return;
+    }
+
+    const uint tiles0 = (p.ne20 + 31) / 32;
+    const uint tiles1 = (p.ne21 + 31) / 32;
+    uint t = idx / 512;
+    const uint i0_base = (t % tiles0) * 32;
+    t /= tiles0;
+    const uint i1_base = (t % tiles1) * 32;
+    t /= tiles1;
+    const uint i2 = t % p.ne22;
+    const uint i3 = t / p.ne22;
+
+    const uint tx = gl_LocalInvocationID.x % 32;
+    const uint ty = gl_LocalInvocationID.x / 32;
+
+    // tx runs along dim 1 here, which is the contiguous dim of src1
+    [[unroll]] for (uint k = ty; k < 32; k += 16) {
+        const uint i0 = i0_base + k;
+        const uint i1 = i1_base + tx;
+        if (i0 < p.ne20 && i1 < p.ne21) {
+            tile[k][tx] = i0 < p.ne00 ? D_TYPE(data_a[get_aoffset() + i3*p.nb03 + i2*p.nb02 + i1*p.nb01 + i0*p.nb00])
+                                      : D_TYPE(data_b[get_boffset() + i3*p.nb13 + i2*p.nb12 + i1*p.nb11 + (i0 - p.ne00)*p.nb10]);
+        }
+    }
+    barrier();
+    [[unroll]] for (uint k = ty; k < 32; k += 16) {
+        const uint i0 = i0_base + tx;
+        const uint i1 = i1_base + k;
+        if (i0 < p.ne20 && i1 < p.ne21) {
+            data_d[get_doffset() + i3*p.nb23 + i2*p.nb22 + i1*p.nb21 + i0*p.nb20] = tile[tx][k];
+        }
+    }
+}
+#else
 void main() {
     const uint idx = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
     const int dim = p.param3;
@@ -39,3 +84,4 @@ void main() {
     }
 #endif
 }
+#endif
