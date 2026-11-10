@@ -1308,6 +1308,27 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
         }
     }
 
+    // AMD RDNA2 prefill: 128-thread workgroups without row split. Sweep on an RX 6900 XT, 512 rows, f16 / q8_0 KV, ms:
+    // - hd64  gqa8 kv8704, Br 8 Bc 64: 8.3 / 11.0 -> 6.5 / 8.1 (gpt-oss)
+    // - hd128 gqa5 kv8704, Br 8 Bc 64: 10.2 / 11.9 -> 6.1 / 7.1 (Qwen3-14B)
+    // - hd256 gqa4 kv8704, Br 8 Bc 32, quantized K/V only: q8_0 6.4 -> 5.1, q4_0..iq4_nl 8.2-10.7 -> 5.9-7.0 (Qwen3.5;
+    //   f16 is 3% slower), gemma-4 SWA layers hd256 kv1536 q8_0 1.25 -> 0.98
+    // hd512 (gemma-4 global layers) has no better valid config. A config is valid only if every thread gets columns
+    // (Bc * D_split * row_split >= workgroup size) and a row group is whole subgroups.
+    if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA2 && n_rows >= 64 &&
+            result.subgroup_size == 64 && result.d_split == 8 && hsk == hsv &&
+            (hsk == 64 || hsk == 128 || (hsk == 256 && ggml_is_quantized(k_type) && ggml_is_quantized(v_type)))) {
+        vk_fa_tuning_params tuned = result;
+        tuned.block_rows     = 8;
+        tuned.block_cols     = hsk <= 128 ? 64 : 32;
+        tuned.row_split      = 1;
+        tuned.workgroup_size = 128;
+        tuned.limit_occupancy_shmem = 0;
+        if (ggml_vk_flash_attn_scalar_shmem_support(device, tuned, hsk, hsv, f32acc, k_type, v_type)) {
+            result = tuned;
+        }
+    }
+
     return result;
 }
 
