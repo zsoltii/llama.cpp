@@ -1,11 +1,15 @@
 #!/bin/bash
 # llama-bench of every profiled model on every given backend: pp512 / tg128 at depth 0 and 8192, FA on, q8_0 KV.
-#   model-bench.sh TAG BACKEND...   backends: vk (own Vulkan, $VK_DEV), rocm (own ROCm/HIP, $ROCM_DEV)
-#   MODELS="qwen35 gemma ..." picks models, REPS=3, DEPTHS=0,8192
+#   model-bench.sh TAG BACKEND...   backends: vk (own Vulkan, $VK_DEV), rocm (own ROCm/HIP, $ROCM_DEV),
+#                                   upvk / uprocm (upstream builds, $UPV_BIN / $UPROCM_BIN), brew ($BREW_BIN, Vulkan)
+#   MODELS="qwen35 gemma ..." picks models, REPS=3, DEPTHS=0,8192, FA=1 (0: no flash attention, f16 KV)
 #   -> $BENCH_OUT/model-bench/TAG-BACKEND-MODEL.jsonl, one summary line per test
 source "$(dirname "$0")/../config.sh"
 ROCM_BIN=${ROCM_BIN:-$REPO/build-rocm/bin}
 ROCM_DEV=${ROCM_DEV:-ROCm0}
+UPROCM_BIN=${UPROCM_BIN:-$REPO/../llama.cpp-upstream/build-rocm/bin}
+BREW_BIN=${BREW_BIN:-/home/linuxbrew/.linuxbrew/bin}
+FA=${FA:-1}
 HUB=${HF_HUB:-$HOME/.cache/huggingface/hub}
 R=$BENCH_OUT/model-bench; mkdir -p $R
 
@@ -27,6 +31,9 @@ for be in "$@"; do
     case $be in
         vk)   BIN=$VK_BIN/llama-bench;   DEV=$VK_DEV ;;
         rocm) BIN=$ROCM_BIN/llama-bench; DEV=$ROCM_DEV ;;
+        upvk)   BIN=$UPV_BIN/llama-bench;    DEV=$VK_DEV ;;
+        uprocm) BIN=$UPROCM_BIN/llama-bench; DEV=$ROCM_DEV ;;
+        brew)   BIN=$BREW_BIN/llama-bench;   DEV=$VK_DEV ;;
         *) echo "unknown backend $be"; exit 1 ;;
     esac
     for m in $MODELS; do
@@ -36,14 +43,18 @@ for be in "$@"; do
         if [ $m = bge ]; then
             args=(-embd 1 -p 512,2048 -n 0 -b 2048 -ub 2048)
         else
-            args=(-p 512 -n 128 -d "$DEPTHS" -ctk q8_0 -ctv q8_0)
+            args=(-p 512 -n 128 -d "$DEPTHS")
+            [ "$FA" = 1 ] && args+=(-ctk q8_0 -ctv q8_0)  # a quantized V cache needs flash attention
         fi
-        "$BIN" -m "$f" -dev "$DEV" -ngl 99 -fa 1 -r "$REPS" "${args[@]}" -o jsonl > "$out" 2> "$out.log" \
+        "$BIN" -m "$f" -dev "$DEV" -ngl 99 -fa "$FA" -r "$REPS" "${args[@]}" -o jsonl > "$out" 2> "$out.log" \
             || echo "$be $m: llama-bench failed, see $out.log"
         python3 - "$out" "$be" "$m" <<'PY'
 import json, sys
-for l in open(sys.argv[1]):
-    r = json.loads(l)
+for l in open(sys.argv[1], errors="replace"):
+    try:
+        r = json.loads(l)
+    except ValueError:  # an aborted run leaves partial output
+        continue
     t = f"pp{r['n_prompt']}" if r["n_prompt"] else f"tg{r['n_gen']}"
     print(f"{sys.argv[2]:5} {sys.argv[3]:7} {t:7} d{r.get('n_depth', 0):<6} {r['avg_ts']:9.2f} t/s  +-{r['stddev_ts']:.2f}")
 PY
