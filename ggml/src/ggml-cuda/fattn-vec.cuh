@@ -77,10 +77,11 @@ static __global__ void flash_attn_ext_vec(
 
 #ifdef GGML_USE_HIP
     // with several Q heads per block, more threads per K row keep the q8_1 Q of every head in registers
+    // (2 heads per block on RX 6900 XT: q8_0 and iq4_nl are fastest with 2 threads, q4_0..q5_1 with 4)
 #ifdef RDNA
-    constexpr int nthreads_KQ_q = ncols2 > 1 ? 8 : 2;
+    constexpr int nthreads_KQ_q = ncols2 > 1 ? (type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_IQ4_NL ? 2 : 4) : 2;
 #else
-    constexpr int nthreads_KQ_q = ncols2 > 1 ? 8 : 4;
+    constexpr int nthreads_KQ_q = ncols2 > 1 ? (type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_IQ4_NL ? 2 : 4) : 4;
 #endif // RDNA
     constexpr int nthreads_V_q  = (D/4 < 32 ? D/4 : 32);
 #else
@@ -573,14 +574,21 @@ static bool ggml_cuda_flash_attn_ext_vec_use_gqa(const ggml_tensor * dst) {
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * mask = dst->src[3];
 
+    if (K->ne[2] == 0 || Q->ne[2] % K->ne[2] != 0) {
+        return false;
+    }
+    const int64_t gqa_ratio = Q->ne[2] / K->ne[2];
+
     float max_bias      = 0.0f;
     float logit_softcap = 0.0f;
     memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
     // all heads of the block share the mask row
-    return Q->ne[1] == 1 && Q->ne[2] % (4*K->ne[2]) == 0 && mask && mask->ne[2] == 1 &&
-        max_bias == 0.0f && logit_softcap == 0.0f;
+    // q5_0 and q5_1 lose with 2 heads per block at gqa 4 (190 -> 244 us), and win at gqa 6 (371 -> 310 us)
+    const bool q5 = K->type == GGML_TYPE_Q5_0 || K->type == GGML_TYPE_Q5_1;
+    return Q->ne[1] == 1 && gqa_ratio % 2 == 0 && (!q5 || gqa_ratio > 4) && K->type != GGML_TYPE_F16 &&
+        mask && mask->ne[2] == 1 && max_bias == 0.0f && logit_softcap == 0.0f;
 #else
     GGML_UNUSED(dst);
     return false;
@@ -596,12 +604,13 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
 #ifdef GGML_USE_HIP
-    // GQA decode with head size 256: one block reads the K/V cache once for 4 Q heads of a K/V head.
-    // RX 6900 XT, Qwen3.5-9B (gqa 4), kv 20736, q8_0: 494 -> 362 us. With smaller heads or a GQA ratio that does not
-    // fill the block (Qwen3-14B hd128 gqa 5: 230 -> 359 us, gpt-oss hd64 gqa 8, Qwen3.8 hd256 gqa 6) it is slower.
+    // GQA decode with head size 256 and a quantized K: one block reads the K/V cache once for 2 Q heads of a K/V
+    // head. 4 or 8 heads per block are slower (register pressure). RX 6900 XT, us, 1 head -> 2 heads per block:
+    // - Qwen3.5-9B (gqa 4), kv 20736: q8_0 498 -> 161, iq4_nl 429 -> 160, q4_1 620 -> 192;
+    // - Qwen3.8-27B (gqa 6), kv 33280: q8_0 831 -> 261, iq4_nl 696 -> 266, q4_1 1067 -> 270, q5_1 342 -> 285.
     if constexpr (D == 256) {
         if (ggml_cuda_flash_attn_ext_vec_use_gqa(dst)) {
-            ggml_cuda_flash_attn_ext_vec_case_impl<D, 4, 4, type_K, type_V, false>(ctx, dst);
+            ggml_cuda_flash_attn_ext_vec_case_impl<D, 2, 2, type_K, type_V, false>(ctx, dst);
             return;
         }
     }

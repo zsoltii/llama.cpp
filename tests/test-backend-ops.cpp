@@ -12806,9 +12806,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // GQA decode with head size 256 and quantized K/V (HIP: 4 Q heads per vec block), with sinks and several blocks per K/V head
-    for (ggml_type type_KV : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
-        for (int gqa : {4, 8}) {
+    // GQA decode with head size 256 and quantized K/V (HIP: 2 Q heads per vec block), with sinks and several blocks per K/V head
+    for (ggml_type type_KV : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_IQ4_NL}) {
+        for (int gqa : {4, 6, 8}) {
             for (bool sinks : {false, true}) {
                 test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {gqa, 1}, 1024, 1, true, sinks, 0, 0, GGML_PREC_F32, type_KV, type_KV));
             }
@@ -13858,6 +13858,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             // gemma-4-12b: global layers hd512 with one KV head (gqa 16), SWA layers hd256 gqa 2 with a 1024 window
             test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {16, 1}, 8704, nb, true, false, 0, 0, GGML_PREC_F32, t, t));
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {2, 1}, 1536, nb, true, false, 0, 0, GGML_PREC_F32, t, t));
+        }
+    }
+
+    // Qwen3.8-27B (hd256, 4 KV heads, gqa 6) at 32k depth: decode and prefill ubatch
+    for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL }) {
+        for (int nb : { 1, 512 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 33280, nb, true, false, 0, 0, GGML_PREC_F32, t, t));
         }
     }
 
