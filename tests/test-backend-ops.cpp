@@ -13866,6 +13866,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int nb : { 1, 512 }) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 33280, nb, true, false, 0, 0, GGML_PREC_F32, t, t));
         }
+        // the dense, permuted KV cache layout of the model (Vulkan: dequant+transpose f16 scratch for prefill)
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 33280, 512, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 2, 1, 3}, false));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 33280, 512, true, false, 0, 0, GGML_PREC_DEFAULT, t, t, {0, 2, 1, 3}, false));
     }
 
     return test_cases;
