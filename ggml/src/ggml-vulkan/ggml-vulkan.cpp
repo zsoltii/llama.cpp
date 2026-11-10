@@ -13817,6 +13817,20 @@ static ggml_backend_buffer_type_t ggml_backend_vk_get_default_buffer_type(ggml_b
     return &ctx->device->buffer_type;
 }
 
+// A small write into host-coherent device memory (ReBAR) can be a CPU copy while the backend is idle: no GPU work
+// is pending that could read the old data, and the next submit makes the write visible.
+static bool ggml_vk_can_cpu_copy(ggml_backend_vk_context * ctx, const vk_buffer & dst_buf, size_t size) {
+    static constexpr size_t max_cpu_copy_size = 128 * 1024;
+    const bool transfer_idle = !ctx->device->async_use_transfer_queue ||
+                               ctx->transfer_semaphore_last_submitted == ctx->transfer_semaphore.value;
+    const bool backend_idle = ctx->compute_ctx.expired() && ctx->transfer_ctx.expired() &&
+                              !ctx->submit_pending && !ctx->almost_ready_fence_pending && transfer_idle;
+    const bool dst_host_coherent =
+        (dst_buf->memory_property_flags & (vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)) ==
+        (vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    return backend_idle && dst_host_coherent && size <= max_cpu_copy_size;
+}
+
 static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset,
                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_set_tensor_2d_async(" << size << ", " << n_copies << ")");
@@ -13829,6 +13843,17 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
 
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
 
+    vk_buffer buf = buf_ctx->dev_buffer;
+
+    auto dst_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
+
+    // e.g. the per-token graph inputs, which the scheduler uploads with set_tensor_async: a copy command would cost
+    // a submit and a queue wait before the graph (7% of the decode time of gpt-oss-20b on an RX 6900 XT)
+    if (ggml_vk_can_cpu_copy(ctx, buf, size * n_copies)) {
+        ggml_vk_buffer_write_2d(buf, dst_offset, data, stride_data, stride_tensor, size, n_copies);
+        return;
+    }
+
     vk_context cpy_ctx;
 
     if (ctx->device->async_use_transfer_queue) {
@@ -13836,10 +13861,6 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
     } else {
         cpy_ctx = ggml_vk_get_compute_ctx(ctx);
     }
-
-    vk_buffer buf = buf_ctx->dev_buffer;
-
-    auto dst_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
 
     bool ret = ggml_vk_buffer_write_2d_async(cpy_ctx, buf, dst_offset, data, stride_data, stride_tensor, size, n_copies);
 
@@ -13973,21 +13994,24 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
         size_t pinned_offset = 0;
         ggml_vk_host_get(ctx->device, src->data, pinned_buf, pinned_offset);
         if (pinned_buf == nullptr) {
+            // Host memory that is not pinned for this device, e.g. the weights in the host buffer type when this device
+            // cannot import the host allocations of a multi-device instance (AMD). The fallback, a synchronous
+            // ggml_backend_tensor_copy, writes with the CPU into host-visible (ReBAR) device memory, which runs at
+            // 0.2 GB/s over Thunderbolt; a staged DMA upload reaches 1.4-1.9 GB/s there.
+            static constexpr size_t min_staged_size = 1024 * 1024;
+            const bool dst_device_local = (dst_buf->memory_property_flags & vk::MemoryPropertyFlagBits::eDeviceLocal) &&
+                                          !ctx->device->uma;
+            if (backend_src->iface.synchronize == nullptr && dst_device_local && ggml_nbytes(src) >= min_staged_size) {
+                ggml_backend_vk_set_tensor_async(backend_dst, dst, src->data, 0, ggml_nbytes(src));
+                return true;
+            }
             return false;
         }
 
         // If the backend is idle, use a CPU copy to avoid GPU synchronization overhead.
-        static constexpr size_t max_cpu_copy_size = 128 * 1024;
         const bool src_backend_synchronous = backend_src->iface.synchronize == nullptr;
-        const bool transfer_idle = !ctx->device->async_use_transfer_queue ||
-                                   ctx->transfer_semaphore_last_submitted == ctx->transfer_semaphore.value;
-        const bool backend_idle = ctx->compute_ctx.expired() && ctx->transfer_ctx.expired() &&
-                                  !ctx->submit_pending && !ctx->almost_ready_fence_pending && transfer_idle;
-        const bool dst_host_coherent =
-            (dst_buf->memory_property_flags & (vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent)) ==
-            (vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
 
-        if ((backend_src == backend_dst || src_backend_synchronous) && backend_idle && dst_host_coherent && ggml_nbytes(src) <= max_cpu_copy_size) {
+        if ((backend_src == backend_dst || src_backend_synchronous) && ggml_vk_can_cpu_copy(ctx, dst_buf, ggml_nbytes(src))) {
             ggml_vk_buffer_write(dst_buf, vk_tensor_offset(dst) + dst->view_offs, src->data, ggml_nbytes(src));
             return true;
         }
