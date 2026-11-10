@@ -16,6 +16,8 @@ if [ ! -s $D/wiki.test.raw ]; then
     curl -fL https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip -o $D/wikitext-2-raw-v1.zip
     unzip -o -j $D/wikitext-2-raw-v1.zip 'wikitext-2-raw/wiki.test.raw' -d $D
     rm $D/wikitext-2-raw-v1.zip
+    # the B50 numbers use the HF datasets text (the rows joined), which has no " " separator lines
+    python3 -c "import sys; p=sys.argv[1]; s=open(p, encoding='utf-8').read(); open(p, 'w', encoding='utf-8').write(''.join(l for l in s.splitlines(True) if l != ' \\n'))" $D/wiki.test.raw
 fi
 
 cd $D && sha1sum -c <<'SUM'

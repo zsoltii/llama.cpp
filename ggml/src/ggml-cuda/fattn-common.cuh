@@ -1418,6 +1418,12 @@ void launch_fattn(
     const dim3 block_dim(warp_size, nwarps, 1);
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
+#ifdef GGML_USE_HIP
+    // The HIP runtime limits a block to the registers of one SIMD (regsPerBlock 32768 on RDNA2), but the waves of a
+    // block are spread over the SIMDs of a CU: e.g. the 256-thread tile kernel with 220 VGPRs runs fine on gfx1030
+    // although the query returns 0. A block that really cannot run fails at launch (CUDA_CHECK below).
+    max_blocks_per_sm = std::max(max_blocks_per_sm, 1);
+#endif // GGML_USE_HIP
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
 
