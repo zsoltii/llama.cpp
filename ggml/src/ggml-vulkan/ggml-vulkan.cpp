@@ -15932,6 +15932,20 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
     }
     vkdev.getMemoryProperties2(&memprops);
 
+    // Mesa ANV (Intel) reports a heap budget of usage + ~90% of the available VRAM, to leave room for the rest of the
+    // system. On a discrete GPU that keeps ~1.6 GB of a 16 GB card unused: Arc Pro B50, budget 14212 MiB at start,
+    // while 15872 MiB of device memory could be allocated. Report the available part instead (budget - usage) / 0.9.
+    // GGML_VK_DRIVER_BUDGET=1 keeps the driver's budget.
+    static const bool driver_budget = getenv("GGML_VK_DRIVER_BUDGET") != nullptr;
+    bool anv_dgpu_budget = false;
+    if (membudget_supported && !is_integrated_gpu && !driver_budget) {
+        vk::PhysicalDeviceDriverProperties driver_props;
+        vk::PhysicalDeviceProperties2 props2;
+        props2.pNext = &driver_props;
+        vkdev.getProperties2(&props2);
+        anv_dgpu_budget = driver_props.driverID == vk::DriverId::eIntelOpenSourceMESA;
+    }
+
     *total = 0;
     *free = 0;
 
@@ -15945,7 +15959,12 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
                 // Driver may report heapBudget > heap.size so we add a safeguard here
                 // See https://github.com/ggml-org/llama.cpp/issues/29277
                 const vk::DeviceSize budget = std::min(budgetprops.heapBudget[i], heap.size);
-                *free += budget > budgetprops.heapUsage[i] ? budget - budgetprops.heapUsage[i] : 0;
+                vk::DeviceSize heap_free = budget > budgetprops.heapUsage[i] ? budget - budgetprops.heapUsage[i] : 0;
+                if (anv_dgpu_budget && heap_free > 0) {
+                    const vk::DeviceSize heap_left = heap.size > budgetprops.heapUsage[i] ? heap.size - budgetprops.heapUsage[i] : 0;
+                    heap_free = std::min(heap_free / 9 * 10, heap_left);
+                }
+                *free += heap_free;
             } else {
                 *free += heap.size;
             }

@@ -840,6 +840,32 @@ Next, from this profile:
 - The small ops are ~3 ms.
 - With verify FA cheaper at depth, MTP n-max 2 may pay off on the B50 for long contexts; measure it.
 
+### 29. Free VRAM on Intel: the Mesa ANV budget keeps ~10% back (2026-11-11)
+
+The user's command (Qwen3.8-27B UD-IQ4_XS, `-c 128000`, iq4_nl KV, `-ub 512`) fits on the RX 6900 XT. On the B50 the fit put the FFN of 11 layers on the CPU, and tg was 5.0 t/s.
+
+Cause: the B50 reports 14219 MiB free, the RX 6900 XT ~16 GB.
+- Mesa ANV sets `heapBudget` to usage + ~90% of the available VRAM.
+- A probe that allocates 256 MiB blocks:
+  - 62 blocks = 15872 MiB could be allocated;
+  - the 63rd failed (no silent overcommit to system memory);
+  - at start the driver budget was 14212 MiB.
+- The model needs 15875 MiB at `-ub 512` (12821 model + 2403 KV + 650 compute). The MTP tensors of the new GGUF (`blk.64.nextn.*`) are not loaded; the old file without them needs 15780 MiB.
+
+Change (`ggml_backend_vk_get_device_memory`):
+- On a discrete GPU with the Mesa Intel driver, free = (budget − usage) / 0.9, capped at heap size − usage.
+- B50: 14219 → 15798 MiB free.
+- `GGML_VK_DRIVER_BUDGET=1` keeps the driver's value.
+- Other drivers and integrated GPUs are unchanged.
+
+Result:
+- `-c 128000 -ub 256 -b 256 --fit-target 64`: all on the GPU (15550 MiB projected).
+  - short prompt tg 8.49 t/s (was 5.0 with the CPU split);
+  - 20.7k prompt pp 215 / tg 7.9.
+- `-c 120000 -ub 256 --fit-target 256` also fits.
+- `-ub 512` at 128k still needs one FFN on the CPU.
+- Check for slowdown when VRAM is full: a 24k context under the driver budget runs at the same speed (8.74 / 7.89 t/s).
+
 ## Remaining work
 
 - FA prefill (coopmat1, Xe2): ~3.5 TFLOPS, about a third of the wiki pp.
