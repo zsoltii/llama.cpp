@@ -913,6 +913,50 @@ Not changed (measured):
   - A faster decode FA needs a kernel rewrite (one 32-key block costs ~31 us per workgroup).
 - Prefill at 20k: FA 37% (already ~11 TFLOPS), iq4_xs GEMM 30%.
 
+### 31. iq2_s / iq2_xs / iq3_xxs mat-vec on Intel; iq4_nl paths checked (2026-11-11)
+
+Timing-only experiments (wrong results), Arc Pro B50, 17408×5120 / 5120×17408, us:
+
+| | iq3_s | iq2_s |
+|---|---|---|
+| as is | 324 / 319 | 594 / 374 |
+| no sign selects | 279 / 288 | 395 / 247 |
+| no grid lookup | 289 / 288 | 249 / 257 |
+
+Two changes:
+1. **Workgroup size.**
+   - Above m = 8192 the mat-vec uses one subgroup per workgroup.
+   - Every workgroup copies the grid table into shared memory first: 8 KB for iq2_s, 4 KB for iq2_xs.
+   - On Intel, iq2_s and iq2_xs now always use the large workgroup.
+   - iq2_s 17408×5120: 593 → 398 us. iq2_xs 17408×5120: 350 → 293 us.
+   - iq2_xxs, iq3_s, iq3_xxs and iq4_xs get 2–4% slower with it, so they keep the old choice.
+2. **Packed signs** (iq2_s, iq3_xxs). The 4 sign bits are spread to the bytes of the grid word (x * 0x00204081, no carries), and 4 values are negated at once ((g ^ 0xFF) + 1).
+   - iq2_s: 398 / 369 → 310 / 292 us.
+   - iq3_xxs: 279 / 283 → 272 / 275 us.
+   - On iq3_s it does not help (324 → 320), so iq3_s keeps the selects.
+   - On the NVIDIA T1200 it is 10–17% slower for iq2_s (3 A/B runs). A spec constant (`PACKED_SIGNS`, constant_id 3) turns it on for Intel only. On the T1200 the times are back to the old ones.
+
+iq2_s in total: 593 / 374 → 310 / 292 us (−48% / −22%).
+
+Other attempts on iq3_s, both no change:
+- 16 threads per block instead of 8: 323 / 313.
+- The large workgroup: 337.
+
+Server, Qwen3.8-27B (same command as finding 30):
+- short tg 9.58 → 9.76 t/s (+2%);
+- wiki tg 8.59 → 8.73 (+1.6%).
+
+The greedy text changed, because the larger workgroup sums iq2_s in another order. Wiki QA: 25/25, 5/5.
+
+iq4_nl paths with an iq4_nl KV cache. None of them has an iq4_nl-specific cost, so nothing was changed:
+- Decode FA (GQA 6, kv=20736): 681 us, against 678 for q8_0 and 659 for q4_0. The kernel is the limit (finding 30).
+- Prefill FA with the f16 dequant scratch (512×8704): 30.0 ms, against 29.3 for q8_0 (+2.5%).
+- KV write (SET_ROWS f32 → iq4_nl): 0.9 ms per 256-token batch in the 20k prefill (0.1% of the GPU time).
+
+Validation:
+- test-backend-ops on the B50: 22297/22297 passed.
+- MUL_MAT iq2_s/iq3_xxs and MUL_MAT_ID: passed on the B50 and the T1200.
+
 ## Remaining work
 
 - FA prefill (coopmat1, Xe2): ~3.5 TFLOPS, about a third of the wiki pp.

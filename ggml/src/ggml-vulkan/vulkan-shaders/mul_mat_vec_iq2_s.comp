@@ -7,6 +7,21 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
 
+// Packed sign application (Intel): the 4 sign bits are spread to the low bit of each byte (x * 0x00204081 puts bit i
+// at 8i, no carries), then the negative bytes are negated as (g ^ 0xFF) + 1, one integer sequence per 4 values.
+// Arc Pro B50, iq2_s 17408x5120: 398 -> 309 us. On NVIDIA (T1200) it is 10-17% slower than a select per value.
+layout (constant_id = 3) const bool PACKED_SIGNS = false;
+
+vec4 signed_grid4(const uint grid, const uint sign4) {
+    if (PACKED_SIGNS) {
+        const uint m01 = ((sign4 & 0xFu) * 0x00204081u) & 0x01010101u;
+        return vec4(unpack8(int32_t((grid ^ (m01 * 0xFFu)) + m01)));
+    }
+    const vec4 g = vec4(unpack8(grid));
+    return vec4((sign4 & 1) != 0 ? -g.x : g.x, (sign4 & 2) != 0 ? -g.y : g.y,
+                (sign4 & 4) != 0 ? -g.z : g.z, (sign4 & 8) != 0 ? -g.w : g.w);
+}
+
 void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, const uint i, const uint num_blocks_per_row, const uint first_row, const uint num_rows) {
     const uint y_idx = i * QUANT_K + 16 * itid;
     const uint nibble_shift = 4 * (itid & 1);
@@ -25,22 +40,22 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint itid, 
             const uint8_t sign = sign16[l];
             const uint qs = qs16[l] | ((qh << (8 - nibble_shift - 2 * l)) & 0x300);
             const uvec2 grid = iq2s_grid[qs];
-            const vec4 grid0 = vec4(unpack8(grid.x));
-            const vec4 grid1 = vec4(unpack8(grid.y));
+            const vec4 sgrid0 = signed_grid4(grid.x, sign);
+            const vec4 sgrid1 = signed_grid4(grid.y, uint(sign) >> 4);
 
             [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
                 vec4 b0 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 2*l + 0]);
                 vec4 b4 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + y_idx) / 4 + 2*l + 1]);
 
                 FLOAT_TYPE sum =
-                      fma(FLOAT_TYPE(b0.x), FLOAT_TYPE((sign &   1) != 0 ? -grid0.x : grid0.x),
-                      fma(FLOAT_TYPE(b0.y), FLOAT_TYPE((sign &   2) != 0 ? -grid0.y : grid0.y),
-                      fma(FLOAT_TYPE(b0.z), FLOAT_TYPE((sign &   4) != 0 ? -grid0.z : grid0.z),
-                      fma(FLOAT_TYPE(b0.w), FLOAT_TYPE((sign &   8) != 0 ? -grid0.w : grid0.w),
-                      fma(FLOAT_TYPE(b4.x), FLOAT_TYPE((sign &  16) != 0 ? -grid1.x : grid1.x),
-                      fma(FLOAT_TYPE(b4.y), FLOAT_TYPE((sign &  32) != 0 ? -grid1.y : grid1.y),
-                      fma(FLOAT_TYPE(b4.z), FLOAT_TYPE((sign &  64) != 0 ? -grid1.z : grid1.z),
-                      fma(FLOAT_TYPE(b4.w), FLOAT_TYPE((sign & 128) != 0 ? -grid1.w : grid1.w),
+                      fma(FLOAT_TYPE(b0.x), FLOAT_TYPE(sgrid0.x),
+                      fma(FLOAT_TYPE(b0.y), FLOAT_TYPE(sgrid0.y),
+                      fma(FLOAT_TYPE(b0.z), FLOAT_TYPE(sgrid0.z),
+                      fma(FLOAT_TYPE(b0.w), FLOAT_TYPE(sgrid0.w),
+                      fma(FLOAT_TYPE(b4.x), FLOAT_TYPE(sgrid1.x),
+                      fma(FLOAT_TYPE(b4.y), FLOAT_TYPE(sgrid1.y),
+                      fma(FLOAT_TYPE(b4.z), FLOAT_TYPE(sgrid1.z),
+                      fma(FLOAT_TYPE(b4.w), FLOAT_TYPE(sgrid1.w),
                       FLOAT_TYPE(0.0)))))))));
                 temp[j][n] = fma(db, sum, temp[j][n]);
             }

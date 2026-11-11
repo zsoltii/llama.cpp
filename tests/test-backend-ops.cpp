@@ -13856,7 +13856,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     // Qwen3.8-27B UD-IQ4_XS decode: FFN up/gate 17408x5120 and down 5120x17408 in every type of the model
-    for (ggml_type t : { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
+    for (ggml_type t : { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, 1,  5120, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  5120, 1, 17408, {1, 1}, {1, 1}));
     }
