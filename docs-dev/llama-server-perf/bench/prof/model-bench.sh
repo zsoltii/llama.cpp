@@ -2,7 +2,7 @@
 # llama-bench of every profiled model on every given backend: pp512 / tg128 at depth 0 and 8192, FA on, q8_0 KV.
 #   model-bench.sh TAG BACKEND...   backends: vk (own Vulkan, $VK_DEV), rocm (own ROCm/HIP, $ROCM_DEV),
 #                                   upvk / uprocm (upstream builds, $UPV_BIN / $UPROCM_BIN), brew ($BREW_BIN, Vulkan)
-#   MODELS="qwen35 gemma ..." picks models, REPS=3, DEPTHS=0,8192, FA=1 (0: no flash attention, f16 KV)
+#   MODELS="qwen35 gemma ..." picks models, REPS=3, DEPTHS=0,8192, FA=1 (0: no flash attention, f16 KV), KV=q8_0
 #   -> $BENCH_OUT/model-bench/TAG-BACKEND-MODEL.jsonl, one summary line per test
 source "$(dirname "$0")/../config.sh"
 ROCM_BIN=${ROCM_BIN:-$REPO/build-rocm/bin}
@@ -25,6 +25,7 @@ declare -A M=(
 MODELS=${MODELS:-"qwen35 gemma qwen3 oss qwen38 bge"}
 REPS=${REPS:-3}
 DEPTHS=${DEPTHS:-0,8192}
+KV=${KV:-q8_0}
 
 TAG=$1; shift
 for be in "$@"; do
@@ -44,7 +45,7 @@ for be in "$@"; do
             args=(-embd 1 -p 512,2048 -n 0 -b 2048 -ub 2048)
         else
             args=(-p 512 -n 128 -d "$DEPTHS")
-            [ "$FA" = 1 ] && args+=(-ctk q8_0 -ctv q8_0)  # a quantized V cache needs flash attention
+            [ "$FA" = 1 ] && args+=(-ctk $KV -ctv $KV)  # a quantized V cache needs flash attention
         fi
         "$BIN" -m "$f" -dev "$DEV" -ngl 99 -fa "$FA" -r "$REPS" "${args[@]}" -o jsonl > "$out" 2> "$out.log" \
             || echo "$be $m: llama-bench failed, see $out.log"

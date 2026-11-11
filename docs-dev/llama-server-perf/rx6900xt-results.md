@@ -70,7 +70,7 @@ The measurements use `bench/prof/model-bench.sh`:
 
 Embeddings, bge-m3 f16, `-embd 1`, Vulkan: pp512 12.1k, pp2048 13.2k -> 13.9k t/s. ROCm: pp2048 13.5k t/s (its pp512 has a large run-to-run spread).
 
-## Comparison with brew and upstream
+## Comparison with brew and upstream (first round, 325 W)
 
 Builds compared:
 - **brew:** llama.cpp b11669 (`620d2225c`), Vulkan only.
@@ -122,6 +122,72 @@ Own Vulkan against upstream Vulkan:
 - **Prefill:** +3-14% at depth 0, +5-32% at 8k.
 - **Decode:** the same, except gpt-oss, which is 6% / 3.4% slower (110.6 vs 117.6 t/s). That is a regression in the branch and is still open.
 
+## Second round: transfers, concat, GQA decode, KV scratch (292 W)
+
+The card's power cap was lowered from 325 W to 292 W for this round, so its numbers are not directly comparable with the tables above.
+
+Changes:
+- **`b9fe1f552` tiled concat (Vulkan, CUDA/HIP).** The delta-net conv input concat of Qwen3.5/3.8 has a transposed src1, so the plain kernel reads it uncoalesced. A 32x32 shared-memory tile: 409 -> 82 us on Vulkan, 316 -> 47 us on ROCm. pp +1.7-2.8% on Qwen3.5/3.8; KLD bit-identical.
+- **`a2ea786f9` Vulkan host uploads.**
+  - The scheduler input staging used `set_tensor_async`, which on RADV with ReBAR cost a queue wait per copy. Small inputs are now copied by the CPU when the backend is idle and the destination is host-coherent. gpt-oss tg d0 110.6 -> 117.3 (upstream 117.6), d8k 105.1 -> 110.0.
+  - Unpinned host weights (a multi-device instance disables host-memory import on AMD) went through a CPU memcpy into ReBAR VRAM at 0.2 GB/s over Thunderbolt. They now use staged DMA at 1.4-1.9 GB/s. Hybrid Qwen3.8-27B (fit for 128k ctx) pp512: 49 -> 276 t/s at d0, 48 -> 242 at d8k.
+- **`e92ee173b` HIP FA vec GQA decode.** 2 Q heads per block for every even GQA ratio (q5_0/q5_1 only above GQA 4), 2 threads per K row for q8_0/iq4_nl and 4 for the others; it replaces the 4-head variant, which register pressure made slower. Qwen3.8-27B iq4_nl tg: d8k 23.5 -> 25.0, d32k 18.6 -> 23.3; Qwen3.5-9B q8_0 tg d8k 57.4 -> 60.8.
+- **`955d8d945` Vulkan quantized KV prefill on RDNA2.** The f16 dequant scratch path is about 2.7x slower in real models than in `test-backend-ops` with the same dispatch parameters (cause unknown, data dependent). The direct quantized path is now used at head size >= 256 on AMD RDNA2; the scratch path still wins at hd64/hd128. pp512 d8k / d32k: Qwen3.8 iq4_nl 434 / 234 -> 474 / 327, Qwen3.5 q8_0 1346 / 729 -> 1494 / 1099, gemma-4 q8_0 767 / 365 -> 941 / 616.
+
+Tests: ROCm `test-backend-ops` 20099/20099; FA ROCm 4682/4682, Vulkan 5702/5702; CONCAT on both backends.
+
+### Comparison at 292 W
+
+Same builds as the first round (brew b11669, upstream master `17701e48d`), against `speedup` at `955d8d945`. Tag `w292`, q8_0 KV, FA on. Upstream ROCm still aborts in FA except on gpt-oss, so its column is FA off with an f16 KV cache (`w292-nofa`).
+
+t/s, pp512 / tg128:
+
+| model | depth | brew Vulkan | upstream Vulkan | upstream ROCm | own Vulkan | own ROCm |
+|---|---|---|---|---|---|---|
+| Qwen3.5-9B | 0 | 1202 / 57.0 | 1502 / 57.4 | 1541 / 62.9 (no FA) | 1674 / 57.3 | 1621 / 63.1 |
+| Qwen3.5-9B | 8192 | 916 / 55.3 | 1087 / 55.7 | 940 / 53.0 (no FA) | 1500 / 55.1 | 1465 / 60.9 |
+| gemma-4-12b | 0 | 933 / 42.1 | 1072 / 42.4 | 940 / 45.6 (no FA) | 1168 / 42.3 | 1076 / 45.5 |
+| gemma-4-12b | 8192 | 634 / 40.0 | 699 / 40.2 | 763 / 33.5 (no FA) | 943 / 40.1 | 910 / 42.8 |
+| Qwen3-14B | 0 | 817 / 43.3 | 963 / 43.7 | 854 / 44.2 (no FA) | 1046 / 43.7 | 927 / 45.2 |
+| Qwen3-14B | 8192 | 527 / 38.8 | 587 / 39.1 | 156 / 21.1 (no FA) | 757 / 39.6 | 676 / 33.5 |
+| gpt-oss-20b | 0 | 1937 / 116.1 | 2433 / 117.4 | 3011 / 114.5 | 2780 / 117.4 | 3027 / 118.2 |
+| gpt-oss-20b | 8192 | 1383 / 109.7 | 1628 / 111.2 | 2149 / 104.8 | 2137 / 110.8 | 2140 / 107.8 |
+| Qwen3.8-27B | 0 | 474 / 24.7 | 532 / 24.8 | 597 / 26.0 (no FA) | 555 / 24.7 | 626 / 26.1 |
+| Qwen3.8-27B | 8192 | 373 / 24.3 | 409 / 24.4 | 361 / 22.0 (no FA) | 498 / 24.3 | 557 / 25.3 |
+
+Qwen3.8-27B with an iq4_nl KV cache (the user's long-context setting, `KV=iq4_nl DEPTHS=0,8192,32768`, tag `w292-iq4`):
+
+| depth | brew Vulkan | upstream Vulkan | upstream ROCm | own Vulkan | own ROCm |
+|---|---|---|---|---|---|
+| 0 | 472 / 24.7 | 528 / 24.7 | 136 / 22.3 | 553 / 24.6 | 626 / 25.7 |
+| 8192 | 376 / 24.0 | 412 / 24.2 | 5.0 / 3.5 | 473 / 24.0 | 556 / 25.0 |
+| 32768 | 235 / 22.5 | 248 / 22.7 | 1.3 / 1.0 | 326 / 22.1 | 415 / 23.3 |
+
+Upstream ROCm has no FA kernel for iq4_nl KV on gfx1030, so its FA falls back to the CPU and collapses.
+
+Own Vulkan:
+- **Against upstream Vulkan:** prefill +4-14% at depth 0 and +22-38% at 8k; Qwen3.8 iq4_nl at 32k +31%. Decode is the same within 1%, except Qwen3.8 iq4_nl at 32k (-2.4%).
+- **Against brew:** prefill +17-44% at depth 0, +34-64% at 8k, +39% on Qwen3.8 iq4_nl at 32k. Decode is the same or up to +2%, except Qwen3.8 iq4_nl at 32k (-1.7%).
+- The gpt-oss decode regression of the first round is gone (117.4 = upstream).
+
+Own ROCm:
+- **Against upstream ROCm (no FA):** prefill at 8k +56% Qwen3.5, +19% gemma-4, 4.3x Qwen3-14B, +55% Qwen3.8; decode at 8k +15%, +28%, +59%, +15%. gpt-oss (FA works upstream): pp the same, tg +3%.
+- **Against brew:** prefill +13-56% at depth 0, +28-60% at 8k; decode +4-10% at 8k, except Qwen3-14B (-14%) and gpt-oss (-2%).
+- **Against the best upstream build at 32k** (Qwen3.8 iq4_nl): pp 415 vs 248 (+67%), tg 23.3 vs 22.7 (+3%).
+
+### Hybrid GPU + CPU (Qwen3.8-27B, fit for 128k ctx)
+
+With the server's default fit margin and the mmproj loaded, part of the FFN runs on the CPU; the laptop's RAM reads about 20 GB/s and the CPU FFN already uses 18 GB/s, so more threads do not help (`-t 16` is slower than 6). pp2048 / tg32:
+
+| fit target, ubatch | Vulkan | ROCm |
+|---|---|---|
+| 1024, 512 (server default) | 240 / 5.8 | 271 / 5.5 |
+| 256, 512 | 295 / 7.9 | 334 / 6.8 |
+| 256, 256 | 220 / 8.8 | 251 / 8.1 |
+| 256, 1024 | 324 / 5.7 | 392 / 5.7 |
+
+With `--no-mmproj` and an iq4_nl or q4_1 KV cache the model fits on the GPU at 128k ctx: about 24.8 t/s tg on ROCm. On Vulkan, `GGML_VK_VISIBLE_DEVICES=<AMD index>` lets host memory be imported for the AMD card (fit 256, ub 512: pp 295 -> 316).
+
 ## Validation (Qwen3.5-9B-MTP, the user's server command)
 
 | test | Vulkan | ROCm |
@@ -139,7 +205,8 @@ During the brew Qwen3.8-27B run the eGPU dropped off the Thunderbolt bus once (`
 
 ## Remaining gaps
 
-- **ROCm decode FA with a quantized KV cache.** Qwen3-14B loses 26% tg at 8k, versus 10% on Vulkan.
-- **Vulkan gpt-oss decode is 6% below upstream** (110.6 vs 117.6 t/s at depth 0). The cause is not found yet.
-- **Vulkan gemma-4 prefill at depth.** The hd512 global layers: 788 vs 926 t/s on ROCm.
-- **Vulkan tg at short context is 4-12% below ROCm** on every model: mat-vec and launch overhead.
+- **ROCm decode FA with q4_0 KV.** The GQA vec kernel is still slow for q4_0 (906 us at GQA 6, against 266 for iq4_nl); Qwen3-14B q8_0 still loses 26% tg at 8k, versus 10% on Vulkan.
+- **Vulkan f16 KV scratch prefill in real models** is about 2.7x slower than the same dispatch in `test-backend-ops`; the cause is not found.
+- **Vulkan prefill at depth is below ROCm** on Qwen3.8 (326 vs 415 t/s at 32k), and Vulkan decode at 32k is 2% below upstream.
+- **Vulkan tg at short context is 4-12% below ROCm** on most models: mat-vec and small-op launch overhead (about 19% of a decode step).
+- The second-round commits still need the story loop, attachment and wiki QA validation runs.
