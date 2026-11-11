@@ -13850,6 +13850,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,  4096, nb,  8192, {1, 1}, {1, 1}));
     }
 
+    // Qwen3.8-27B decode at 20k context: FA with 24 Q heads on 4 KV heads (GQA 6)
+    for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 20736, 1, true, false, 0, 0, GGML_PREC_F32, t, t));
+    }
+
+    // Qwen3.8-27B UD-IQ4_XS decode: FFN up/gate 17408x5120 and down 5120x17408 in every type of the model
+    for (ggml_type t : { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, 1,  5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  5120, 1, 17408, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32,  6144, 1, 5120, {1, 1}, {1, 1}));
+
     // Qwen3-14B (hd128, 8 KV heads, gqa 5) and gpt-oss-20b (hd64, 8 KV heads, gqa 8) at 8k depth: decode and prefill ubatch
     for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
         for (int nb : { 1, 512 }) {

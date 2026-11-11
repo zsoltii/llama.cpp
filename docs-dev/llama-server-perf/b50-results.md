@@ -866,6 +866,53 @@ Result:
 - `-ub 512` at 128k still needs one FFN on the CPU.
 - Check for slowdown when VRAM is full: a 24k context under the driver budget runs at the same speed (8.74 / 7.89 t/s).
 
+### 30. Qwen3.8-27B UD-IQ4_XS on the B50: iq4_xs mat-vec lookup table (2026-11-11)
+
+Command: `-c 128000 -fa on -ctk iq4_nl -ctv iq4_nl -ub 256 -b 256 --fit-target 64`, everything on the GPU (finding 29).
+The B50 is `Vulkan1` now: with Thunderbolt BIOS Assist Mode the iGPU is no longer listed.
+
+Decode profile (short context, 117 ms GPU per token):
+- iq4_xs mat-vecs ~50% of the time, at ~130 GB/s. q4_K of the same size runs at ~205 GB/s, and the q5_K LM head at 212 GB/s.
+- iq3_s / iq3_xxs ~120 GB/s. iq2_s ~47 GB/s (5 calls, 3.3 ms).
+- `GGML_VK_FORCE_MMVQ` does not help iq4_xs (378 → 403 us).
+
+The cause in the iq4_xs shader is the 16-entry `kvalues_iq4nl` table in shared memory, one lookup per nibble.
+Without the lookup (wrong values, timing only) 17408×5120 takes 245 us instead of 378, the q4_K speed.
+
+Attempts (17408×5120, us):
+
+| variant | us |
+|---|---|
+| before (16-entry shared table) | 378 |
+| table in registers (2 selects + `bitfieldExtract`) | 478 (ALU-bound) |
+| **256-entry shared table byte → (kv lo, kv hi), one lookup per byte** | **319** |
+| the same as packed f16 | 322 |
+| + more rows per workgroup (`GGML_VK_RM_KQ=4`) | 310 (not changed) |
+
+Change (`mul_mat_vec_iq4_xs.comp`, all vendors): the 256-entry pair table.
+- 5120×17408: 359 → 306 us; 10240×5120: 226 → 180 us; 6144×5120: 116 → 101 us.
+
+Server, greedy, 2 runs each (t/s):
+
+| | short pp / tg | wiki 20.7k pp / tg |
+|---|---|---|
+| before | 29.7 / 8.75 | 216 / 7.88 |
+| after | 29.8 / **9.58 (+9.5%)** | 215 / **8.59 (+9%)** |
+
+The output is the same (same hash of the greedy text).
+
+Validation:
+- test-backend-ops: 22297/22297 passed (MUL_MAT iq4_xs 50/50).
+- Wiki QA on Qwen3.8: 25/25 answered, 5/5 abstained.
+
+Not changed (measured):
+- Decode FA at 20k context (GQA 6: 24 Q heads on 4 KV heads, n=1) costs ~855 us per call, ~11% of a step.
+  - f16, q8_0, q4_0 and iq4_nl all take 660–785 us. The cost is the kernel, not the K/V reads (~35 GB/s).
+  - The scalar path is slower (1120–1200 us).
+  - The time scales with the number of parallel workgroups. 32 workgroups per core and at least 128 keys per split are already the best settings.
+  - A faster decode FA needs a kernel rewrite (one 32-key block costs ~31 us per workgroup).
+- Prefill at 20k: FA 37% (already ~11 TFLOPS), iq4_xs GEMM 30%.
+
 ## Remaining work
 
 - FA prefill (coopmat1, Xe2): ~3.5 TFLOPS, about a third of the wiki pp.
