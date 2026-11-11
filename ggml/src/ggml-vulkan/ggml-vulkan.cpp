@@ -8655,6 +8655,25 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         }
     }
 
+    // The same merge on coopmat1 for Intel Xe2: the 16-row tile holds only the gqa_ratio heads of one token
+    // (4 of 16 rows), so up to 16 / gqa_ratio tokens fill it and share the K/V reads.
+    // Arc Pro B50, kv=20736, head 256, GQA 4, 2 / 3 tokens, us: q8_0 1220/1805 -> 722/743, q4_0 1247/1689 -> 698/724,
+    // q4_1 1020/1526 -> 666/682, q5_0 1449/2206 -> 837/860, q5_1 1168/1843 -> 764/783, iq4_nl 1211/1837 -> 727/744.
+    if (gqa_ratio > 1 && neq1 > 1 && fa_gqa_tokens > 1 && ctx->device->vendor_id == VK_VENDOR_ID_INTEL &&
+            ctx->device->architecture == vk_device_architecture::INTEL_XE2 &&
+            !(mask && ggml_get_op_params_i32(dst, 4) > 0)) {
+        uint32_t gqa_T = std::min<uint32_t>(neq1, fa_gqa_tokens);
+        vk_fa_tuning_params merged = get_fa_tuning_params(ctx->device, HSK, HSV, gqa_T * gqa_ratio, KV, k_type_eff, v_type_eff, f32acc);
+        if (merged.path == FA_COOPMAT1) {
+            gqa_T = std::min(gqa_T, merged.block_rows / gqa_ratio);
+            if (gqa_T > 1) {
+                N = gqa_T * gqa_ratio;
+                workgroups_x = CEIL_DIV((uint32_t) neq1, gqa_T);
+                tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k_type_eff, v_type_eff, f32acc);
+            }
+        }
+    }
+
     float scale         = 1.0f;
     float max_bias      = 0.0f;
     float logit_softcap = 0.0f;

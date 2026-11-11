@@ -777,6 +777,69 @@ Build b298513ba, q8_0 KV, 128k context, 6 seeds per row:
   - The server log or text of the looping run, or the conversation (multi-turn?), is needed.
 - **To do:** run this test on the other GPUs as well (speed and loops).
 
+### 28. Coopmat1 FA: tokens of the MTP verify share one tile (2026-11-11)
+
+First a check of the second-round commits (RX 6900 XT, b9fe1f552…955d8d945) on the B50, at 900edbd36:
+- test-backend-ops: 22297/22297 passed.
+- Wiki QA: 25/25 answered, 5/5 abstained.
+- Attachment test (the user's command, 24 seeds): 0/24 loops.
+- Loop test p1:
+  - default sampling 6/6, Qwen sampling 2/6;
+  - every seed stops at the same token count as before, so the output did not change.
+- Qwen sampling, MTP:
+  - story 334.6 / 32.91 t/s (was 339 / 29.7);
+  - wiki 624.6 / 27.43 t/s (was 612 / 25.4).
+
+Profile after that (wiki, 20k context, per MTP step):
+- The 2-token verify FA costs 12.2 ms of 55 ms (1.57 ms per call).
+- The mat-vecs run at 80–85% of the bandwidth.
+- `test-backend-ops perf` shows that the FA time grows linearly with the token count:
+  - q8_0 662 / 1201 / 1782 us for 1 / 2 / 3 tokens;
+  - the cause: every token has its own workgroups, so each token reads the whole KV cache;
+  - the coopmat1 tile has 16 rows, and the 4 GQA heads of one token leave 12 of them empty.
+
+Change:
+- The token merge of finding 24, which had been scalar only, now also works in `flash_attn_cm1.comp`:
+  - row r = token gqa_iq1*gqa_T + r/gqa_ratio, head iq2 + r%gqa_ratio;
+  - Q, mask rows, outputs and split_k partials are addressed per row.
+- The host uses it on Intel Xe2 when the merged rows pick coopmat1: up to 16/gqa_ratio tokens.
+  - With 2 tokens it gives 8 rows, so f16/q4_0/q4_1/q5_1 also move from the separate scalar tokens to coopmat1.
+  - `GGML_VK_FA_GQA_TOKENS=1` disables it.
+  - Other vendors are unchanged.
+
+| FA us, kv=20736, head 256, GQA 4 | 2 tokens before → after | 3 tokens before → after |
+|---|---|---|
+| q8_0 | 1220 → 722 (−41%) | 1805 → 743 (−59%) |
+| q4_0 | 1247 → 698 (−44%) | 1689 → 724 (−57%) |
+| q4_1 | 1020 → 666 (−35%) | 1526 → 682 (−55%) |
+| q5_0 | 1449 → 837 (−42%) | 2206 → 860 (−61%) |
+| q5_1 | 1168 → 764 (−35%) | 1843 → 783 (−58%) |
+| iq4_nl | 1211 → 727 (−40%) | 1837 → 744 (−59%) |
+
+1 token and prefill (512×8704) are unchanged (±1%).
+
+Server, Qwen sampling, MTP n=1, q8_0:
+
+| | story pp / tg | wiki pp / tg |
+|---|---|---|
+| before (900edbd36) | 334.6 / 32.91 | 624.6 / 27.43 |
+| after | 332.5 / 32.98 | 625.3 / **30.78 (+12%)** |
+
+Validation:
+- test-backend-ops: 22297/22297 passed.
+- Wiki QA: 25/25 answered, 5/5 abstained.
+- Loop test p1: default sampling 6/6 (as before), Qwen sampling 0/6 (was 2/6). The FA sum order changed, so the trajectories differ.
+- Attachment test: 0/24 loops.
+- KLD was not re-run. `llama-perplexity` evaluates 512-token batches and never takes this path.
+
+The bench script fix `suites/fa-bench.sh`: `grep -m1` closed the `tee` pipe, so the script printed no rows.
+
+Next, from this profile:
+- The story step is mostly mat-vecs at 80–85% bandwidth, with the q8_0 4096×4096 mat-vec at ~136 GB/s.
+- The LM head is q6_K 4.6 ms.
+- The small ops are ~3 ms.
+- With verify FA cheaper at depth, MTP n-max 2 may pay off on the B50 for long contexts; measure it.
+
 ## Remaining work
 
 - FA prefill (coopmat1, Xe2): ~3.5 TFLOPS, about a third of the wiki pp.
