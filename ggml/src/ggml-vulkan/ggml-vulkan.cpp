@@ -1337,6 +1337,23 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
         }
     }
 
+    // AMD RDNA2 decode with head size 256 (the GQA heads of one KV head as rows): one row group of 128 threads with
+    // exactly n_rows rows, so every K/V value is loaded and dequantized once per workgroup instead of once per row group.
+    // RX 6900 XT, kv 20736, f16 / q8_0 / iq4_nl, us: gqa 6 111 / 121 / 189 -> 83 / 82 / 101, gqa 4 203 / 104 / 167 -> 78 / 68 / 85
+    if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA2 && hsk == 256 && hsv == 256 &&
+            n_rows >= 4 && n_rows <= 8 && result.subgroup_size == 64) {
+        vk_fa_tuning_params tuned = result;
+        tuned.block_rows     = n_rows;
+        tuned.block_cols     = 32;
+        tuned.row_split      = 1;
+        tuned.workgroup_size = 128;
+        tuned.d_split        = 16;
+        tuned.limit_occupancy_shmem = 0;
+        if (ggml_vk_flash_attn_scalar_shmem_support(device, tuned, hsk, hsv, f32acc, k_type, v_type)) {
+            result = tuned;
+        }
+    }
+
     return result;
 }
 
@@ -1939,6 +1956,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         s_warptile_mmqid_int_k = { mul_mat_subgroup_size_32, 32,  32, 32, mul_mat_s_warptile_wm_16, 32, 1, 2, 1, 1, mul_mat_subgroup_size_16 };
 
         // chip specific tuning
+        if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA2 && !device->coopmat_support && mm_warp_8 == 64) {
+            // AMD RDNA2 (no coopmat): large integer dot tiles with 4 waves, RX 6900 XT, 17408 x 512 x 5120, TFLOPS
+            // against the medium tile: iq4_xs 32.6 -> 33.8, iq3_s 29.6 -> 32.0, q4_K 31.8 -> 35.6, q3_K 26.0 -> 28.5.
+            // q5_K uses its own 8 wave tile, see the pipeline creation.
+            l_warptile_mmq_int   = { 256, 128, 128, 32,  64, 64, 2, 4, 2, 1, 64 };
+            l_warptile_mmq_int_k = { 256, 128, 128, 32, 128, 32, 1, 4, 2, 1, 64 };
+        }
         if ((device->architecture == AMD_GCN) && (device->driver_id != vk::DriverId::eAmdProprietary)) {
             m_warptile_mmq = m_warptile_mmq_int = { 256, 64, 64, 32, 16, 16, 2, 2, 2, 1, 16 };
             m_warptile_mmqid = m_warptile_mmqid_int = { 256, 64, 64, 32, 16, 16, 2, 2, 2, 1, 16 };
@@ -2767,7 +2791,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 sg_create_mmq({GGML_TYPE_Q2_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_int_k, "matmul_q2_k_q8_1", matmul_q2_k_q8_1_len, matmul_q2_k_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
                 sg_create_mmq({GGML_TYPE_Q3_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_int_k, "matmul_q3_k_q8_1", matmul_q3_k_q8_1_len, matmul_q3_k_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
                 sg_create_mmq({GGML_TYPE_Q4_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_int_k, "matmul_q4_k_q8_1", matmul_q4_k_q8_1_len, matmul_q4_k_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
-                sg_create_mmq({GGML_TYPE_Q5_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_int_k, "matmul_q5_k_q8_1", matmul_q5_k_q8_1_len, matmul_q5_k_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
+                // AMD RDNA2: q5_K prefers 8 waves of 32 x 64 warp tiles, RX 6900 XT 17408 x 512 x 5120: 23.8 -> 30.5 TFLOPS
+                std::vector<vk_tile_config> tc_mmq_int_q5_k = tc_mmq_int_k;
+                if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA2 && !device->coopmat_support && mm_warp_8 == 64) {
+                    tc_mmq_int_q5_k[2].warptile = { 512, 128, 128, 32, 32, 64, 1, 2, 2, 1, 64 };
+                }
+                sg_create_mmq({GGML_TYPE_Q5_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_int_q5_k, "matmul_q5_k_q8_1", matmul_q5_k_q8_1_len, matmul_q5_k_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
                 sg_create_mmq({GGML_TYPE_Q6_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_int_k, "matmul_q6_k_q8_1", matmul_q6_k_q8_1_len, matmul_q6_k_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
                 sg_create_mmq({GGML_TYPE_IQ3_S, GGML_TYPE_Q8_1, false, false}, tc_mmq_int_k, "matmul_iq3_s_q8_1", matmul_iq3_s_q8_1_len, matmul_iq3_s_q8_1_data, sizeof(vk_mat_mat_push_constants), 3);
             }
@@ -2881,7 +2910,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 sg_create_mmq({GGML_TYPE_Q2_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_int_k, "matmul_q2_k_q8_1", matmul_q2_k_q8_1_fp32_len, matmul_q2_k_q8_1_fp32_data, sizeof(vk_mat_mat_push_constants), 3);
                 sg_create_mmq({GGML_TYPE_Q3_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_int_k, "matmul_q3_k_q8_1", matmul_q3_k_q8_1_fp32_len, matmul_q3_k_q8_1_fp32_data, sizeof(vk_mat_mat_push_constants), 3);
                 sg_create_mmq({GGML_TYPE_Q4_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_int_k, "matmul_q4_k_q8_1", matmul_q4_k_q8_1_fp32_len, matmul_q4_k_q8_1_fp32_data, sizeof(vk_mat_mat_push_constants), 3);
-                sg_create_mmq({GGML_TYPE_Q5_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_int_k, "matmul_q5_k_q8_1", matmul_q5_k_q8_1_fp32_len, matmul_q5_k_q8_1_fp32_data, sizeof(vk_mat_mat_push_constants), 3);
+                // AMD RDNA2: q5_K prefers 8 waves of 32 x 64 warp tiles, RX 6900 XT 17408 x 512 x 5120: 23.8 -> 30.5 TFLOPS
+                std::vector<vk_tile_config> tc_mmq_int_q5_k = tc_mmq_int_k;
+                if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA2 && !device->coopmat_support && mm_warp_8 == 64) {
+                    tc_mmq_int_q5_k[2].warptile = { 512, 128, 128, 32, 32, 64, 1, 2, 2, 1, 64 };
+                }
+                sg_create_mmq({GGML_TYPE_Q5_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_int_q5_k, "matmul_q5_k_q8_1", matmul_q5_k_q8_1_fp32_len, matmul_q5_k_q8_1_fp32_data, sizeof(vk_mat_mat_push_constants), 3);
                 sg_create_mmq({GGML_TYPE_Q6_K, GGML_TYPE_Q8_1, false, false}, tc_mmq_int_k, "matmul_q6_k_q8_1", matmul_q6_k_q8_1_fp32_len, matmul_q6_k_q8_1_fp32_data, sizeof(vk_mat_mat_push_constants), 3);
                 sg_create_mmq({GGML_TYPE_IQ3_S, GGML_TYPE_Q8_1, false, false}, tc_mmq_int_k, "matmul_iq3_s_q8_1", matmul_iq3_s_q8_1_fp32_len, matmul_iq3_s_q8_1_fp32_data, sizeof(vk_mat_mat_push_constants), 3);
             }
@@ -5169,6 +5203,10 @@ vk_device ggml_vk_get_device(size_t idx) {
 #endif
 
             device->mul_mat_l_int[i]    = device->mul_mat_l[i];
+            // AMD RDNA2 without coopmat: the large tile only for the integer dot MMQ, see l_warptile_mmq_int
+            if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA2 && !device->coopmat_support) {
+                device->mul_mat_l_int[i] = true;
+            }
             device->mul_mat_m_int[i]    = device->mul_mat_m[i];
             device->mul_mat_s_int[i]    = device->mul_mat_s[i];
             device->mul_mat_id_l_int[i] = device->mul_mat_id_l[i];

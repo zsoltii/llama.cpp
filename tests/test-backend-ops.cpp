@@ -13862,6 +13862,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 10240, 1, 5120, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32,  6144, 1, 5120, {1, 1}, {1, 1}));
+    // the other projections: attn_qkv 10240, attn_q 12288, attn_gate 6144, ssm_out / attn_output 6144 -> 5120, LM head
+    for (ggml_type t : { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 12288, 1, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32,  5120, 1, 6144, {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1}));
+    // the same shapes with 8 different matrices, so the weights do not fit in a large last level cache (RDNA2 Infinity
+    // Cache, 128 MB) and the kernel reads them from VRAM as in the model
+    for (ggml_type t : { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
+        for (auto mk : std::vector<std::array<int, 2>>{ {17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120}, {5120, 6144} }) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, mk[0], 1, mk[1], {8, 1}, {1, 1}));
+        }
+    }
+    // prefill ubatch of the FFN
+    for (ggml_type t : { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q3_K }) {
+        test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 17408, 512, 5120, {1, 1}, {1, 1}));
+    }
 
     // Qwen3-14B (hd128, 8 KV heads, gqa 5) and gpt-oss-20b (hd64, 8 KV heads, gqa 8) at 8k depth: decode and prefill ubatch
     for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
