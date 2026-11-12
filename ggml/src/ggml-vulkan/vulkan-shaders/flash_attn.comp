@@ -247,6 +247,11 @@ void main() {
                 if (max_mask <= NEG_FLT_MAX_OVER_2) {
                     continue;
                 }
+            } else if (SHMEM_STAGING == 0) {
+                // The mask load above holds the subgroups of the workgroup together. Without it (and without
+                // K/V staging) they drift apart and each one reads K/V on its own: an all-zero causal mask made
+                // f16 prefill 3x slower on the RX 6900 XT (hd256, 33k keys).
+                barrier();
             }
         }
 

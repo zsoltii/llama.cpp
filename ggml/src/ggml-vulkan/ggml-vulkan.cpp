@@ -1337,6 +1337,22 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
         }
     }
 
+    // AMD RDNA2 prefill with head size 256 on f16 K/V (also the f16 scratch of a quantized cache): two row groups
+    // of 8 rows. RX 6900 XT, 512 rows, gqa 6, kv 33280, causal mask: 23.7 -> 19.9 ms (Qwen3.8-27B)
+    if (device->vendor_id == VK_VENDOR_ID_AMD && device->architecture == AMD_RDNA2 && n_rows >= 64 &&
+            result.subgroup_size == 64 && result.d_split == 8 && hsk == 256 && hsv == 256 &&
+            k_type == GGML_TYPE_F16 && v_type == GGML_TYPE_F16) {
+        vk_fa_tuning_params tuned = result;
+        tuned.block_rows     = 16;
+        tuned.block_cols     = 32;
+        tuned.row_split      = 2;
+        tuned.workgroup_size = 128;
+        tuned.limit_occupancy_shmem = 0;
+        if (ggml_vk_flash_attn_scalar_shmem_support(device, tuned, hsk, hsv, f32acc, k_type, v_type)) {
+            result = tuned;
+        }
+    }
+
     // AMD RDNA2 decode with head size 256 (the GQA heads of one KV head as rows): one row group of 128 threads with
     // exactly n_rows rows, so every K/V value is loaded and dequantized once per workgroup instead of once per row group.
     // RX 6900 XT, kv 20736, f16 / q8_0 / iq4_nl, us: gqa 6 111 / 121 / 189 -> 83 / 82 / 101, gqa 4 203 / 104 / 167 -> 78 / 68 / 85
@@ -8624,13 +8640,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const size_t kv_scratch_ts = kv_raw_strided ? ggml_type_size(k->type) : sizeof(ggml_fp16_t);
     // K and V share one scratch buffer, so the sum must fit in one allocation
     const uint64_t dequant_kv_sz = ((uint64_t)ggml_nelements(k) + (uint64_t)ggml_nelements(v)) * kv_scratch_ts;
-    // AMD RDNA2 with head size >= 256: the scalar FA on the quantized cache (its own tile, see get_fa_tuning_params_scalar)
-    // beats the f16 scratch in the models. RX 6900 XT pp512 at d32768, q8_0 KV: Qwen3.5-9B 729 -> 1099 t/s,
-    // Qwen3.8-27B 234 -> 374, gemma-4-12b 365 -> 616 (iq4_nl: Qwen3.8 234 -> 327). With head size 64 and 128
-    // (gpt-oss, Qwen3-14B) the scratch stays faster.
-    const bool quant_kv_direct = ctx->device->vendor_id == VK_VENDOR_ID_AMD &&
-                                 ctx->device->architecture == vk_device_architecture::AMD_RDNA2 && HSK >= 256;
-    const bool use_dequant_kv = ((k_quant && v_quant && !quant_kv_direct) || kv_raw_strided) && neq1 >= 64 &&
+    const bool use_dequant_kv = ((k_quant && v_quant) || kv_raw_strided) && neq1 >= 64 &&
                                 is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
                                 (uint64_t)ggml_nelements(k) * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
                                 (uint64_t)ggml_nelements(v) * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
