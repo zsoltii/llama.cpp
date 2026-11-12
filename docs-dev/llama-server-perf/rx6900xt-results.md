@@ -276,6 +276,95 @@ Validation (Vulkan, RX 6900 XT):
 - Story loop test, p1, 6 seeds (Qwen3.5): default sampling 5/6 not ok, Qwen sampling 1/6, the same as the second-round baseline.
 - Attachment test, Qwen sampling, 6 seeds: 0/6 loops; pp ~1160 t/s (41k tokens), tg ~64.4 t/s.
 
+## Fourth round: prefill, and the fastest server command (2026-11-12)
+
+Same card, model and use case as the third round (Qwen3.8-27B UD-IQ4_XS, iq4_nl K/V, 15-20k-token prompts, 3-4k
+generated tokens). Prefill profile (Vulkan, pp512 at d16384, 1170 ms per ubatch): MUL_MAT 68%, FLASH_ATTN_EXT 27%,
+GATED_DELTA_NET 1.4%, the rest small ops.
+
+### Findings
+
+1. **The FA prefill "f16 scratch mystery" (third round, finding 5) was the causal mask.**
+   - `test-backend-ops` fills the mask with random values. A model mask is all zero except the causal triangle, so
+     the scalar shader skips the mask load (`MASK_OPT_ALL_ZERO`) in almost every block.
+   - That load had the only barrier of the KV loop. Without K/V staging in shared memory, the subgroups of a
+     workgroup then drift apart and read K/V on their own.
+   - f16 KV, hd256, gqa 6, kv 33280, 512 rows: 26 ms with a random mask, 77 ms with a causal one.
+   - Fix: a barrier in the all-zero branch when there is no staging: 77 -> 24 ms. On the T1200 it is neutral
+     (q8_0 hd256 99 -> 91 ms).
+2. **With that fixed, the f16 scratch beats the direct quantized path on RDNA2 for every head size.** So the RDNA2
+   hd >= 256 exception is gone.
+   - hd256 f16 prefill has its own tile now: Br 16, Bc 32, row split 2, 128 threads, 23.7 -> 19.9 ms.
+   - iq4_nl prefill FA, kv 33280: 38 -> 21 ms (ROCm: 24.9 ms).
+   - pp512 @ d32768, q8_0 / iq4_nl KV:
+     - Qwen3.5-9B: 1020 / 893 -> 1054 / 1062;
+     - gemma-4-12b: 606 / 464 -> 673 / 663.
+   - Qwen3.8 pp1024 @ d16384, ub 1024: 427 -> 495 (ROCm 505).
+3. **The scratch is not part of the scheduler's reservation.** With the MTP draft on a full card (~90 MiB free at
+   128k), the growing scratch over-committed VRAM: the driver paged buffers out, with 3-7 s stalls per ubatch after
+   8k tokens and pp 77 t/s.
+   - The scratch now grows only while the device has room, in 64 MiB steps.
+   - Otherwise the scalar FA runs in KV chunks. Each chunk is dequantized into the scratch, and the O/L/M state
+     goes from chunk to chunk through two split_k slots.
+   - 8k-key chunks cost nothing (kv 33280: 24.5 ms whole, 24.0 chunked), 1k chunks 6%.
+   - MTP server pp: 77 -> 451 t/s.
+4. **ROCm MMQ on RDNA2:** J 128 tiles for q4_K and q5_K, 27.9 -> 31.2 and 26.2 -> 30.7 TFLOPS.
+   - The IQ types lose 10-18% with J 128.
+   - Other I / J / thread counts, and the FA tile configs (also 64 columns per block for hd256), were not faster.
+   - ROCm pp +2%.
+5. **MTP works with the Qwen3.8 GGUF** (it has the nextn layer) and is the biggest win for long answers.
+   - `--spec-draft-n-max 1` is best: tg 22.8 -> 33-35 t/s (acceptance 0.75-0.80). With n-max 2 it is 25-26, with
+     n-max 3 it is 22.
+   - The draft KV must be iq4_nl (`-ctkd iq4_nl -ctvd iq4_nl`). With q8_0, `--fit` moves an FFN to the CPU.
+   - Larger ubatches do not fit with MTP.
+6. **ROCm has less free VRAM than Vulkan** (16196 vs 16351 MiB at start, compute buffer 176 vs 138 MiB), and its
+   memory pool (MMQ src1, FA f16 K/V) is outside `--fit`.
+   - With MTP at 128k, the fit offloads 2 FFNs (tg only 23-27).
+   - At 116k it fits, but the first ubatch fails with out of memory in the pool.
+   - 100k works.
+7. **Without MTP, larger ubatches help prefill.**
+
+   | backend | ub 256 | ub 512 | ub 1024 |
+   |---|---|---|---|
+   | Vulkan | 477 | 515 | 528 |
+   | ROCm | 520 | 544 | 549 |
+
+   - Wiki 20.7k pp, t/s.
+   - At ub 2048, Vulkan offloads a layer.
+
+### Fastest command, 20.7k wiki / 15.8k code prompt, 3500 generated tokens (default sampling, seed 1)
+
+| backend | command | pp t/s | tg t/s | time for 20.7k + 3500 |
+|---|---|---|---|---|
+| Vulkan | user (ub 256) | 477 / 489 | 22.8 / 23.1 | 197 s |
+| Vulkan | ub 1024 | 528 / 538 | 23.0 / 23.1 | 192 s |
+| Vulkan | MTP, ub 256, 128k | 451 / 462 | 33.4 / 34.6 | 151 s |
+| ROCm | user (ub 256) | 520 / 517 | 23.7 / 23.9 | 188 s |
+| ROCm | ub 1024 | 549 / 568 | 23.6 / 23.9 | 186 s |
+| ROCm | MTP, ub 256, 100k | 496 / 511 | 32.0 / 35.3 | 151 s |
+
+Vulkan:
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 llama-server -hf unsloth/Qwen3.8-27B-GGUF:UD-IQ4_XS -c 128000 -fa on --parallel 1 \
+  -ctk iq4_nl -ctv iq4_nl --fit-target 64 -ub 256 -b 256 --no-mmproj -dev Vulkan1 \
+  --spec-type draft-mtp --spec-draft-n-max 1 -ctkd iq4_nl -ctvd iq4_nl
+```
+
+ROCm: the same with `-c 100000 -dev ROCm0`. Without MTP, `-ub 1024 -b 1024` is the fastest on both backends.
+
+Validation (RX 6900 XT, after both commits):
+
+| test | Vulkan | ROCm |
+|---|---|---|
+| `test-backend-ops` | 22303/22303 | 20127/20127 |
+| wiki QA: Qwen3.5-9B-MTP, Qwen3.8 user command, Qwen3.8 MTP command | 25/25 + 5/5 for each | 25/25 + 5/5 for each |
+| story loop, p1 6 seeds, default / Qwen sampling (Qwen3.5) | 5/6 / 1/6 not ok | 6/6 / 0/6 not ok |
+| attachment test, 6 seeds (Qwen3.5) | 0/6 loops, pp ~1205, tg ~64 | 0/6 loops, pp ~1174, tg ~61 |
+
+The loop results are the same as the earlier baselines. The FA tests also pass on the T1200, with and without
+`GGML_VK_FA_KV_CHUNK=256`.
+
 ## Validation (Qwen3.5-9B-MTP, the user's server command)
 
 | test | Vulkan | ROCm |
@@ -294,7 +383,10 @@ During the brew Qwen3.8-27B run the eGPU dropped off the Thunderbolt bus once (`
 ## Remaining gaps
 
 - **ROCm decode FA with q4_0 KV.** The GQA vec kernel is still slow for q4_0 (906 us at GQA 6, against 266 for iq4_nl); Qwen3-14B q8_0 still loses 26% tg at 8k, versus 10% on Vulkan.
-- **Vulkan f16 KV scratch prefill in real models** is about 2.7x slower than the same dispatch in `test-backend-ops`; the cause is not found.
+- **ROCm FA prefill memory:** the f16 K/V conversion and the MMQ buffers come from the pool, outside `--fit`.
+  - On a full card (MTP draft, 116k+ ctx) the first ubatch fails with out of memory.
+  - A KV-chunked conversion like the Vulkan one would fix it.
+- **ROCm hd256 FA prefill** stays at about 17 TFLOPS (tile kernel), against 21 on Vulkan now.
 - **Vulkan prefill at depth is below ROCm** on Qwen3.8 (326 vs 415 t/s at 32k), and Vulkan decode at 32k is 2% below upstream.
 - **Vulkan tg at short context is 4-12% below ROCm** on most models: mat-vec and small-op launch overhead (about 19% of a decode step).
 - The second-round commits still need the story loop, attachment and wiki QA validation runs.
