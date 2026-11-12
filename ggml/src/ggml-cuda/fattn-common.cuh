@@ -256,6 +256,35 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_iq4_nl(
 
     float sum = 0.0f;
 
+#ifndef GGML_USE_HIP
+    if constexpr ((QI8_1/2) % nthreads == 0) {
+        // A thread also handles the high nibbles of its ints (QI8_1/2 further on): one table lookup for both halves.
+#pragma unroll
+        for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += QI8_1) {
+#pragma unroll
+            for (int l = 0; l < QI8_1/2; l += nthreads) {
+                const int k_KQ = k_KQ_0 + l + threadIdx.x % nthreads;
+
+                const int ib   = k_KQ / QI8_1;
+                const int iqs4 = k_KQ % QI4_NL;
+
+                int v;
+                ggml_cuda_memcpy_1<sizeof(int), 2>(&v, K_iq4_nl[ib].qs + sizeof(int)*iqs4);
+                const int2 vt = get_int_from_table_16(v, kvalues_iq4nl);
+
+                const int u_lo = Q_q8[(k_KQ_0 + l)/nthreads];
+                const int u_hi = Q_q8[(k_KQ_0 + l + QI8_1/2)/nthreads];
+                const int sumi = ggml_cuda_dp4a(vt.y, u_hi, ggml_cuda_dp4a(vt.x, u_lo, 0));
+
+                // both halves belong to the same q8_1 block of Q
+                const float2 Q_ds = ((const float2 *) Q_ds_v)[(k_KQ_0 + l)/nthreads];
+                sum += __half2float(K_iq4_nl[ib].d) * sumi*Q_ds.x;
+            }
+        }
+        return sum;
+    }
+#endif // GGML_USE_HIP
+
 #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
         const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
@@ -675,7 +704,19 @@ static __device__ __forceinline__ void dequantize_V_iq4_nl(const void * __restri
     ggml_cuda_memcpy_1<ne, 2>(&q, x[ib].qs + iqs);
     q >>= 4*shift;
     q &= 0x0F0F0F0F;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    {
+        // only the 4 values of q: pack the byte indices into the 4 selector nibbles of __byte_perm
+        const uint32_t * table32 = (const uint32_t *) kvalues_iq4nl;
+        uint32_t sel = q | (q >> 4);
+        sel = (sel & 0xFF) | ((sel >> 8) & 0xFF00);
+        const uint32_t lo = __byte_perm(table32[0], table32[1], sel);
+        const uint32_t hi = __byte_perm(table32[2], table32[3], sel);
+        q = __byte_perm(lo, hi, 0x3210 | ((sel & 0x8888) >> 1));
+    }
+#else
     q = get_int_from_table_16(q, kvalues_iq4nl).x;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
     const int8_t * q8 = (const int8_t *) &q;
 
