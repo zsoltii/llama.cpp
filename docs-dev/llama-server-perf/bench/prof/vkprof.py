@@ -48,5 +48,5 @@ for kind, blks in groups.items():
     nb = len(blks)
     total = sum(tot.values()) / nb
     print(f"\n##### {kind}: {nb} graphs, avg GPU {total/1000:.2f} ms/graph")
-    for key, t in sorted(tot.items(), key=lambda kv: -kv[1])[:40]:
+    for key, t in sorted(tot.items(), key=lambda kv: -kv[1])[:int(__import__("os").environ.get("TOPN",40))]:
         print(f"{t/nb/1000:8.3f} ms {100*t/nb/total:5.1f}%  {cnt[key]/nb:6.1f}x  {key}")

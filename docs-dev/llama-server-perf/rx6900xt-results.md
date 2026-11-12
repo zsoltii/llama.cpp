@@ -188,6 +188,94 @@ With the server's default fit margin and the mmproj loaded, part of the FFN runs
 
 With `--no-mmproj` and an iq4_nl or q4_1 KV cache the model fits on the GPU at 128k ctx: about 24.8 t/s tg on ROCm. On Vulkan, `GGML_VK_VISIBLE_DEVICES=<AMD index>` lets host memory be imported for the AMD card (fit 256, ub 512: pp 295 -> 316).
 
+## Third round: Qwen3.8-27B for agentic use (300 W, 2026-11-12)
+
+Target: the user's command, Qwen3.8-27B UD-IQ4_XS, 128k ctx, iq4_nl K and V, `--fit-target 64 -ub 256 -b 256 --no-mmproj`, with 15-20k-token prompts and long answers. The card is `Vulkan1` / `ROCm0` now (the T1200 is `Vulkan0`).
+
+Baseline, 20.7k-token wiki prompt, 512 generated tokens:
+
+| backend | pp t/s | tg t/s |
+|---|---|---|
+| Vulkan | 430 | 22.4 |
+| ROCm | 519 | 23.6 |
+
+Weights per decoded token: 13.45 GB (iq4_xs 61%, q5_K 14% with the LM head, iq3_s 9%, q4_K 7%, iq3_xxs 4.5%). At 512 GB/s that is about 26 ms, against 44.7 ms measured on Vulkan.
+
+### Findings
+
+1. **Mat-vec microbenchmarks lie on RDNA2.** A single 17408x5120 iq4_xs matrix (47 MB) stays in the 128 MB Infinity Cache, and `test-backend-ops` reports 1.3 TB/s.
+   - New perf cases use 8 different matrices (`bs=[8,1]`), so the weights come from VRAM.
+   - With them, every type used by the model runs at 485-500 GB/s on Vulkan (95-97% of peak). ROCm is the same, except iq2_s (395-411), iq3_xxs (432-470) and iq3_s (455-472).
+   - In the model, the Vulkan mat-vecs reach 410 GB/s on average (GGML_VK_PERF_LOGGER). The difference is a fixed cost of about 5-9 us per dependent dispatch, the same as the floor of the small ops (ADD, GLU, MUL: 5.8 us each).
+   - Not the cause:
+     - MMVQ (`GGML_VK_DISABLE_MMVQ`: +2%; the IQ types do not use it);
+     - rows per workgroup (`GGML_VK_RM_KQ` 1 and 4 are slower);
+     - the clocks (MCLK 1000 MHz, SCLK ~2.6 GHz, 265 W during decode).
+2. **Decode step on Vulkan, 20.7k context:** 44.3 ms of GPU time, made of:
+   - mat-vec 32.8 ms;
+   - FA 3.3 ms (117 GB/s);
+   - about 1300 small ops, 8.3 ms.
+3. **Vulkan decode FA (hd256, GQA rows 4-8).**
+   - Before, the scalar path used row_split 4 with 8 rows, so every K/V value was dequantized by 4 row groups, and 2 of the 8 rows were padding at GQA 6.
+   - The new config is one row group of 128 threads with exactly n_rows rows, Bc 32 and D_split 16.
+   - RX 6900 XT, kv 20736, us:
+
+     | gqa | f16 | q8_0 | iq4_nl |
+     |---|---|---|---|
+     | 6 | 111 -> 83 | 121 -> 82 | 189 -> 101 |
+     | 4 | 203 -> 78 | 104 -> 68 | 167 -> 85 |
+
+   - kv 33280, gqa 6: f16 233 -> 171, q8_0 175 -> 119, iq4_nl 271 -> 145 us. Multi-token decode (nb 2, 3) is also faster for every type.
+   - Qwen3.8 wiki tg 22.37 -> 22.92.
+4. **Vulkan prefill MMQ tiles on RDNA2.**
+   - Without coopmat, AMD had the large tile disabled, so prefill ran on the 128-thread 64x64 tile.
+   - The large integer dot tile is now enabled on RDNA2 for the MMQ path only, with 4 waves: 64x64 warp tiles, or 128x32 for the K-quant layout. q5_K gets 8 waves of 32x64.
+   - 17408 x 512 x 5120, TFLOPS:
+
+     | type | before | after | ROCm |
+     |---|---|---|---|
+     | iq4_xs | 32.6 | 33.9 | 37.7 |
+     | iq3_s | 29.6 | 32.0 | 35.4 |
+     | q4_K | 31.8 | 35.8 | |
+     | q5_K | 23.8 | 30.4 | 26.1 |
+     | q3_K | 26.0 | 28.5 | |
+
+   - Qwen3.8 wiki pp 431 -> 449.
+5. **The f16 KV scratch prefill mystery is not memory placement.**
+   - With iq4_nl KV, `test-backend-ops` (kv 16384, 256 rows) gives:
+     - scratch 7.2 ms;
+     - direct 10.5 ms.
+   - In the model, with the same dispatch parameters (`GGML_VK_FA_DEBUG`: Br 16, Bc 32, split_k 3), the scratch path takes 15.9 ms per call and the direct path 9.9 ms.
+   - The scratch time grows superlinearly with depth: 1.23 ms at 2k keys, 7.4 at 8k, 15.9 at 16k.
+   - The direct path grows linearly.
+   - The scratch path is just as slow with `-c 32768`, where VRAM is free, and with only the AMD device visible.
+   - So the direct path stays for hd256 on RDNA2.
+6. **Prefill FA tile sweep** (quantized KV, 256 rows): no config beats the current one (Br 8, Bc 32, 128 threads). The dequant per row block is the cost.
+7. **ROCm decode FA** is compute bound in the GQA vec kernel: about 180 us at kv 20736 for q8_0 and iq4_nl alike. None of these helped:
+   - 3 heads per block: 459 us, from register pressure;
+   - 4 threads per K row for iq4_nl: 273 us;
+   - more parallel blocks: the HIP occupancy query returns 1 block per SM, so only 120 blocks run, but up to 8 blocks per SM only help f16 (307 -> 137 us).
+
+   A faster ROCm decode needs a new kernel.
+8. **Other ROCm paths:**
+   - the FFN gate/up/GLU mat-vec fusion already exists in the CUDA backend;
+   - MMQ prefill is 10-15% ahead of Vulkan;
+   - no ROCm code was changed in this round.
+
+### Result, 20.7k-token prompt, 512 generated tokens
+
+| backend | pp t/s | tg t/s |
+|---|---|---|
+| Vulkan, before | 430 | 22.4 |
+| Vulkan, after | 449 | 22.9 |
+| ROCm (unchanged) | 519 | 23.6 |
+
+Validation (Vulkan, RX 6900 XT):
+- `test-backend-ops`: 22297/22297.
+- Wiki QA: Qwen3.5-9B-MTP and Qwen3.8-27B (user command) both 25/25 answered, 5/5 abstained.
+- Story loop test, p1, 6 seeds (Qwen3.5): default sampling 5/6 not ok, Qwen sampling 1/6, the same as the second-round baseline.
+- Attachment test, Qwen sampling, 6 seeds: 0/6 loops; pp ~1160 t/s (41k tokens), tg ~64.4 t/s.
+
 ## Validation (Qwen3.5-9B-MTP, the user's server command)
 
 | test | Vulkan | ROCm |
