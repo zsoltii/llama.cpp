@@ -16,7 +16,7 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
 #endif // __clang__
-// ncols2 > 1 (HIP only): the ncols == ncols2 columns are Q heads of one K/V head for a single token (GQA decode),
+// ncols2 > 1: the ncols == ncols2 columns are Q heads of one K/V head for a single token (GQA decode),
 // so that the K/V cache is read once for all of them; the last block of a K/V head may have fewer heads.
 template<int D, int ncols, int ncols2, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
@@ -85,7 +85,9 @@ static __global__ void flash_attn_ext_vec(
 #endif // RDNA
     constexpr int nthreads_V_q  = (D/4 < 32 ? D/4 : 32);
 #else
-    constexpr int nthreads_KQ_q = (D/4 < 32 ? D/4 : 32);
+    // RTX 3090, Qwen3.8-27B decode (hd256, gqa 6, kv 33280), 3 heads per block: 4 threads per K row are fastest
+    // (iq4_nl 32 threads 515 us, 8 threads 187 us, 4 threads 156 us)
+    constexpr int nthreads_KQ_q = ncols2 > 1 ? 4 : (D/4 < 32 ? D/4 : 32);
     constexpr int nthreads_V_q  = (D/4 < 32 ? D/4 : 32);
 #endif // GGML_USE_HIP
 
@@ -567,15 +569,15 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     launch_fattn<D, cols_per_block/ncols2, ncols2>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false, false);
 }
 
-// Whether a single-token FLASH_ATTN_EXT can process the Q heads of a K/V head in one block (see flash_attn_ext_vec).
-static bool ggml_cuda_flash_attn_ext_vec_use_gqa(const ggml_tensor * dst) {
-#ifdef GGML_USE_HIP
+// The number of Q heads of a K/V head that one block of a single-token FLASH_ATTN_EXT processes, 1 if it cannot
+// (see flash_attn_ext_vec).
+static int ggml_cuda_flash_attn_ext_vec_gqa_heads(const ggml_tensor * dst) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * mask = dst->src[3];
 
     if (K->ne[2] == 0 || Q->ne[2] % K->ne[2] != 0) {
-        return false;
+        return 1;
     }
     const int64_t gqa_ratio = Q->ne[2] / K->ne[2];
 
@@ -585,13 +587,25 @@ static bool ggml_cuda_flash_attn_ext_vec_use_gqa(const ggml_tensor * dst) {
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
     // all heads of the block share the mask row
+#ifdef GGML_USE_HIP
+    const bool type_ok = K->type != GGML_TYPE_F16;
+#else
+    const bool type_ok = ggml_is_quantized(K->type);
+#endif // GGML_USE_HIP
+    if (Q->ne[1] != 1 || gqa_ratio % 2 != 0 || !type_ok || !mask || mask->ne[2] != 1 || max_bias != 0.0f ||
+            logit_softcap != 0.0f) {
+        return 1;
+    }
+#ifdef GGML_USE_HIP
     // q5_0 and q5_1 lose with 2 heads per block at gqa 4 (190 -> 244 us), and win at gqa 6 (371 -> 310 us)
     const bool q5 = K->type == GGML_TYPE_Q5_0 || K->type == GGML_TYPE_Q5_1;
-    return Q->ne[1] == 1 && gqa_ratio % 2 == 0 && (!q5 || gqa_ratio > 4) && K->type != GGML_TYPE_F16 &&
-        mask && mask->ne[2] == 1 && max_bias == 0.0f && logit_softcap == 0.0f;
+    return !q5 || gqa_ratio > 4 ? 2 : 1;
 #else
-    GGML_UNUSED(dst);
-    return false;
+    // RTX 3090, us, 1 head -> n heads per block:
+    // - Qwen3.5-9B (gqa 4), kv 20736, 4 heads: q8_0 129 -> 83, q4_0 138 -> 66, iq4_nl 275 -> 73;
+    // - Qwen3.8-27B (gqa 6), kv 33280, 3 heads: q8_0 293 -> 147, q4_0 314 -> 119, iq4_nl 623 -> 156
+    //   (2 heads: 179, 157, 209).
+    return gqa_ratio % 4 == 0 ? 4 : (gqa_ratio % 3 == 0 ? 3 : 2);
 #endif // GGML_USE_HIP
 }
 
@@ -603,18 +617,27 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-#ifdef GGML_USE_HIP
-    // GQA decode with head size 256 and a quantized K: one block reads the K/V cache once for 2 Q heads of a K/V
-    // head. 4 or 8 heads per block are slower (register pressure). RX 6900 XT, us, 1 head -> 2 heads per block:
+    // GQA decode with head size 256 and a quantized K: one block reads the K/V cache once for several Q heads of a
+    // K/V head. On HIP 4 or 8 heads per block are slower (register pressure). RX 6900 XT, us, 1 head -> 2 heads:
     // - Qwen3.5-9B (gqa 4), kv 20736: q8_0 498 -> 161, iq4_nl 429 -> 160, q4_1 620 -> 192;
     // - Qwen3.8-27B (gqa 6), kv 33280: q8_0 831 -> 261, iq4_nl 696 -> 266, q4_1 1067 -> 270, q5_1 342 -> 285.
     if constexpr (D == 256) {
-        if (ggml_cuda_flash_attn_ext_vec_use_gqa(dst)) {
-            ggml_cuda_flash_attn_ext_vec_case_impl<D, 2, 2, type_K, type_V, false>(ctx, dst);
-            return;
+        switch (ggml_cuda_flash_attn_ext_vec_gqa_heads(dst)) {
+            case 2:
+                ggml_cuda_flash_attn_ext_vec_case_impl<D, 2, 2, type_K, type_V, false>(ctx, dst);
+                return;
+#ifndef GGML_USE_HIP
+            case 3:
+                ggml_cuda_flash_attn_ext_vec_case_impl<D, 3, 3, type_K, type_V, false>(ctx, dst);
+                return;
+            case 4:
+                ggml_cuda_flash_attn_ext_vec_case_impl<D, 4, 4, type_K, type_V, false>(ctx, dst);
+                return;
+#endif // GGML_USE_HIP
+            default:
+                break;
         }
     }
-#endif // GGML_USE_HIP
 
     if (Q->ne[1] == 1) {
         constexpr int cols_per_block = 1;

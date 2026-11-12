@@ -12836,6 +12836,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {2, 1}, 1280, 260, true, sinks, 0, 0, GGML_PREC_F32, t, t, {0, 2, 1, 3}, false));
         }
     }
+    // single-token decode with a quantized KV cache and GQA: the CUDA vector kernel processes several Q heads of a K/V
+    // head in one block
+    for (ggml_type t : { GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL }) {
+        for (int gqa : { 2, 4, 6, 8 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {gqa, 1}, 1536, 1, true, false, 0, 0, GGML_PREC_F32, t, t));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 2, {6, 1}, 1536, 1, true, false, 0, 0, GGML_PREC_F32, t, t));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 1536, 1, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 2, 1, 3}, false));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 1536, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 1536, 1, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
