@@ -174,7 +174,8 @@ static __global__ void flash_attn_ext_vec(
     __align__(16) float2 Q_reg[ncols][(D/2)/nthreads_KQ] = {{{0.0f, 0.0f}}}; // May be only partially initialized.
 #endif // V_DOT2_F32_F16_AVAILABLE
     int    Q_i32[ncols][1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ)];
-    float2  Q_ds[ncols][1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ)];
+    constexpr int nthreads_KQ_ds = nthreads_KQ < QI8_1 ? QI8_1 : nthreads_KQ; // see fattn_vec_Q_ds_index
+    float2  Q_ds[ncols][1 > D/(sizeof(int)*nthreads_KQ_ds) ? 1 : D/(sizeof(int)*nthreads_KQ_ds)];
 
     ggml_cuda_pdl_sync();
     if constexpr (Q_q8_1) {
@@ -226,7 +227,7 @@ static __global__ void flash_attn_ext_vec(
                 const int i = i0 + (nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ);
 
                 Q_i32[j][i0/nthreads_KQ] = tmp_q_i32[i];
-                Q_ds[j][i0/nthreads_KQ]  = tmp_q_ds[i/QI8_1];
+                Q_ds[j][fattn_vec_Q_ds_index<nthreads_KQ>(i0)] = tmp_q_ds[i/QI8_1];
             }
         }
 
@@ -294,7 +295,17 @@ static __global__ void flash_attn_ext_vec(
             KQ_max_new[j] = KQ_max[j];
         }
 
-#pragma unroll
+        // GQA mode on NVIDIA: partial unrolling of the KQ and V loops keeps fewer K/V loads in flight (255 registers
+        // with spills otherwise). RTX 3090, us, full -> 2 / 8: gqa 4 kv 20736 q8_0 85 -> 65, iq4_nl 66 -> 55,
+        // 2 tokens 106 -> 95; gqa 6 kv 33280 q8_0 148 -> 142, 2 tokens iq4_nl 237 -> 213.
+#ifdef GGML_USE_HIP
+        constexpr int unroll_KQ = nthreads_KQ;
+        constexpr int unroll_V  = WARP_SIZE;
+#else
+        constexpr int unroll_KQ = ncols2 > 1 ? 2 : nthreads_KQ;
+        constexpr int unroll_V  = ncols2 > 1 ? 8 : WARP_SIZE;
+#endif // GGML_USE_HIP
+#pragma unroll unroll_KQ
         for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; ++i_KQ_0) {
             const int i_KQ = threadIdx.y*WARP_SIZE + (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ-1))) + i_KQ_0;
 
@@ -349,7 +360,7 @@ static __global__ void flash_attn_ext_vec(
 
         ggml_cuda_syncwarp(); // Needed for KQ synchronization.
 
-#pragma unroll
+#pragma unroll unroll_V
         for (int k0 = 0; k0 < WARP_SIZE; k0 += V_cols_per_iter) {
             const int k = threadIdx.y*WARP_SIZE + k0 + (nthreads_V == WARP_SIZE ? 0 : threadIdx.x / nthreads_V);
 

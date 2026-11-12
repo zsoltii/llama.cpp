@@ -183,6 +183,13 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_bf16(
     return sum;
 }
 
+// Index of the q8_1 scale/sum (ds) of Q for the int k_KQ_0 + threadIdx.x % nthreads: with fewer than QI8_1 threads
+// per K row, the consecutive ints of a thread share a q8_1 block, so one ds per block is kept (fewer registers).
+template <int nthreads>
+static constexpr __device__ int fattn_vec_Q_ds_index(const int k_KQ_0) {
+    return k_KQ_0 / (nthreads < QI8_1 ? QI8_1 : nthreads);
+}
+
 template<int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_0(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
@@ -207,7 +214,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_0(
 
         const int sumi = ggml_cuda_dp4a(v, u, 0);
 
-        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[fattn_vec_Q_ds_index<nthreads>(k_KQ_0)];
         sum += __half2float(K_q4_0[ib].d) * (sumi*Q_ds.x - (8/QI8_1)*Q_ds.y);
     }
 
@@ -239,7 +246,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_1(
         const int sumi = ggml_cuda_dp4a(v, u, 0);
 
         const float2 K_dm = __half22float2(K_q4_1[ib].dm);
-        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[fattn_vec_Q_ds_index<nthreads>(k_KQ_0)];
 
         sum += K_dm.x*Q_ds.x*sumi + K_dm.y*Q_ds.y/QI8_1;
     }
@@ -277,7 +284,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_iq4_nl(
                 const int sumi = ggml_cuda_dp4a(vt.y, u_hi, ggml_cuda_dp4a(vt.x, u_lo, 0));
 
                 // both halves belong to the same q8_1 block of Q
-                const float2 Q_ds = ((const float2 *) Q_ds_v)[(k_KQ_0 + l)/nthreads];
+                const float2 Q_ds = ((const float2 *) Q_ds_v)[fattn_vec_Q_ds_index<nthreads>(k_KQ_0 + l)];
                 sum += __half2float(K_iq4_nl[ib].d) * sumi*Q_ds.x;
             }
         }
@@ -300,7 +307,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_iq4_nl(
 
         const int sumi = ggml_cuda_dp4a(hi ? vt.y : vt.x, u, 0);
 
-        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[fattn_vec_Q_ds_index<nthreads>(k_KQ_0)];
         sum += __half2float(K_iq4_nl[ib].d) * sumi*Q_ds.x;
     }
 
@@ -344,7 +351,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q5_0(
 
         const int sumi = ggml_cuda_dp4a(v, u, 0);
 
-        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[fattn_vec_Q_ds_index<nthreads>(k_KQ_0)];
 
         sum += __half2float(K_q5_0[ib].d) * (sumi*Q_ds.x - (16/QI8_1)*Q_ds.y);
     }
@@ -390,7 +397,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q5_1(
         const int sumi = ggml_cuda_dp4a(v, u, 0);
 
         const float2 K_dm = __half22float2(K_q5_1[ib].dm);
-        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[fattn_vec_Q_ds_index<nthreads>(k_KQ_0)];
 
         sum += K_dm.x*Q_ds.x*sumi + K_dm.y*Q_ds.y/QI8_1;
     }
@@ -418,7 +425,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
         ggml_cuda_memcpy_1<sizeof(v), 2>(&v, K_q8_0[ib].qs + 4*iqs);
 
         const float2 * Q_ds = (const float2 *) Q_ds_v;
-        const float Q_d = Q_ds[k_KQ_0/nthreads].x;
+        const float Q_d = Q_ds[fattn_vec_Q_ds_index<nthreads>(k_KQ_0)].x;
 
         sum += vec_dot_q8_0_q8_1_impl<float, 1>(&v, &Q_q8[k_KQ_0/nthreads], K_q8_0[ib].d, Q_d);
     }
