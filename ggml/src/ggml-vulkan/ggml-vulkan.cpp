@@ -1222,6 +1222,13 @@ void ggml_vk_wait_events(vk_context& ctx, std::vector<vk::Event>&& events) {
     );
 }
 
+// NVIDIA with fp16 (Turing and newer, also TU117 without coopmat), decode/verify with head size 256 and 2-8 rows (GQA
+// heads): the scalar shader with one row group of n_rows rows beats coopmat1/coopmat2 tiles of 16-32 rows. Pascal (no
+// fp16, fp32 registers) is not covered.
+static bool ggml_vk_fa_nvidia_decode_256(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows) {
+    return device->vendor_id == VK_VENDOR_ID_NVIDIA && device->fp16 && hsk == 256 && hsv == 256 && n_rows >= 2 && n_rows <= 8;
+}
+
 static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
 
     vk_fa_tuning_params result{};
@@ -1370,6 +1377,24 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
         }
     }
 
+    // NVIDIA decode with head size 256 (the GQA heads of one KV head as rows): one row group of
+    // 128 threads with exactly n_rows rows and 16-key blocks. kv 33280 gqa 6, f16 / q8_0 / q4_0 / iq4_nl, us:
+    // RTX 3090 (coopmat2) 228 / 252 / 241 / 268 -> 180 / 138 / 135 / 175, T1200 (scalar) 1336 / 2081 / 1703 / 2744 ->
+    // 1219 / 1102 / 1061 / 1267
+    if (ggml_vk_fa_nvidia_decode_256(device, hsk, hsv, n_rows)) {
+        vk_fa_tuning_params tuned = result;
+        tuned.block_rows     = n_rows;
+        tuned.block_cols     = 16;
+        tuned.row_split      = 1;
+        tuned.workgroup_size = 128;
+        tuned.d_split        = 16;
+        tuned.shmem_staging  = 0;
+        tuned.limit_occupancy_shmem = 0;
+        if (ggml_vk_flash_attn_scalar_shmem_support(device, tuned, hsk, hsv, f32acc, k_type, v_type)) {
+            result = tuned;
+        }
+    }
+
     return result;
 }
 
@@ -1469,7 +1494,7 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
     }
 
     // scalar is faster than coopmat when N==1
-    if (n_rows == 1 && (path == FA_COOPMAT1 || path == FA_COOPMAT2)) {
+    if ((n_rows == 1 || ggml_vk_fa_nvidia_decode_256(device, hsk, hsv, n_rows)) && (path == FA_COOPMAT1 || path == FA_COOPMAT2)) {
         path = FA_SCALAR;
     }
 
@@ -8966,6 +8991,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         } else {
             fa_wg_per_core_default = 2u;
         }
+    }
+    // NVIDIA hd256 decode tile (see get_fa_tuning_params_scalar): RTX 3090 kv 33280 gqa 6 iq4_nl 195 -> 175 us with 4
+    if (tuning_params.path == FA_SCALAR && ggml_vk_fa_nvidia_decode_256(ctx->device, HSK, HSV, Br) && Br == N) {
+        fa_wg_per_core_default = 4u;
     }
     const uint32_t fa_wg_per_core = fa_wg_per_core_env ? (uint32_t) fa_wg_per_core_env : fa_wg_per_core_default;
     const uint32_t fa_min_kv_per_split = fa_min_kv_per_split_env ? (uint32_t) fa_min_kv_per_split_env :
