@@ -1256,6 +1256,8 @@ struct ggml_backend_vk_context {
     size_t semaphore_idx, binary_semaphore_idx, event_idx;
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
+    // smallest f16 FA K/V scratch size that did not fit into the free device memory (0: none yet)
+    uint64_t fa_scratch_denied_size;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};

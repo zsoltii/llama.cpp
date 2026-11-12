@@ -5898,6 +5898,7 @@ void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->event_idx = 0;
 
     ctx->prealloc_size_x = 0;
+    ctx->fa_scratch_denied_size = 0;
     ctx->prealloc_size_y = 0;
     ctx->prealloc_size_split_k = 0;
     // Fixed size of 1KB, for deterministic behavior
@@ -8560,6 +8561,86 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     return supported;
 }
 
+// The f16 K/V scratch of the FA prefill grows with the context (Qwen3.8-27B at 128k: 524 MiB for K+V) and is not
+// part of the scheduler's reservation. Over-committed VRAM made the driver page buffers out (stalls of several seconds
+// per ubatch on an RX 6900 XT with a full card), so the scratch only grows while the device has room, in 64 MiB steps.
+// When the whole KV does not fit, the scratch holds one chunk of keys at a time and the attention state goes from
+// chunk to chunk through two split_k slots (chunk_ok: prefill shapes the KV chunk mode of the shader supports).
+// Returns false if the quantized cache has to be read directly. Otherwise *kv_chunk is the number of keys per chunk,
+// 0 for all of KV at once.
+static bool ggml_vk_fa_scratch_plan(ggml_backend_vk_context * ctx, uint32_t KV, uint64_t bytes_per_key, uint64_t split_slot_bytes,
+                                    bool chunk_ok, uint32_t * kv_chunk) {
+    const uint64_t margin = 32ull << 20;
+    const uint64_t step   = 64ull << 20;
+    const uint64_t max_alloc = std::min<uint64_t>(ctx->device->max_buffer_size, ctx->device->max_memory_allocation_size);
+    const uint64_t have_x = std::max<uint64_t>(ctx->prealloc_size_x, ctx->prealloc_x != nullptr ? ctx->prealloc_x->size : 0);
+    const uint64_t have_s = std::max<uint64_t>(ctx->prealloc_size_split_k, ctx->prealloc_split_k != nullptr ? ctx->prealloc_split_k->size : 0);
+    const uint64_t full = (uint64_t) KV * bytes_per_key;
+
+    *kv_chunk = 0;
+
+    // GGML_VK_FA_KV_CHUNK=N: chunks of N keys (rounded up to 256) whenever possible, for testing
+    static const uint32_t forced_chunk = [] {
+        const char * env = getenv("GGML_VK_FA_KV_CHUNK");
+        return env ? (uint32_t) ((std::max(1, atoi(env)) + 255) / 256 * 256) : 0u;
+    }();
+    if (forced_chunk != 0 && chunk_ok && KV % 256 == 0 && KV > forced_chunk) {
+        ctx->prealloc_size_x = std::max<uint64_t>(have_x, (uint64_t) forced_chunk * bytes_per_key);
+        *kv_chunk = forced_chunk;
+        return true;
+    }
+
+    if (full <= have_x) {
+        return true;
+    }
+
+    // free device memory, counting the scratch buffers that are freed before they are reallocated
+    auto avail = [&]() {
+        size_t free = 0, total = 0;
+        ggml_backend_vk_get_device_memory(ctx->device->idx, &free, &total);
+        return (uint64_t) free + (ctx->prealloc_x != nullptr ? ctx->prealloc_x->size : 0) +
+               (ctx->prealloc_split_k != nullptr ? ctx->prealloc_split_k->size : 0);
+    };
+    uint64_t mem = 0;
+    if (ctx->fa_scratch_denied_size == 0 || full < ctx->fa_scratch_denied_size) {
+        mem = avail();
+        const uint64_t padded = std::min<uint64_t>((full + step - 1) / step * step, max_alloc);
+        if (full <= max_alloc && mem >= full + have_s + margin) {
+            ctx->prealloc_size_x = mem >= padded + have_s + margin ? padded : full;
+            return true;
+        }
+        ctx->fa_scratch_denied_size = full;
+    }
+    if (!chunk_ok || KV % 256 != 0) {
+        return false;
+    }
+
+    // as many keys per chunk (a multiple of 256) as the scratch holds, growing it to the free memory once
+    const uint64_t need_s = 2 * split_slot_bytes;
+    if (need_s > ctx->device->properties.limits.maxStorageBufferRange) {
+        return false;
+    }
+    const uint64_t max_chunk = (uint64_t) (CEIL_DIV(KV, 2) + 255) / 256 * 256;
+    uint64_t chunk = std::min<uint64_t>(have_x / bytes_per_key / 256 * 256, max_chunk);
+    if (chunk < 1024 || need_s > have_s) {
+        if (mem == 0) {
+            mem = avail();
+        }
+        const uint64_t s_bytes = std::max(need_s, have_s);
+        if (mem < s_bytes + margin) {
+            return false;
+        }
+        const uint64_t x_bytes = std::min<uint64_t>(std::max(mem - s_bytes - margin, have_x), max_alloc);
+        chunk = std::min<uint64_t>(x_bytes / bytes_per_key / 256 * 256, max_chunk);
+    }
+    if (chunk < 512) {
+        return false;
+    }
+    ctx->prealloc_size_x = std::max<uint64_t>(have_x, chunk * bytes_per_key);
+    *kv_chunk = (uint32_t) chunk;
+    return true;
+}
+
 void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
@@ -8640,7 +8721,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     const size_t kv_scratch_ts = kv_raw_strided ? ggml_type_size(k->type) : sizeof(ggml_fp16_t);
     // K and V share one scratch buffer, so the sum must fit in one allocation
     const uint64_t dequant_kv_sz = ((uint64_t)ggml_nelements(k) + (uint64_t)ggml_nelements(v)) * kv_scratch_ts;
-    const bool use_dequant_kv = ((k_quant && v_quant) || kv_raw_strided) && neq1 >= 64 &&
+    bool use_dequant_kv = ((k_quant && v_quant) || kv_raw_strided) && neq1 >= 64 &&
                                 is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
                                 (uint64_t)ggml_nelements(k) * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
                                 (uint64_t)ggml_nelements(v) * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
@@ -8654,6 +8735,19 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                                 // Intel Xe1 regresses, see PR 25494
                                 (ctx->device->vendor_id != VK_VENDOR_ID_INTEL ||
                                  (ctx->device->coopmat_support && ctx->device->architecture != vk_device_architecture::INTEL_XE1));
+    // keys per chunk of the f16 scratch, 0: all of KV at once
+    uint32_t kv_chunk = 0;
+    if (use_dequant_kv) {
+        // prefill only (no GQA rows, no sparse mask), one batch, one mask, and only the scalar shader has the chunk mode
+        const bool chunk_ok = mask != nullptr && nek3 == 1 && nev3 == 1 && neq3 == 1 && nem0 == KV && nem2 == 1 && nem3 == 1 &&
+                              mask->nb[1] == (size_t) nem0 * sizeof(ggml_fp16_t) &&
+                              get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV,
+                                                   kv_raw_strided ? k->type : GGML_TYPE_F16,
+                                                   kv_raw_strided ? v->type : GGML_TYPE_F16, f32acc).path == FA_SCALAR;
+        const uint64_t bytes_per_key = ((uint64_t) HSK * nek2 + (uint64_t) HSV * nev2) * kv_scratch_ts;
+        const uint64_t split_slot_bytes = ((uint64_t) HSV * ne1 * sizeof(float) + ne1 * sizeof(float) * 2) * ne2 * ne3;
+        use_dequant_kv = ggml_vk_fa_scratch_plan(ctx, KV, bytes_per_key, split_slot_bytes, chunk_ok, &kv_chunk);
+    }
     const ggml_type k_type_eff = (use_dequant_kv && !kv_raw_strided) ? GGML_TYPE_F16 : k->type;
     const ggml_type v_type_eff = (use_dequant_kv && !kv_raw_strided) ? GGML_TYPE_F16 : v->type;
 
@@ -8915,9 +9009,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     static const bool fa_debug = getenv("GGML_VK_FA_DEBUG") != nullptr;
     if (fa_debug) {
-        fprintf(stderr, "ggml_vulkan: FA N=%u KV=%u gqa=%u K=%s V=%s path=%d Br=%u Bc=%u wg=(%u,%u,%u) split_k=%u dequant_kv=%d sparse=%d\n",
+        fprintf(stderr, "ggml_vulkan: FA N=%u KV=%u gqa=%u K=%s V=%s path=%d Br=%u Bc=%u wg=(%u,%u,%u) split_k=%u dequant_kv=%d kv_chunk=%u sparse=%d\n",
                 N, KV, gqa_ratio, ggml_type_name(k->type), ggml_type_name(v->type), (int) tuning_params.path, Br, Bc,
-                workgroups_x, workgroups_y, workgroups_z, split_k, (int) use_dequant_kv, (int) use_sparse);
+                workgroups_x, workgroups_y, workgroups_z, split_k, (int) use_dequant_kv, kv_chunk,
+                (int) use_sparse);
     }
 
     if (!use_sparse && split_k > 1) {
@@ -8958,6 +9053,14 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                 }
             }
         }
+    }
+
+    if (kv_chunk != 0) {
+        // two split_k slots carry the state from chunk to chunk, split_kv is the mask row length
+        // (see KV_CHUNK_BIT in flash_attn_base.glsl)
+        split_k  = 2;
+        split_kv = KV;
+        xe_fa_opt = false;
     }
 
     if (xe_fa_opt == true) {
@@ -9041,11 +9144,13 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         ctx->prealloc_y_last_tensor_used = nullptr;
     }
 
-    if (use_dequant_kv) {
+    if (use_dequant_kv && kv_chunk == 0) {
         const uint64_t k_sz = (uint64_t)ggml_nelements(k) * kv_scratch_ts;
         const uint64_t v_sz = (uint64_t)ggml_nelements(v) * kv_scratch_ts;
         if (ctx->prealloc_size_x < k_sz + v_sz) {
             ctx->prealloc_size_x = k_sz + v_sz;
+        }
+        if (ctx->prealloc_x == nullptr || ctx->prealloc_x->size < ctx->prealloc_size_x) {
             ggml_vk_preallocate_buffers(ctx, subctx);
         }
         vk_subbuffer k_dst = vk_subbuffer{ ctx->prealloc_x, 0,    k_sz };
@@ -9099,23 +9204,29 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | n_head_log2;
 
-    if (use_mask_opt)
-    {
+    // mask opt bits for the mask columns [0, n0) of mask_sub
+    auto dispatch_mask_opt = [&](const vk_subbuffer & mask_sub, uint32_t n0) {
+        const uint32_t num_dwords = CEIL_DIV(n0, 16 * Bc);
         const vk_op_flash_attn_mask_opt_push_constants opt_pc = {
-            nem0,
+            n0,
             nem1,
             nem2,
             (uint32_t)(mask->nb[1] / sizeof(ggml_fp16_t)),
             (uint32_t)(mask->nb[2] / sizeof(ggml_fp16_t)),
             (uint32_t)(mask->nb[3] / sizeof(ggml_fp16_t)),
-            mask_opt_num_dwords,
-            mask_opt_num_dwords * CEIL_DIV(nem1, Br),
-            mask_opt_num_dwords * CEIL_DIV(nem1, Br) * nem2,
+            num_dwords,
+            num_dwords * CEIL_DIV(nem1, Br),
+            num_dwords * CEIL_DIV(nem1, Br) * nem2,
         };
 
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline_fa_mask_opt,
-                                  { mask_buf, mask_opt_buf }, opt_pc,
-                                  { mask_opt_num_dwords, CEIL_DIV(nem1, Br), nem2 * nem3 });
+                                  { mask_sub, mask_opt_buf }, opt_pc,
+                                  { num_dwords, CEIL_DIV(nem1, Br), nem2 * nem3 });
+    };
+
+    if (use_mask_opt && kv_chunk == 0)
+    {
+        dispatch_mask_opt(mask_buf, nem0);
         ggml_vk_sync_buffers(ctx, subctx);
     }
 
@@ -9150,7 +9261,89 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                                               mask_n_head_log2, m0, m1,
                                               gqa_ratio, split_kv, split_k };
 
-    if (xe_fa_opt && split_k > 1) {
+    if (kv_chunk != 0) {
+        // KV chunk mode (see ggml_vk_fa_scratch_plan): dequantize one chunk of keys into the scratch and attend to it,
+        // continuing from the state the previous chunk left in the other split_k slot.
+        vk_pipeline cp_k, cp_v;
+        if (kv_raw_strided) {
+            cp_k = ggml_vk_get_cpy_pipeline(ctx, k, nullptr, k->type);
+            cp_v = ggml_vk_get_cpy_pipeline(ctx, v, nullptr, v->type);
+        } else {
+            cp_k = ctx->device->pipeline_dequant_transpose[k->type];
+            cp_v = ctx->device->pipeline_dequant_transpose[v->type];
+        }
+        const uint32_t n_chunks = CEIL_DIV(KV, kv_chunk);
+        ggml_pipeline_request_descriptor_sets(ctx, cp_k, n_chunks);
+        ggml_pipeline_request_descriptor_sets(ctx, cp_v, n_chunks);
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, n_chunks);
+        if (use_mask_opt) {
+            ggml_pipeline_request_descriptor_sets(ctx, pipeline_fa_mask_opt, n_chunks);
+        }
+
+        if (ctx->prealloc_size_x > (ctx->prealloc_x != nullptr ? ctx->prealloc_x->size : 0)) {
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        ggml_vk_sync_buffers(ctx, subctx);
+
+        auto make_cpy_pc = [](uint32_t hs, uint32_t nh, uint32_t kv, uint32_t nel) {
+            vk_op_unary_push_constants upc{};
+            upc.ne = nel;
+            upc.ne00 = hs; upc.ne01 = nh;      upc.ne02 = kv; upc.ne03 = 1;
+            upc.nb00 = 1;  upc.nb01 = hs;      upc.nb02 = hs * nh; upc.nb03 = hs * nh * kv;
+            upc.ne10 = hs; upc.ne11 = nh;      upc.ne12 = kv; upc.ne13 = 1;
+            upc.nb10 = 1;  upc.nb11 = hs * kv; upc.nb12 = hs; upc.nb13 = hs * kv * nh;
+            init_pushconst_fastdiv(upc);
+            return upc;
+        };
+        auto cpy_elems = [](uint32_t ne) -> std::array<uint32_t, 3> {
+            if (ne > 262144) { return { 512, 512, CEIL_DIV(ne, 262144) }; }
+            if (ne > 512)    { return { 512, CEIL_DIV(ne, 512), 1 }; }
+            return { ne, 1, 1 };
+        };
+
+        vk_subbuffer split_k_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+        for (uint32_t c = 0; c < n_chunks; ++c) {
+            const uint32_t kv0 = c * kv_chunk;
+            const uint32_t len = std::min(kv_chunk, KV - kv0);
+            const uint32_t k_nel = len * HSK * (uint32_t) nek2;
+            const uint32_t v_nel = len * HSV * (uint32_t) nev2;
+            const vk_subbuffer k_src = { k_buf.buffer, k_buf.offset + (uint64_t) kv0 * nbk1, (uint64_t) len * nbk1 };
+            const vk_subbuffer v_src = { v_buf.buffer, v_buf.offset + (uint64_t) kv0 * nbv1, (uint64_t) len * nbv1 };
+            const vk_subbuffer k_dst = { ctx->prealloc_x, 0,                            (uint64_t) k_nel * kv_scratch_ts };
+            const vk_subbuffer v_dst = { ctx->prealloc_x, (uint64_t) k_nel * kv_scratch_ts, (uint64_t) v_nel * kv_scratch_ts };
+            const vk_subbuffer m_sub = { mask_buf.buffer, mask_buf.offset + (uint64_t) kv0 * sizeof(ggml_fp16_t),
+                                         mask_buf.size - (uint64_t) kv0 * sizeof(ggml_fp16_t) };
+
+            if (kv_raw_strided) {
+                ggml_vk_dispatch_pipeline(ctx, subctx, cp_k, { k_src, k_dst }, make_cpy_pc(HSK, (uint32_t) nek2, len, k_nel), cpy_elems(k_nel));
+                ggml_vk_dispatch_pipeline(ctx, subctx, cp_v, { v_src, v_dst }, make_cpy_pc(HSV, (uint32_t) nev2, len, v_nel), cpy_elems(v_nel));
+            } else {
+                { const std::vector<uint32_t> tpc = { HSK, (uint32_t) nek2, len, 0, k_nel };
+                  ggml_vk_dispatch_pipeline(ctx, subctx, cp_k, { k_src, k_dst }, tpc, { k_nel, 1, 1 }); }
+                { const std::vector<uint32_t> tpc = { HSV, (uint32_t) nev2, len, 0, v_nel };
+                  ggml_vk_dispatch_pipeline(ctx, subctx, cp_v, { v_src, v_dst }, tpc, { v_nel, 1, 1 }); }
+            }
+            if (use_mask_opt) {
+                dispatch_mask_opt(m_sub, len);
+            }
+            ggml_vk_sync_buffers(ctx, subctx);
+
+            vk_flash_attn_push_constants cpc = pc;
+            cpc.KV   = len;
+            cpc.nb12 = HSK * len * (uint32_t) kv_scratch_ts;
+            cpc.nb22 = HSV * len * (uint32_t) kv_scratch_ts;
+            // KV_CHUNK_BIT, KV_CHUNK_LOAD, KV_CHUNK_SLOT, KV_CHUNK_FINAL in flash_attn_base.glsl
+            const bool last = c + 1 == n_chunks;
+            cpc.mask_n_head_log2 |= (1u << 25) | (c > 0 ? 1u << 26 : 0u) | ((c & 1) ? 1u << 27 : 0u) | (last ? 1u << 28 : 0u);
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                        {q_buf, k_dst, v_dst, m_sub, sinks_buf, last ? dst_buf : split_k_buf, mask_opt_buf, split_k_buf},
+                                        cpc, { Tr * pipeline->wg_denoms[0], workgroups_y, workgroups_z });
+            // the next chunk overwrites the scratch and the mask opt bits, and reads the state
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        ctx->prealloc_split_k_need_sync = true;
+        ctx->prealloc_x_need_sync = true;
+    } else if (xe_fa_opt && split_k > 1) {
         auto upper_power_of_2 = [&](uint32_t in) {
             GGML_ASSERT(in != 0);
             if (in <= 1) return 1u;

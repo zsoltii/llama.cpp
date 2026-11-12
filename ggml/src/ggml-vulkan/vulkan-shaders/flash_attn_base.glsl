@@ -78,6 +78,14 @@ layout (push_constant) uniform parameter {
 
 #define SINK_ENABLE_BIT (1<<24)
 #define N_LOG2_MASK 0xFFFF
+// KV chunk mode (scalar path, no GQA rows): K/V hold only one chunk of KV (p.KV is its length), the mask binding
+// starts at the chunk and split_kv is the full mask row length. The O, L, M state is passed from chunk to chunk in
+// two split_k slots (k_num == 2): a chunk writes slot KV_CHUNK_SLOT, reads the other one through binding 7 if
+// KV_CHUNK_LOAD is set, and the last chunk (KV_CHUNK_FINAL) writes the normalized result to dst instead.
+#define KV_CHUNK_BIT   (1<<25)
+#define KV_CHUNK_LOAD  (1<<26)
+#define KV_CHUNK_SLOT  (1<<27)
+#define KV_CHUNK_FINAL (1<<28)
 
 layout (binding = 4) readonly buffer S {float data_s[];};
 
@@ -180,8 +188,16 @@ void init_indices()
 
     Tr = CEIL_DIV(N, Br);
 
-    start_j = split_k_index * p.split_kv / Bc;
-    end_j = CEIL_DIV(min(KV, (split_k_index + 1) * p.split_kv), Bc);
+    const bool kv_chunk = (p.mask_n_head_log2 & KV_CHUNK_BIT) != 0;
+    if (kv_chunk) {
+        i = gl_WorkGroupID.x;
+        split_k_index = (p.mask_n_head_log2 & KV_CHUNK_SLOT) != 0 ? 1 : 0;
+        start_j = 0;
+        end_j = CEIL_DIV(KV, Bc);
+    } else {
+        start_j = split_k_index * p.split_kv / Bc;
+        end_j = CEIL_DIV(min(KV, (split_k_index + 1) * p.split_kv), Bc);
+    }
 
     // When not using grouped query attention, all rows share the same iq2, equal to gl_WorkGroupID.y.
     // When using grouped query attention, each workgroup does gqa_ratio consecutive values of iq2.
@@ -213,7 +229,7 @@ void init_indices()
     // "p.gqa_ratio >> 16" is just a roundabout way of writing zero
     // that prevents the compiler from folding the "&" through the select
     // and breaking the alignment detection.
-    m_stride = (p.gqa_ratio > 1) ? (p.gqa_ratio >> 16) : KV;
+    m_stride = (p.gqa_ratio > 1) ? (p.gqa_ratio >> 16) : (kv_chunk ? p.split_kv : KV);
 
     // Sparse: the tile shares one mask row (gqa heads, or Br==1). split_k
     // partitions the n_kv_max blocks.
