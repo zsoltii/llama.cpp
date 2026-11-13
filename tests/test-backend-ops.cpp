@@ -10772,6 +10772,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     }
                 }
             }
+            // non-overlapping windows of 64+ values (the row max of build_amax_src1_f16): one block per output on CUDA
+            test_cases.emplace_back(new test_pool1d(pool_type, type_input, { 5120, 6, 2, 1 }, 5120, 5120, 0));
+            test_cases.emplace_back(new test_pool1d(pool_type, type_input, { 300, 4, 3, 1 }, 100, 100, 0));
+            test_cases.emplace_back(new test_pool1d(pool_type, type_input, { 1000, 3, 1, 1 }, 64, 64, 0));
         }
     }
 
