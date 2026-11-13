@@ -1229,6 +1229,16 @@ static bool ggml_vk_fa_nvidia_decode_256(const vk_device& device, uint32_t hsk, 
     return device->vendor_id == VK_VENDOR_ID_NVIDIA && device->fp16 && hsk == 256 && hsv == 256 && n_rows >= 2 && n_rows <= 8;
 }
 
+// NVIDIA with coopmat, verify of a few tokens with head size 256 and a 4 bit K/V: the tokens of one KV head share the
+// 16-row coopmat1 tile (e.g. 2 tokens x gqa 6 = 12 rows) and so read the K/V cache once, see the token merge in
+// ggml_vk_flash_attn. The scalar n_rows tile reads it once per token. RTX 3090, kv 33280, gqa 6, 2 tokens, us:
+// iq4_nl 311 -> 231 (q8_0 is no faster: 239 -> 248).
+static bool ggml_vk_fa_nvidia_verify_cm1(const vk_device& device, uint32_t hsk, uint32_t hsv, ggml_type k_type, ggml_type v_type) {
+    return device->vendor_id == VK_VENDOR_ID_NVIDIA && device->coopmat1_fa_support && device->fp16 &&
+           device->architecture != vk_device_architecture::NVIDIA_TURING && hsk == 256 && hsv == 256 &&
+           k_type == v_type && (k_type == GGML_TYPE_IQ4_NL || k_type == GGML_TYPE_Q4_0);
+}
+
 static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc) {
 
     vk_fa_tuning_params result{};
@@ -1490,6 +1500,15 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
 
         if (!shape_ok || !shmem_ok) {
             path = FA_SCALAR;
+        }
+    }
+
+    // the merged verify tokens (see ggml_vk_fa_nvidia_verify_cm1)
+    if (path == FA_COOPMAT2 && n_rows > 8 && n_rows <= 16 && ggml_vk_fa_nvidia_verify_cm1(device, hsk, hsv, k_type, v_type)) {
+        path = FA_COOPMAT1;
+        const vk_fa_tuning_params params = get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc);
+        if (ggml_vk_fa_cm1_m(device, f32acc) == 0 || !ggml_vk_flash_attn_coopmat_shmem_support(device, params, hsk, hsv, f32acc, k_type, v_type)) {
+            path = FA_COOPMAT2;
         }
     }
 
@@ -3118,6 +3137,9 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     } else if (device->vendor_id == VK_VENDOR_ID_INTEL) {
         rm_stdq = 2;
+        rm_stdq_int = 2;
+    } else if (device->vendor_id == VK_VENDOR_ID_NVIDIA && device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) {
+        // RTX 3090, iq4_xs 17408 x 5120 (8 matrices from VRAM): 653 -> 718 GB/s; Qwen3.8-27B UD-IQ4_XS tg128 37.3 -> 38.7
         rm_stdq_int = 2;
     }
     // Experimental: override the number of K rows processed per shader for k-quants and IQ types.
@@ -8835,8 +8857,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // (4 of 16 rows), so up to 16 / gqa_ratio tokens fill it and share the K/V reads.
     // Arc Pro B50, kv=20736, head 256, GQA 4, 2 / 3 tokens, us: q8_0 1220/1805 -> 722/743, q4_0 1247/1689 -> 698/724,
     // q4_1 1020/1526 -> 666/682, q5_0 1449/2206 -> 837/860, q5_1 1168/1843 -> 764/783, iq4_nl 1211/1837 -> 727/744.
-    if (gqa_ratio > 1 && neq1 > 1 && fa_gqa_tokens > 1 && ctx->device->vendor_id == VK_VENDOR_ID_INTEL &&
-            ctx->device->architecture == vk_device_architecture::INTEL_XE2 &&
+    // NVIDIA: only where coopmat1 is the faster verify path (ggml_vk_fa_nvidia_verify_cm1).
+    if (gqa_ratio > 1 && neq1 > 1 && fa_gqa_tokens > 1 && ((ctx->device->vendor_id == VK_VENDOR_ID_INTEL &&
+            ctx->device->architecture == vk_device_architecture::INTEL_XE2) ||
+            (gqa_ratio > 4 && ggml_vk_fa_nvidia_verify_cm1(ctx->device, HSK, HSV, k_type_eff, v_type_eff))) &&
             !(mask && ggml_get_op_params_i32(dst, 4) > 0)) {
         uint32_t gqa_T = std::min<uint32_t>(neq1, fa_gqa_tokens);
         vk_fa_tuning_params merged = get_fa_tuning_params(ctx->device, HSK, HSV, gqa_T * gqa_ratio, KV, k_type_eff, v_type_eff, f32acc);
@@ -8995,6 +9019,11 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     // NVIDIA hd256 decode tile (see get_fa_tuning_params_scalar): RTX 3090 kv 33280 gqa 6 iq4_nl 195 -> 175 us with 4
     if (tuning_params.path == FA_SCALAR && ggml_vk_fa_nvidia_decode_256(ctx->device, HSK, HSV, Br) && Br == N) {
         fa_wg_per_core_default = 4u;
+    }
+    // the merged coopmat1 verify: 1 or 2 per core, 16: iq4_nl 251 -> 231 us
+    if (tuning_params.path == FA_COOPMAT1 && ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA &&
+            ggml_vk_fa_nvidia_verify_cm1(ctx->device, HSK, HSV, k_type_eff, v_type_eff)) {
+        fa_wg_per_core_default = 2u;
     }
     const uint32_t fa_wg_per_core = fa_wg_per_core_env ? (uint32_t) fa_wg_per_core_env : fa_wg_per_core_default;
     const uint32_t fa_min_kv_per_split = fa_min_kv_per_split_env ? (uint32_t) fa_min_kv_per_split_env :
