@@ -13891,6 +13891,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1}));
     // the same shapes with 8 different matrices, so the weights do not fit in a large last level cache (RDNA2 Infinity
     // Cache, 128 MB) and the kernel reads them from VRAM as in the model
+    // n = 2 without batching: the Vulkan mat-vec takes n > 1 only for a single matrix (ne2 * ne3 == 1)
+    for (ggml_type t : { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
+        for (auto mk : std::vector<std::array<int, 2>>{ {17408, 5120}, {5120, 17408} }) {
+            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, mk[0], 2, mk[1], {1, 1}, {1, 1}));
+        }
+    }
     // n = 2: MTP verify
     for (ggml_type t : { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q3_K }) {
         for (auto mk : std::vector<std::array<int, 2>>{ {17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120}, {5120, 6144} }) {
