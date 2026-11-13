@@ -3106,6 +3106,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         res = std::max<uint32_t>(1024u, 12u*model.n_tensors());
     } else {
         res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+        // fused QKV / gate-up weights leave few tensors per layer, while a quantized V cache adds nodes per layer:
+        // Phi-4 (243 tensors, 40 layers) with -ctv q8_0 overflowed the scheduler hash set at 8 nodes per tensor
+        res = std::max<uint32_t>(res, 64u*model.hparams.n_layer());
         for (const auto & lora : model.loras) {
             res += lora->get_n_nodes();
         }
