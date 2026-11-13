@@ -8786,11 +8786,12 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                                 (kv_raw_strided ||
                                  (ctx->device->pipeline_dequant_transpose[k->type] != nullptr &&
                                   ctx->device->pipeline_dequant_transpose[v->type] != nullptr)) &&
-                                // coopmat2 path does not benefit from the f16 scratch, except with MLA head sizes:
-                                // its in-shader dequant of K for every block of rows is the limit there. RTX 3090,
-                                // GLM-4.7-Flash, 20 heads, kv 16384, 512 rows, q8_0: 111 -> 28.2 ms (f16 KV 27.7 ms).
-                                // Not for decode: 246 -> 274 us
-                                (!ctx->device->coopmat2 || (v_view_of_k && HSK > 256)) &&
+                                // coopmat2 path does not benefit from the f16 scratch, except with head sizes above 256:
+                                // its in-shader dequant of K / V for every block of rows is the limit there. RTX 3090,
+                                // GLM-4.7-Flash (MLA 576/512), 20 heads, kv 16384, 512 rows, q8_0: 111 -> 28.2 ms (f16 KV
+                                // 27.7 ms); gemma-4-12b (512 in the global layers) pp512 @ d16384 1114 -> 1388 t/s.
+                                // Not for decode (MLA: 246 -> 274 us).
+                                (!ctx->device->coopmat2 || HSK > 256) &&
                                 // Intel Xe1 regresses, see PR 25494
                                 (ctx->device->vendor_id != VK_VENDOR_ID_INTEL ||
                                  (ctx->device->coopmat_support && ctx->device->architecture != vk_device_architecture::INTEL_XE1));
