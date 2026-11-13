@@ -465,14 +465,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_quant_dequant_row(
 #endif // FP16_AVAILABLE
 }
 
-// KV points to the quantized rows of one K/V head, stride_KV is in bytes. The rows must be 16 byte aligned.
+// KV points to the quantized rows of one K/V head, stride_KV is in bytes. The rows must be 16 byte aligned, or 8 byte
+// aligned if the row size is not a multiple of 16 (head size 128).
 template<int KV_type, int D, int nwarps, int nbatch_fa>
 static __device__ __forceinline__ void flash_attn_ext_f16_quant_preload(
         const char * const __restrict__ KV, char * const __restrict__ raw, const int stride_KV,
         const int k_VKQ_0, const int32_t * const __restrict__ indices) {
     constexpr int warp_size      = ggml_cuda_get_physical_warp_size();
-    constexpr int chunk_size     = 16;
     constexpr int row_bytes      = flash_attn_ext_f16_quant_row_bytes<KV_type>(D);
+    constexpr int chunk_size     = row_bytes % 16 == 0 ? 16 : 8;
     constexpr int chunks_per_row = row_bytes / chunk_size;
     constexpr int nchunks        = nbatch_fa * chunks_per_row;
     constexpr int nthreads       = nwarps * warp_size;
@@ -490,20 +491,27 @@ static __device__ __forceinline__ void flash_attn_ext_f16_quant_preload(
         const int i = c / chunks_per_row;
         const int j = c % chunks_per_row;
         const int64_t i_KV = indices ? max(indices[k_VKQ_0 + i], 0) : k_VKQ_0 + i;
-        cp_async_cg_16<preload>(raw_32 + c*chunk_size, KV + i_KV*stride_KV + j*chunk_size);
+        if constexpr (chunk_size == 16) {
+            cp_async_cg_16<preload>(raw_32 + c*chunk_size, KV + i_KV*stride_KV + j*chunk_size);
+        } else {
+            cp_async_ca_8(raw_32 + c*chunk_size, KV + i_KV*stride_KV + j*chunk_size);
+        }
     }
 }
 
 template<int KV_type, int D, int stride_tile, int nwarps, int nbatch_fa>
 static __device__ __forceinline__ void flash_attn_ext_f16_quant_dequant(const char * const __restrict__ raw, half2 * const __restrict__ tile_KV) {
-    constexpr int row_bytes = flash_attn_ext_f16_quant_row_bytes<KV_type>(D);
-    static_assert(D == 8*ggml_cuda_get_physical_warp_size(), "one chunk of 8 values per thread and row");
-    static_assert(nbatch_fa % nwarps == 0, "bad nbatch_fa");
+    constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
+    constexpr int row_bytes       = flash_attn_ext_f16_quant_row_bytes<KV_type>(D);
+    constexpr int threads_per_row = D/8; // one chunk of 8 values per thread and row
+    constexpr int rows_per_warp   = warp_size/threads_per_row;
+    static_assert(warp_size % threads_per_row == 0, "bad head size");
+    static_assert(nbatch_fa % (nwarps*rows_per_warp) == 0, "bad nbatch_fa");
 
-    const int k = threadIdx.x;
+    const int k = threadIdx.x % threads_per_row;
 #pragma unroll
-    for (int i0 = 0; i0 < nbatch_fa; i0 += nwarps) {
-        const int i = i0 + threadIdx.y;
+    for (int i0 = 0; i0 < nbatch_fa; i0 += nwarps*rows_per_warp) {
+        const int i = i0 + threadIdx.y*rows_per_warp + threadIdx.x/threads_per_row;
         flash_attn_ext_f16_quant_dequant_row<KV_type, stride_tile>(raw + i*row_bytes, tile_KV + i*stride_tile, i, k);
     }
 }

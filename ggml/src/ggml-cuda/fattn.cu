@@ -583,6 +583,8 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
 //   gqa 6, kv 33280, 1 token:  iq4_nl 142 ->  87, q4_0 124 -> 83, q8_0 142 -> 108
 //   gqa 6, kv 33280, 2 tokens: iq4_nl 211 -> 100, q4_0 205 -> 93, q8_0 207 -> 110
 //   gqa 4, kv 20736, 2 tokens: iq4_nl  95 ->  59, q4_0  94 -> 57, q8_0  96 ->  82; 1 token stays on the vector kernel
+// Head size 128, kv 16384, 1 token, us: Phi-4 (gqa 4) q8_0 149 -> 97, q4_0 152 -> 52, iq4_nl 197 -> 55;
+//   Qwen3-14B (gqa 5) q8_0 148 -> 57, q4_0 152 -> 46. tg128 @ d16384, q8_0 KV: Phi-4 56.1 -> 62.1, Qwen3-14B 55.4 -> 68.3.
 static bool ggml_cuda_flash_attn_ext_mma_q_applies(const int cc, const ggml_tensor * dst) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(cc, dst);
@@ -601,7 +603,7 @@ static bool ggml_cuda_flash_attn_ext_mma_q_applies(const int cc, const ggml_tens
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
 
-    if (Q->ne[0] != 256 || V->ne[0] != 256 || Q->ne[1] > 2 || Q->ne[3] != 1 || dst->src[5] != nullptr) {
+    if ((Q->ne[0] != 256 && Q->ne[0] != 128) || V->ne[0] != Q->ne[0] || Q->ne[1] > 2 || Q->ne[3] != 1 || dst->src[5] != nullptr) {
         return false;
     }
     if (K->type != V->type || (K->type != GGML_TYPE_Q8_0 && K->type != GGML_TYPE_Q4_0 && K->type != GGML_TYPE_IQ4_NL)) {
@@ -611,9 +613,15 @@ static bool ggml_cuda_flash_attn_ext_mma_q_applies(const int cc, const ggml_tens
     if (V_is_K_view || !mask || mask->ne[2] != 1 || K->ne[1] % FATTN_KQ_STRIDE != 0) {
         return false;
     }
-    // the raw rows are loaded 16 bytes at a time
+    // below a few thousand keys FA is a small part of a step and the vector kernel has less fixed cost:
+    // Phi-4 q8_0 tg128 at depth 0 84.2 (vector) against 81.9 t/s
+    if (K->ne[1] < 2048) {
+        return false;
+    }
+    // the raw rows are loaded 16 bytes at a time, 8 bytes if the row size is no multiple of 16 (head size 128)
+    const size_t align = ggml_row_size(K->type, K->ne[0]) % 16 == 0 ? 16 : 8;
     for (const ggml_tensor * t : {K, V}) {
-        if ((uintptr_t) t->data % 16 != 0 || t->nb[1] % 16 != 0 || t->nb[2] % 16 != 0 || t->nb[3] % 16 != 0) {
+        if ((uintptr_t) t->data % align != 0 || t->nb[1] % align != 0 || t->nb[2] % align != 0 || t->nb[3] % align != 0) {
             return false;
         }
     }
@@ -627,11 +635,11 @@ static bool ggml_cuda_flash_attn_ext_mma_q_applies(const int cc, const ggml_tens
     }
 
     const int gqa_ratio = Q->ne[2] / K->ne[2];
-    return gqa_ratio > 4 || (gqa_ratio > 2 && Q->ne[1] == 2); // 8 or 4 Q heads per block
+    return gqa_ratio > 4 || (gqa_ratio > 2 && (Q->ne[1] == 2 || Q->ne[0] == 128)); // 8 or 4 Q heads per block
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
-template <int KV_type>
+template <int D, int KV_type>
 static void ggml_cuda_flash_attn_ext_mma_q_type(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -639,12 +647,12 @@ static void ggml_cuda_flash_attn_ext_mma_q_type(ggml_backend_cuda_context & ctx,
     if (gqa_ratio > 4) {
         // 1 token: two 128-thread blocks per SM fit for the 4-bit types, not for q8_0 (larger raw tile)
         if (Q->ne[1] == 1 && KV_type != GGML_TYPE_Q8_0) {
-            ggml_cuda_flash_attn_ext_mma_f16_case_impl<256, 256, 1, 8, KV_type>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_case_impl<D, D, 1, 8, KV_type>(ctx, dst);
         } else {
-            ggml_cuda_flash_attn_ext_mma_f16_case_impl<256, 256, 2, 8, KV_type>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_case_impl<D, D, 2, 8, KV_type>(ctx, dst);
         }
     } else {
-        ggml_cuda_flash_attn_ext_mma_f16_case_impl<256, 256, 2, 4, KV_type>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_case_impl<D, D, 2, 4, KV_type>(ctx, dst);
     }
 }
 
@@ -653,10 +661,17 @@ static void ggml_cuda_flash_attn_ext_mma_q(ggml_backend_cuda_context & ctx, ggml
     GGML_UNUSED_VARS(ctx, dst);
     GGML_ABORT("fatal error");
 #else
+    const bool d256 = dst->src[0]->ne[0] == 256;
     switch (dst->src[1]->type) {
-        case GGML_TYPE_Q8_0:   ggml_cuda_flash_attn_ext_mma_q_type<GGML_TYPE_Q8_0>  (ctx, dst); break;
-        case GGML_TYPE_Q4_0:   ggml_cuda_flash_attn_ext_mma_q_type<GGML_TYPE_Q4_0>  (ctx, dst); break;
-        case GGML_TYPE_IQ4_NL: ggml_cuda_flash_attn_ext_mma_q_type<GGML_TYPE_IQ4_NL>(ctx, dst); break;
+        case GGML_TYPE_Q8_0:
+            d256 ? ggml_cuda_flash_attn_ext_mma_q_type<256, GGML_TYPE_Q8_0>(ctx, dst) : ggml_cuda_flash_attn_ext_mma_q_type<128, GGML_TYPE_Q8_0>(ctx, dst);
+            break;
+        case GGML_TYPE_Q4_0:
+            d256 ? ggml_cuda_flash_attn_ext_mma_q_type<256, GGML_TYPE_Q4_0>(ctx, dst) : ggml_cuda_flash_attn_ext_mma_q_type<128, GGML_TYPE_Q4_0>(ctx, dst);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            d256 ? ggml_cuda_flash_attn_ext_mma_q_type<256, GGML_TYPE_IQ4_NL>(ctx, dst) : ggml_cuda_flash_attn_ext_mma_q_type<128, GGML_TYPE_IQ4_NL>(ctx, dst);
+            break;
         default: GGML_ABORT("fatal error");
     }
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)

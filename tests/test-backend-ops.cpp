@@ -13921,6 +13921,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // head size 128 decode / verify at 16k: Phi-4 (10 KV heads, gqa 4), Qwen3-14B (8 KV heads, gqa 5)
+    for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL }) {
+        for (int nb : { 1, 2 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 10, {4, 1}, 16384, nb, true, false, 0, 0, GGML_PREC_F32, t, t));
+            test_cases.emplace_back(new test_flash_attn_ext(128, 128,  8, {5, 1}, 16384, nb, true, false, 0, 0, GGML_PREC_F32, t, t));
+        }
+    }
+
     // Qwen3.8-27B KV cache write of a decode / MTP verify step (4 KV heads x 256 values per token)
     for (ggml_type t : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL }) {
         for (int r : { 1, 2 }) {
