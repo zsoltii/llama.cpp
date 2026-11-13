@@ -377,6 +377,7 @@ private:
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
     std::map<llama_seq_id, std::vector<float>> embd_seq;
+    std::vector<float> embd_seq_stage; // encode(): all pooled rows of a ubatch, split into embd_seq
 
     // per-token lexical weights of the last encoded batch, next to the token and its sequence
     // populated only when the model has a sparse head and pooling_type != LLAMA_POOLING_TYPE_NONE

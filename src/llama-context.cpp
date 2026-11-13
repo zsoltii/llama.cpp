@@ -2123,18 +2123,24 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
             case LLAMA_POOLING_TYPE_CLS:
             case LLAMA_POOLING_TYPE_LAST:
                 {
-                    // extract sequence embeddings
+                    // extract sequence embeddings: one copy of all pooled rows, then split per sequence.
+                    // One small copy per sequence costs a transfer each (64 queries per ubatch: bge-m3 over Thunderbolt).
                     auto & embd_seq_out = embd_seq;
+
+                    // use n_embd_out (not n_embd_inp) - the pooled embedding has the model's
+                    // output dimension, which differs from input dimension for deepstack models (e.g. qwen3vl)
+                    const uint32_t n_embd_out = hparams.n_embd_out();
+                    GGML_ASSERT(ggml_nelements(t_embd) >= (int64_t) n_embd_out*ubatch.n_seqs_unq);
+                    embd_seq_stage.resize((size_t) n_embd_out*ubatch.n_seqs_unq);
+                    ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_stage.data(), 0, embd_seq_stage.size()*sizeof(float));
+                    ggml_backend_sched_synchronize(sched.get());
 
                     for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
                         const llama_seq_id seq_id  = ubatch.seq_id_unq[s];
                         const int32_t      seq_idx = ubatch.seq_idx[seq_id];
 
-                        // use n_embd_out (not n_embd_inp) - the pooled embedding has the model's
-                        // output dimension, which differs from input dimension for deepstack models (e.g. qwen3vl)
-                        const uint32_t n_embd_out = hparams.n_embd_out();
-                        embd_seq_out[seq_id].resize(n_embd_out);
-                        ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_embd_out*seq_idx)*sizeof(float), n_embd_out*sizeof(float));
+                        const float * src = embd_seq_stage.data() + (size_t) n_embd_out*seq_idx;
+                        embd_seq_out[seq_id].assign(src, src + n_embd_out);
                     }
                 } break;
             case LLAMA_POOLING_TYPE_RANK:
