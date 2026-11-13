@@ -7160,11 +7160,13 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
         }
 
         switch (src0_type) {
-        case GGML_TYPE_MXFP4:
-        case GGML_TYPE_Q8_0:
-        // Turing+: the fp K-quant shader is faster here, RTX 2080 Ti q4_K 4096x12288: MMVQ 70 us -> 60 us
+        // Turing: the fp K-quant shader is faster here, RTX 2080 Ti q4_K 4096x12288: MMVQ 70 us -> 60 us.
+        // Ampere keeps MMVQ: RTX 3090 q4_K 17408x5120 fp 76.6 us, MMVQ 63.5 us (Qwen3-14B tg128 69.9 -> 78.3).
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
+            return device->architecture != vk_device_architecture::NVIDIA_TURING;
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_Q8_0:
             return device->architecture == vk_device_architecture::NVIDIA_PRE_TURING;
         default:
             return true;
