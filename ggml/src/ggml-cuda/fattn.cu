@@ -556,6 +556,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_MMA_Q   = 500, // MMA kernel that reads the quantized K/V directly
 };
 
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
@@ -574,6 +575,91 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         default:
             return false;
     }
+}
+
+// Decode / MTP verify (1-2 tokens) with a quantized KV cache at head size 256 on Ampere and newer: the MMA kernel
+// dequantizes K/V while it loads its tiles, so every K/V value is read once for all Q heads of a K/V head.
+// RTX 3090, vec -> this kernel, us (GGML_CUDA_FA_MMA_QUANT=0 for the A/B):
+//   gqa 6, kv 33280, 1 token:  iq4_nl 142 ->  87, q4_0 124 -> 83, q8_0 142 -> 108
+//   gqa 6, kv 33280, 2 tokens: iq4_nl 211 -> 100, q4_0 205 -> 93, q8_0 207 -> 110
+//   gqa 4, kv 20736, 2 tokens: iq4_nl  95 ->  59, q4_0  94 -> 57, q8_0  96 ->  82; 1 token stays on the vector kernel
+static bool ggml_cuda_flash_attn_ext_mma_q_applies(const int cc, const ggml_tensor * dst) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(cc, dst);
+    return false;
+#else
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_CUDA_FA_MMA_QUANT");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!enabled || !GGML_CUDA_CC_IS_NVIDIA(cc) || !cp_async_available(cc) || ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) {
+        return false;
+    }
+
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    if (Q->ne[0] != 256 || V->ne[0] != 256 || Q->ne[1] > 2 || Q->ne[3] != 1 || dst->src[5] != nullptr) {
+        return false;
+    }
+    if (K->type != V->type || (K->type != GGML_TYPE_Q8_0 && K->type != GGML_TYPE_Q4_0 && K->type != GGML_TYPE_IQ4_NL)) {
+        return false;
+    }
+    const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
+    if (V_is_K_view || !mask || mask->ne[2] != 1 || K->ne[1] % FATTN_KQ_STRIDE != 0) {
+        return false;
+    }
+    // the raw rows are loaded 16 bytes at a time
+    for (const ggml_tensor * t : {K, V}) {
+        if ((uintptr_t) t->data % 16 != 0 || t->nb[1] % 16 != 0 || t->nb[2] % 16 != 0 || t->nb[3] % 16 != 0) {
+            return false;
+        }
+    }
+
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (max_bias != 0.0f || logit_softcap != 0.0f) {
+        return false;
+    }
+
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+    return gqa_ratio > 4 || (gqa_ratio > 2 && Q->ne[1] == 2); // 8 or 4 Q heads per block
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+}
+
+template <int KV_type>
+static void ggml_cuda_flash_attn_ext_mma_q_type(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+    if (gqa_ratio > 4) {
+        // 1 token: two 128-thread blocks per SM fit for the 4-bit types, not for q8_0 (larger raw tile)
+        if (Q->ne[1] == 1 && KV_type != GGML_TYPE_Q8_0) {
+            ggml_cuda_flash_attn_ext_mma_f16_case_impl<256, 256, 1, 8, KV_type>(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_mma_f16_case_impl<256, 256, 2, 8, KV_type>(ctx, dst);
+        }
+    } else {
+        ggml_cuda_flash_attn_ext_mma_f16_case_impl<256, 256, 2, 4, KV_type>(ctx, dst);
+    }
+}
+
+static void ggml_cuda_flash_attn_ext_mma_q(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(ctx, dst);
+    GGML_ABORT("fatal error");
+#else
+    switch (dst->src[1]->type) {
+        case GGML_TYPE_Q8_0:   ggml_cuda_flash_attn_ext_mma_q_type<GGML_TYPE_Q8_0>  (ctx, dst); break;
+        case GGML_TYPE_Q4_0:   ggml_cuda_flash_attn_ext_mma_q_type<GGML_TYPE_Q4_0>  (ctx, dst); break;
+        case GGML_TYPE_IQ4_NL: ggml_cuda_flash_attn_ext_mma_q_type<GGML_TYPE_IQ4_NL>(ctx, dst); break;
+        default: GGML_ABORT("fatal error");
+    }
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_auto(const int device, const ggml_tensor * dst) {
@@ -698,6 +784,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_auto(const int device, 
                 // The MMA kernel converts the whole quantized KV cache to f16 on every call, the vector kernel reads it
                 // directly: MTP verify (2 tokens) at 20k context on RTX 2080 Ti 1266 -> 279 us.
                 if (Q->ne[1] <= 2) {
+                    if (gqa_opt_applies && ggml_cuda_flash_attn_ext_mma_q_applies(cc, dst)) {
+                        return BEST_FATTN_KERNEL_MMA_Q;
+                    }
                     return BEST_FATTN_KERNEL_VEC;
                 }
             }
@@ -839,6 +928,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
             need_f16_V = V->type == GGML_TYPE_F32 || f16_fallback;
         } break;
+        case BEST_FATTN_KERNEL_MMA_Q:
         case BEST_FATTN_KERNEL_NONE:
             break;
     }
@@ -867,6 +957,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_MMA_Q:
+            ggml_cuda_flash_attn_ext_mma_q(ctx, dst);
             break;
     }
 }
