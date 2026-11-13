@@ -650,6 +650,21 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
     }
 }
 
+// Ampere and newer: types with a heavy vec_dot (grid lookups, sign and high bit unpacking) need more rows per block to
+// keep enough weight loads in flight. RTX 3090, 8 matrices 17408 x 5120 / 6144 x 5120, GB/s, 1 -> 4 rows (with the iq3
+// grids in shared memory), n = 1: iq3_s 586 -> 710, iq3_xxs 565 -> 717, iq2_s 486 -> 605
+static constexpr __host__ __device__ bool mmvq_four_rows_generic(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_Q3_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
 #ifndef GGML_CUDA_MMVQ_TURING_RPB_SMALL
 #define GGML_CUDA_MMVQ_TURING_RPB_SMALL 4
 #endif
@@ -667,6 +682,9 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
                 if (table_id == MMVQ_PARAMETERS_GB10) {
                     return type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_S ? 2 : 1;
                 }
+                if (table_id == MMVQ_PARAMETERS_GENERIC && mmvq_four_rows_generic(type)) {
+                    return 4;
+                }
                 return table_id == MMVQ_PARAMETERS_GENERIC && mmvq_two_rows_ncols1(type) ? 2 : 1;
             case 2:
             case 3:
@@ -678,6 +696,9 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
                 }
                 if (table_id == MMVQ_PARAMETERS_PASCAL) {
                     return GGML_CUDA_MMVQ_PASCAL_RPB_SMALL;
+                }
+                if (table_id == MMVQ_PARAMETERS_GENERIC && mmvq_four_rows_generic(type)) {
+                    return 4;
                 }
                 return 2;
             case 5:
@@ -814,6 +835,32 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
+    // The iq3 grids in shared memory: the lookups with random indices are the limit when they go through the L1 cache.
+    // With 4 rows per block (mmvq_four_rows_generic), RTX 3090, 8 matrices 17408 x 5120, GB/s: iq3_s 662 -> 711,
+    // iq3_xxs 665 -> 712.
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    constexpr int grid_size = type == GGML_TYPE_IQ3_S ? 512 : (type == GGML_TYPE_IQ3_XXS ? 256 : 0);
+#else
+    constexpr int grid_size = 0;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    [[maybe_unused]] __shared__ uint32_t grid_shared[grid_size > 0 ? grid_size : 1];
+    if constexpr (grid_size > 0) {
+        const uint32_t * grid = type == GGML_TYPE_IQ3_S ? iq3s_grid : iq3xxs_grid;
+        for (int l = tid; l < grid_size; l += nwarps*warp_size) {
+            grid_shared[l] = grid[l];
+        }
+        __syncthreads();
+    }
+    auto vec_dot = [&] __device__ (const void * vxx, const block_q8_1 * yy, const int kbxx, const int kqss) -> float {
+        if constexpr (grid_size > 0 && type == GGML_TYPE_IQ3_S) {
+            return vec_dot_iq3_s_q8_1_grid(vxx, yy, kbxx, kqss, grid_shared);
+        } else if constexpr (grid_size > 0 && type == GGML_TYPE_IQ3_XXS) {
+            return vec_dot_iq3_xxs_q8_1_grid(vxx, yy, kbxx, kqss, grid_shared);
+        } else {
+            return vec_dot_q_cuda(vxx, yy, kbxx, kqss);
+        }
+    };
+
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
@@ -845,11 +892,11 @@ static __global__ void mul_mat_vec_q(
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
-                tmp[j][i] += vec_dot_q_cuda(
+                tmp[j][i] += vec_dot(
                     vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        tmp_gate[j][i] += vec_dot_q_cuda(
+                        tmp_gate[j][i] += vec_dot(
                             vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                     }
                 }
