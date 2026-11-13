@@ -1,0 +1,64 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+#include "types.glsl"
+
+// pool_1d over non-overlapping windows without padding (k0 == s0, p0 == 0, e.g. the max over a whole row in
+// build_amax_src1_f16): one workgroup per output value reduces its window in parallel.
+layout(push_constant) uniform parameter {
+    uint IL;
+    uint OL;
+    uint OC;
+    uint pelements;
+    uint op;
+    int k0;
+    int s0;
+    int p0;
+} p;
+
+#define BLOCK_SIZE 256
+#define FLT_MAX 3.402823466e+38F
+#define OP_POOL_MAX 0u
+#define OP_POOL_AVG 1u
+
+layout (local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer X {A_TYPE data_a[];};
+layout(binding = 1) writeonly buffer D {D_TYPE data_d[];};
+
+shared float red[BLOCK_SIZE];
+
+void main() {
+    const uint idx = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    if (idx >= p.pelements) {
+        return;
+    }
+    const uint tid = gl_LocalInvocationID.x;
+
+    const uint nc     = idx / p.OL;
+    const uint cur_ol = idx % p.OL;
+
+    const uint bl = cur_ol * uint(p.k0);
+    const uint el = min(bl + uint(p.k0), p.IL);
+
+    float res = p.op == OP_POOL_MAX ? -FLT_MAX : 0.0;
+    for (uint i = bl + tid; i < el; i += BLOCK_SIZE) {
+        const float cur = float(data_a[nc * p.IL + i]);
+        res = p.op == OP_POOL_MAX ? max(res, cur) : res + cur;
+    }
+
+    red[tid] = res;
+    barrier();
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            red[tid] = p.op == OP_POOL_MAX ? max(red[tid], red[tid + s]) : red[tid] + red[tid + s];
+        }
+        barrier();
+    }
+
+    if (tid == 0) {
+        const uint count = el > bl ? el - bl : 0;
+        data_d[nc * p.OL + cur_ol] = D_TYPE(p.op == OP_POOL_AVG ? (count > 0 ? red[0] / float(count) : 0.0) : red[0]);
+    }
+}

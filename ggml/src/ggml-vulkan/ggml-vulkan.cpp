@@ -3954,6 +3954,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_snake_bf16, "snake_bf16", snake_bf16_len, snake_bf16_data, "main", 4, sizeof(vk_op_snake_push_constants), {256, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_pool1d_f32, "pool1d_f32", pool1d_f32_len, pool1d_f32_data, "main", 2, sizeof(vk_op_pool1d_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_pool1d_reduce_f32, "pool1d_reduce_f32", pool1d_reduce_f32_len, pool1d_reduce_f32_data, "main", 2, sizeof(vk_op_pool1d_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_pool2d_f32, "pool2d_f32", pool2d_f32_len, pool2d_f32_data, "main", 2, sizeof(vk_op_pool2d_push_constants), {1, 1, 1}, {512}, 1);
     if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
         ggml_vk_create_pipeline(device, device->pipeline_pool2d_subgroup_f32, "pool2d_subgroup_f32", pool2d_subgroup_f32_len, pool2d_subgroup_f32_data, "main", 2, sizeof(vk_op_pool2d_push_constants), {1, 1, 1}, {128}, 1, false, true, device->subgroup_size);
@@ -9586,6 +9587,15 @@ static vk_pipeline ggml_vk_rms_norm_pipeline(const std::array<vk_pipeline, 3> & 
     return pipelines[2];
 }
 
+// pool_1d over large non-overlapping windows (the row max of build_amax_src1_f16): one workgroup per output.
+// RTX 3090, flint decode: 19.7 us per op with one invocation per output.
+static bool ggml_vk_pool1d_use_reduce(const ggml_tensor * dst) {
+    const int32_t k0 = dst->op_params[1];
+    const int32_t s0 = dst->op_params[2];
+    const int32_t p0 = dst->op_params[3];
+    return p0 == 0 && k0 == s0 && k0 >= 64;
+}
+
 static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * dst, ggml_op op) {
     switch (op) {
     case GGML_OP_GET_ROWS:
@@ -10091,7 +10101,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
     case GGML_OP_POOL_1D:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-            return ctx->device->pipeline_pool1d_f32;
+            return ggml_vk_pool1d_use_reduce(dst) ? ctx->device->pipeline_pool1d_reduce_f32 : ctx->device->pipeline_pool1d_f32;
         }
         return nullptr;
     case GGML_OP_POOL_2D:
@@ -10538,7 +10548,15 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             const uint32_t N = dst->ne[3] * dst->ne[2];
             const uint32_t OC = dst->ne[1];
             const uint32_t OL = dst->ne[0];
-            elements = { N * OC * OL, 1, 1};
+            const uint32_t ne = N * OC * OL;
+            if (ggml_vk_pool1d_use_reduce(dst)) {
+                // one workgroup per output, indexed as z*262144 + y*512 + x in pool1d_reduce.comp
+                elements = ne > 262144 ? std::array<uint32_t, 3>{ 512, 512, CEIL_DIV(ne, 262144) } :
+                           ne > 512    ? std::array<uint32_t, 3>{ 512, CEIL_DIV(ne, 512), 1 } :
+                                         std::array<uint32_t, 3>{ ne, 1, 1 };
+            } else {
+                elements = { ne, 1, 1};
+            }
         } break;
     case GGML_OP_POOL_2D:
         {
