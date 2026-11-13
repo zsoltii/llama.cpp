@@ -70,6 +70,168 @@ static __global__ void k_set_rows_quant(const float * __restrict__ src0,
     GGML_UNUSED(ne13);
 }
 
+// Quantized set_rows for q4_0, q8_0 and iq4_nl with one warp per block of 32 values, lane j holds value j.
+// A decode step writes only a few blocks per layer (Qwen3.8: 32 for K or V), so the one-thread-per-block kernel is pure
+// latency: RTX 3090, iq4_nl, 1024 values: 17.8 us. Same results as the quantize_f32_*_block functions up to the order
+// of the float sums.
+template <ggml_type type>
+static __device__ __forceinline__ void set_rows_quant_warp_block(const float x, char * __restrict__ dst) {
+    constexpr int qk = 32;
+    const int j = threadIdx.x;
+
+    // the element with the largest magnitude, the first one on ties
+    float amax = fabsf(x);
+    int   imax = j;
+#pragma unroll
+    for (int offset = qk/2; offset > 0; offset >>= 1) {
+        const float a = __shfl_xor_sync(0xFFFFFFFF, amax, offset, qk);
+        const int   i = __shfl_xor_sync(0xFFFFFFFF, imax, offset, qk);
+        if (a > amax || (a == amax && i < imax)) {
+            amax = a;
+            imax = i;
+        }
+    }
+    const float vmax = __shfl_sync(0xFFFFFFFF, x, imax, qk);
+
+    if constexpr (type == GGML_TYPE_Q8_0) {
+        block_q8_0 * y = (block_q8_0 *) dst;
+        const float d  = amax / ((1 << 7) - 1);
+        const float id = d ? 1.0f/d : 0.0f;
+        y->qs[j] = roundf(x*id);
+        if (j == 0) {
+            y->d = d;
+        }
+    } else {
+        int q;
+        float d;
+        if constexpr (type == GGML_TYPE_Q4_0) {
+            d = vmax / -8;
+            const float id = d ? 1.0f/d : 0.0f;
+            q = min(15, (int8_t)(x*id + 8.5f));
+        } else {
+            static_assert(type == GGML_TYPE_IQ4_NL, "unsupported type");
+            constexpr int8_t values[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113}; // kvalues_iq4nl
+            d = vmax / values[0];
+            const float id = d ? 1.0f/d : 0.0f;
+            const float xs = x*id;
+            // best_index_int8 without the table lookups: ml is the last value <= xs
+            int ml = 0;
+#pragma unroll
+            for (int l = 1; l < 15; ++l) {
+                ml += values[l] <= xs;
+            }
+            q = xs <= values[0] ? 0 : (xs >= values[15] ? 15 : (xs - values[ml] < values[ml + 1] - xs ? ml : ml + 1));
+
+            float v = 0.0f;
+#pragma unroll
+            for (int l = 0; l < 16; ++l) {
+                v = l == q ? values[l] : v;
+            }
+            const float w  = x*x;
+            const float sumqx = warp_reduce_sum<qk>(w*v*x);
+            const float sumq2 = warp_reduce_sum<qk>(w*v*v);
+            d = sumq2 > 0 ? sumqx/sumq2 : d;
+        }
+        const int q_hi = __shfl_down_sync(0xFFFFFFFF, q, qk/2, qk);
+        block_q4_0 * y = (block_q4_0 *) dst; // same layout as block_iq4_nl
+        if (j < qk/2) {
+            y->qs[j] = q | (q_hi << 4);
+        }
+        if (j == 0) {
+            y->d = d;
+        }
+    }
+}
+
+template <typename idx_t, ggml_type type>
+static __global__ void k_set_rows_quant_warp(const float * __restrict__ src0,
+                                             const idx_t * __restrict__ src1,
+                                             char * __restrict__ dst,
+                                             const int64_t ne_total,
+                                             const int64_t s01,
+                                             const int64_t s02,
+                                             const int64_t s03,
+                                             const int64_t s10,
+                                             const int64_t s11,
+                                             const int64_t s12,
+                                             const int64_t s1,
+                                             const int64_t s2,
+                                             const int64_t s3,
+                                             const uint3   ne00,
+                                             const uint3   ne01,
+                                             const uint3   ne02,
+                                             const uint3   ne11_fd,
+                                             const uint3   ne12_fd) {
+    constexpr int qk         = 32;
+    constexpr int block_size = type == GGML_TYPE_Q8_0 ? sizeof(block_q8_0) : sizeof(block_q4_0);
+
+    const int64_t i = int64_t(blockDim.y) * blockIdx.x + threadIdx.y; // block of 32 values
+    if (i >= ne_total) {
+        return;
+    }
+
+    uint32_t tmp = (uint32_t) (i * qk);
+    uint2    div_mod;
+
+    div_mod           = fast_div_modulo(tmp, ne00);
+    const int64_t i00 = div_mod.y;
+    tmp               = div_mod.x;
+
+    div_mod           = fast_div_modulo(tmp, ne01);
+    const int64_t i01 = div_mod.y;
+    tmp               = div_mod.x;
+
+    div_mod           = fast_div_modulo(tmp, ne02);
+    const int64_t i02 = div_mod.y;
+    const int64_t i03 = div_mod.x;
+
+    const int64_t i12 = fastmodulo((uint32_t) i03, ne12_fd);
+    const int64_t i11 = fastmodulo((uint32_t) i02, ne11_fd);
+    const int64_t i10 = i01;
+
+    ggml_cuda_pdl_sync();
+    const int64_t dst_row = *(src1 + i10*s10 + i11*s11 + i12*s12);
+
+    const float x = src0[i01*s01 + i02*s02 + i03*s03 + i00 + threadIdx.x];
+    set_rows_quant_warp_block<type>(x, dst + dst_row*s1 + i02*s2 + i03*s3 + (i00/qk)*block_size);
+}
+
+// untested on HIP and MUSA
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+static constexpr bool set_rows_quant_warp_available = false;
+#else
+static constexpr bool set_rows_quant_warp_available = true;
+#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+
+template <typename idx_t, ggml_type type>
+static void set_rows_cuda_quant_warp(
+        const float * src0_d, const idx_t * src1_d, char * dst_d,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t ne11, const int64_t ne12,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t nb10, const size_t nb11, const size_t nb12,
+        const size_t nb1, const size_t nb2, const size_t nb3,
+        cudaStream_t stream) {
+    constexpr int qk = 32;
+    GGML_ASSERT(ne00 % qk == 0);
+    const int64_t ne_total = (ne00 * ne01 * ne02 * ne03) / qk;
+    if (ne_total <= 0 || ne11 <= 0 || ne12 <= 0) {
+        return;
+    }
+
+    constexpr int warps_per_block = 8;
+    const dim3 block_dims(WARP_SIZE, warps_per_block);
+    const dim3 grid_dims((ne_total + warps_per_block - 1) / warps_per_block);
+
+    k_set_rows_quant_warp<idx_t, type><<<grid_dims, block_dims, 0, stream>>>(
+        src0_d, src1_d, dst_d, ne_total,
+        nb01/sizeof(float), nb02/sizeof(float), nb03/sizeof(float),
+        nb10/sizeof(idx_t), nb11/sizeof(idx_t), nb12/sizeof(idx_t),
+        nb1, nb2, nb3,
+        init_fastdiv_values((uint32_t) ne00), init_fastdiv_values((uint32_t) ne01), init_fastdiv_values((uint32_t) ne02),
+        init_fastdiv_values((uint32_t) ne11), init_fastdiv_values((uint32_t) ne12));
+}
+
 // Template dispatch function for quantized set_rows
 template<typename idx_t, typename block_type, int qk, void (*quantize_func)(const float*, block_type*)>
 static void set_rows_cuda_quant(
@@ -257,6 +419,16 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb1, nb2, nb3,
             stream
         );
+    } else if (dst->type == GGML_TYPE_Q4_0 && set_rows_quant_warp_available) {
+        set_rows_cuda_quant_warp<idx_t, GGML_TYPE_Q4_0>(
+            src0_d, src1_d, (char *) dst->data,
+            ne00, ne01, ne02, ne03,
+            ne11, ne12,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream
+        );
     } else if (dst->type == GGML_TYPE_Q4_0) {
         set_rows_cuda_quant<idx_t, block_q4_0, QK4_0, quantize_f32_q4_0_block>(
             src0_d, src1_d, (block_q4_0*)dst->data,
@@ -297,11 +469,31 @@ static void set_rows_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * s
             nb1, nb2, nb3,
             stream
         );
+    } else if (dst->type == GGML_TYPE_Q8_0 && set_rows_quant_warp_available) {
+        set_rows_cuda_quant_warp<idx_t, GGML_TYPE_Q8_0>(
+            src0_d, src1_d, (char *) dst->data,
+            ne00, ne01, ne02, ne03,
+            ne11, ne12,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream
+        );
     } else if (dst->type == GGML_TYPE_Q8_0) {
         set_rows_cuda_quant<idx_t, block_q8_0, QK8_0, quantize_f32_q8_0_block>(
             src0_d, src1_d, (block_q8_0*)dst->data,
             ne00, ne01, ne02, ne03,
             ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream
+        );
+    } else if (dst->type == GGML_TYPE_IQ4_NL && set_rows_quant_warp_available) {
+        set_rows_cuda_quant_warp<idx_t, GGML_TYPE_IQ4_NL>(
+            src0_d, src1_d, (char *) dst->data,
+            ne00, ne01, ne02, ne03,
+            ne11, ne12,
             nb01, nb02, nb03,
             nb10, nb11, nb12,
             nb1, nb2, nb3,

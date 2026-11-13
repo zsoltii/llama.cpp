@@ -13891,9 +13891,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_K, GGML_TYPE_F32, 248320, 1, 5120, {1, 1}, {1, 1}));
     // the same shapes with 8 different matrices, so the weights do not fit in a large last level cache (RDNA2 Infinity
     // Cache, 128 MB) and the kernel reads them from VRAM as in the model
-    for (ggml_type t : { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K }) {
+    // n = 2: MTP verify
+    for (ggml_type t : { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q3_K }) {
         for (auto mk : std::vector<std::array<int, 2>>{ {17408, 5120}, {5120, 17408}, {10240, 5120}, {6144, 5120}, {5120, 6144} }) {
-            test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, mk[0], 1, mk[1], {8, 1}, {1, 1}));
+            for (int n : { 1, 2 }) {
+                test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, mk[0], n, mk[1], {8, 1}, {1, 1}));
+            }
         }
     }
     // prefill ubatch of the FFN
@@ -13912,6 +13915,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Qwen3.8-27B KV cache write of a decode / MTP verify step (4 KV heads x 256 values per token)
+    for (ggml_type t : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL }) {
+        for (int r : { 1, 2 }) {
+            test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, t, GGML_TYPE_I64, { 1024, 32768, 1, 1 }, { 1, 1 }, r, false));
+        }
+    }
+
     // Qwen3.8-27B (hd256, 4 KV heads, gqa 6) at 32k depth: decode and prefill ubatch
     for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL }) {
         for (int nb : { 1, 2, 512 }) {
@@ -13919,6 +13929,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
         // the dense, permuted KV cache layout of the model (Vulkan: dequant+transpose f16 scratch for prefill)
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 33280, 512, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 2, 1, 3}, false));
+        // decode and MTP verify on that layout: the rows of a K/V head are interleaved with those of the other heads
+        for (int nb : { 1, 2 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 33280, nb, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 2, 1, 3}, false));
+        }
         // ubatch 256 and 1024 (the agentic server command uses -ub 256)
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 16384, 256, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 2, 1, 3}, false));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 16384, 512, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 2, 1, 3}, false));
