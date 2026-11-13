@@ -8751,9 +8751,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     // dequant K/V once into an f16 scratch, reordered KV layout so FA can read without a stride
     auto is_dense_kv_cache = [](const ggml_tensor * t) {
-        return t->nb[0] == ggml_type_size(t->type) &&
-               t->nb[2] == ggml_row_size(t->type, t->ne[0]) &&
-               t->nb[1] == t->nb[2] * t->ne[2] &&
+        // with one KV head (MLA) nb[2] does not matter
+        const bool rows_dense = t->ne[2] == 1 ? t->nb[1] == ggml_row_size(t->type, t->ne[0]) :
+                                (t->nb[2] == ggml_row_size(t->type, t->ne[0]) && t->nb[1] == t->nb[2] * t->ne[2]);
+        return t->nb[0] == ggml_type_size(t->type) && rows_dense &&
                (t->ne[3] == 1 || t->nb[3] == t->nb[1] * t->ne[1]);
     };
     const bool k_quant = k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_BF16 && k->type != GGML_TYPE_F32;
@@ -8768,10 +8769,16 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                                  v->nb[1] != (uint64_t)HSV * ggml_type_size(v->type)) &&
                                 (HSK % 8) == 0 && (HSV % 8) == 0;
     const size_t kv_scratch_ts = kv_raw_strided ? ggml_type_size(k->type) : sizeof(ggml_fp16_t);
+    // MLA (DeepSeek, GLM-4.7-Flash): V is the first HSV values of each K row. Only K goes to the scratch, V reads it
+    // with K's stride.
+    const bool v_view_of_k = !kv_raw_strided && v->type == k->type && v->ne[0] <= k->ne[0] && v->ne[1] == k->ne[1] &&
+                             v->ne[2] == k->ne[2] && v->ne[3] == k->ne[3] && v->nb[1] == k->nb[1] && v->nb[2] == k->nb[2] &&
+                             v->nb[3] == k->nb[3] && ggml_vk_tensor_subbuffer(ctx, v).buffer == ggml_vk_tensor_subbuffer(ctx, k).buffer &&
+                             ggml_vk_tensor_subbuffer(ctx, v).offset == ggml_vk_tensor_subbuffer(ctx, k).offset;
     // K and V share one scratch buffer, so the sum must fit in one allocation
-    const uint64_t dequant_kv_sz = ((uint64_t)ggml_nelements(k) + (uint64_t)ggml_nelements(v)) * kv_scratch_ts;
+    const uint64_t dequant_kv_sz = ((uint64_t)ggml_nelements(k) + (v_view_of_k ? 0 : (uint64_t)ggml_nelements(v))) * kv_scratch_ts;
     bool use_dequant_kv = ((k_quant && v_quant) || kv_raw_strided) && neq1 >= 64 &&
-                                is_dense_kv_cache(k) && is_dense_kv_cache(v) &&
+                                is_dense_kv_cache(k) && (is_dense_kv_cache(v) || v_view_of_k) &&
                                 (uint64_t)ggml_nelements(k) * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
                                 (uint64_t)ggml_nelements(v) * kv_scratch_ts <= ctx->device->properties.limits.maxStorageBufferRange &&
                                 dequant_kv_sz <= ctx->device->max_buffer_size &&
@@ -8779,8 +8786,11 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
                                 (kv_raw_strided ||
                                  (ctx->device->pipeline_dequant_transpose[k->type] != nullptr &&
                                   ctx->device->pipeline_dequant_transpose[v->type] != nullptr)) &&
-                                // coopmat2 path does not benefit from the f16 scratch
-                                !ctx->device->coopmat2 &&
+                                // coopmat2 path does not benefit from the f16 scratch, except with MLA head sizes:
+                                // its in-shader dequant of K for every block of rows is the limit there. RTX 3090,
+                                // GLM-4.7-Flash, 20 heads, kv 16384, 512 rows, q8_0: 111 -> 28.2 ms (f16 KV 27.7 ms).
+                                // Not for decode: 246 -> 274 us
+                                (!ctx->device->coopmat2 || (v_view_of_k && HSK > 256)) &&
                                 // Intel Xe1 regresses, see PR 25494
                                 (ctx->device->vendor_id != VK_VENDOR_ID_INTEL ||
                                  (ctx->device->coopmat_support && ctx->device->architecture != vk_device_architecture::INTEL_XE1));
@@ -8788,12 +8798,13 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     uint32_t kv_chunk = 0;
     if (use_dequant_kv) {
         // prefill only (no GQA rows, no sparse mask), one batch, one mask, and only the scalar shader has the chunk mode
-        const bool chunk_ok = mask != nullptr && nek3 == 1 && nev3 == 1 && neq3 == 1 && nem0 == KV && nem2 == 1 && nem3 == 1 &&
+        // the chunk mode converts V on its own, not as a view of the K scratch
+        const bool chunk_ok = !v_view_of_k && mask != nullptr && nek3 == 1 && nev3 == 1 && neq3 == 1 && nem0 == KV && nem2 == 1 && nem3 == 1 &&
                               mask->nb[1] == (size_t) nem0 * sizeof(ggml_fp16_t) &&
                               get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV,
                                                    kv_raw_strided ? k->type : GGML_TYPE_F16,
                                                    kv_raw_strided ? v->type : GGML_TYPE_F16, f32acc).path == FA_SCALAR;
-        const uint64_t bytes_per_key = ((uint64_t) HSK * nek2 + (uint64_t) HSV * nev2) * kv_scratch_ts;
+        const uint64_t bytes_per_key = ((uint64_t) HSK * nek2 + (v_view_of_k ? 0 : (uint64_t) HSV * nev2)) * kv_scratch_ts;
         const uint64_t split_slot_bytes = ((uint64_t) HSV * ne1 * sizeof(float) + ne1 * sizeof(float) * 2) * ne2 * ne3;
         use_dequant_kv = ggml_vk_fa_scratch_plan(ctx, KV, bytes_per_key, split_slot_bytes, chunk_ok, &kv_chunk);
     }
@@ -8923,11 +8934,11 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     uint32_t nbv2_eff = (uint32_t)nbv2, nbv3_eff = (uint32_t)nbv3;
     if (use_dequant_kv) {
         k_stride = HSK;
-        v_stride = HSV;
+        v_stride = v_view_of_k ? HSK : HSV;
         nbk2_eff = (uint32_t)((uint64_t)HSK * KV * sizeof(ggml_fp16_t));
         nbk3_eff = (uint32_t)((uint64_t)HSK * KV * nek2 * sizeof(ggml_fp16_t));
-        nbv2_eff = (uint32_t)((uint64_t)HSV * KV * sizeof(ggml_fp16_t));
-        nbv3_eff = (uint32_t)((uint64_t)HSV * KV * nev2 * sizeof(ggml_fp16_t));
+        nbv2_eff = v_view_of_k ? nbk2_eff : (uint32_t)((uint64_t)HSV * KV * sizeof(ggml_fp16_t));
+        nbv3_eff = v_view_of_k ? nbk3_eff : (uint32_t)((uint64_t)HSV * KV * nev2 * sizeof(ggml_fp16_t));
     }
     const uint32_t alignment = tuning_params.block_cols;
     bool aligned = (KV % alignment) == 0 &&
@@ -9206,7 +9217,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
 
     if (use_dequant_kv && kv_chunk == 0) {
         const uint64_t k_sz = (uint64_t)ggml_nelements(k) * kv_scratch_ts;
-        const uint64_t v_sz = (uint64_t)ggml_nelements(v) * kv_scratch_ts;
+        const uint64_t v_sz = v_view_of_k ? 0 : (uint64_t)ggml_nelements(v) * kv_scratch_ts;
         if (ctx->prealloc_size_x < k_sz + v_sz) {
             ctx->prealloc_size_x = k_sz + v_sz;
         }
@@ -9254,12 +9265,14 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             }
             { const std::vector<uint32_t> pc = { (uint32_t)HSK, (uint32_t)nek2, (uint32_t)KV, 0, k_nel };
               ggml_vk_dispatch_pipeline(ctx, subctx, tr_k, { k_buf, k_dst }, pc, { k_nel, 1, 1 }); }
-            { const std::vector<uint32_t> pc = { (uint32_t)HSV, (uint32_t)nev2, (uint32_t)KV, 0, v_nel };
-              ggml_vk_dispatch_pipeline(ctx, subctx, tr_v, { v_buf, v_dst }, pc, { v_nel, 1, 1 }); }
+            if (!v_view_of_k) {
+                const std::vector<uint32_t> pc = { (uint32_t)HSV, (uint32_t)nev2, (uint32_t)KV, 0, v_nel };
+                ggml_vk_dispatch_pipeline(ctx, subctx, tr_v, { v_buf, v_dst }, pc, { v_nel, 1, 1 });
+            }
         }
         ggml_vk_sync_buffers(ctx, subctx);
         k_buf = k_dst;
-        v_buf = v_dst;
+        v_buf = v_view_of_k ? k_dst : v_dst;
     }
 
     uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | n_head_log2;

@@ -13921,6 +13921,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // GLM-4.7-Flash (MLA: K 576 = latent + rope, V a 512 view of K, 1 KV head, 20 Q heads) prefill ubatch and decode at 16k
+    for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        for (int nb : { 1, 512 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 16384, nb, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 1, 2, 3}, true, true));
+        }
+    }
+
     // head size 128 decode / verify at 16k: Phi-4 (10 KV heads, gqa 4), Qwen3-14B (8 KV heads, gqa 5)
     for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL }) {
         for (int nb : { 1, 2 }) {
