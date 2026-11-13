@@ -79,8 +79,14 @@ static inline int64_t ggml_cuda_flash_attn_ext_get_kv_chunk(
         return 0;
     }
 
+    // Decode / verify (a few Q rows): a chunk runs with one MMA block per output tile, a handful of blocks on the whole
+    // GPU, so chunks are only used once the f16 copy is large. Gemma-4 head size 512 decode at 16k (64 MiB f16 K+V):
+    // 2 x 590 us chunked against 96 us + the conversion whole; tg128 @ d16384: Nemotron-3.5-Bolt-E4B 59.3 -> 108.4, gemma-4-26B-A4B 71.7 -> 117.3 t/s.
+    const ggml_tensor * Q = dst->src[0];
+    const int64_t chunk_bytes_eff = Q->ne[1] <= 8 ? std::max<int64_t>(chunk_bytes, int64_t(1024)*1024*1024) : chunk_bytes;
+
     const int64_t row_bytes = sizeof(half)*((convert_K ? K->ne[0]*K->ne[2]*K->ne[3] : 0) + (convert_V ? V->ne[0]*V->ne[2]*V->ne[3] : 0));
-    const int64_t kv_chunk  = std::max<int64_t>(chunk_bytes/row_bytes/FATTN_KQ_STRIDE, 1)*FATTN_KQ_STRIDE;
+    const int64_t kv_chunk  = std::max<int64_t>(chunk_bytes_eff/row_bytes/FATTN_KQ_STRIDE, 1)*FATTN_KQ_STRIDE;
 
     return K->ne[1] > kv_chunk ? kv_chunk : 0;
 }
