@@ -251,3 +251,4 @@ It runs only for requests with images or video. Never measured in this project.
   of C0 and V0, every experiment with its numbers, and the dead ends.
 - Updated recommended server commands if S1-S3 change them.
 - The validation table after the last accepted change.
+- Vulkan MUL_MAT_ID tile selection by rows-per-expert (n_sel) and BN 16/32/64: no gain, iq3 regressed 2x; reverted (2026-11-14)
