@@ -183,3 +183,14 @@ Open:
 - **iq4_nl decode FA is still slower than q4_0.** At gqa 6 it takes 144 us against 120 us, because of the table lookups.
 - **Vulkan 2-token verify at gqa 6** stays on the old path.
 - **HIP:** the CUDA changes that could help HIP are untested on the RX 6900 XT.
+
+## Round 3: Nemotron, gemma4, flint (2026-11-14)
+
+- CUDA quantized MMA flash attention extended to head size 64 (gpt-oss: tg@16k 159 -> 184) and head size 512
+  (gemma-4 global layers: tg@64k 87 -> 113; Bolt gqa 4: 108 -> 118).
+- Vulkan coopmat2 FA: 16-column tiles for head size 512/576 (GLM pp@16k 338 -> 1010, gemma-26B 2508 -> 3560, Bolt +23 %)
+  and a 128-thread 16-column tile for MLA decode (+7-9 %). Qwen3.8 unchanged.
+- Full per-model sweep and the best command lines: `best-commands.md` (raw data `bestsweep2.txt`, `specrun-final.txt`).
+- flint UD-IQ3_XXS: CUDA pp 6744 / tg 160 (145 @16k), Vulkan pp 5241 / tg 123 (110 @16k).
+- Still open: Vulkan MoE prefill (MUL_MAT_ID) 1.5-2.4x behind CUDA; Vulkan GLM q8_0 decode (60 vs 102 f16); CUDA GLM MLA
+  quantized-KV decode (93 vs 109); Bolt prefill is faster at -ub 1024 than 2048 on CUDA (cause not found).
