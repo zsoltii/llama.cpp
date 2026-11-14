@@ -15,9 +15,13 @@ Speed numbers are tokens/s from `llama-bench` / `llama-server` runs (see `bestsw
    backend and take the first KV type that reaches the maximum.
 3. Draft models (MTP): keep `-ctkd q8_0 -ctvd q8_0`; their KV is small, the 2 GiB margin covers it. If a draft does not fit, drop it before
    shrinking the main context.
-4. `-ub 2048`, except Nemotron Bolt (`-ub 1024`, +12 % prefill on CUDA, +5 % on Vulkan).
-5. Verify each line: start it, wait for `/health`, send one request, and record the VRAM used.
-6. Use the card's own device selection: CUDA `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=<index>` and `-dev CUDA0`; Vulkan `-dev Vulkan<N>`; HIP `-dev ROCm0`.
+4. **Repetition loops:** the gemma-4 models can fall into a thinking loop in long agent sessions (opencode, `high`/`max` thinking, ~100k context, after a failing
+   build/test repeats). The server has no repetition protection by default (`repeat_penalty 1.0`, DRY off), so the gemma-4 commands carry `--dry-multiplier 0.8`.
+   The KV type and the MTP draft are not the cause: 94k-token thinking runs with f16 KV, q8_0 KV and q8_0 KV + MTP showed no loops (`loopab.txt`).
+   Other models: add the same option if you see the same behaviour. A client that sends its own `dry_multiplier` overrides it.
+5. `-ub 2048`, except Nemotron Bolt (`-ub 1024`, +12 % prefill on CUDA, +5 % on Vulkan).
+6. Verify each line: start it, wait for `/health`, send one request, and record the VRAM used.
+7. Use the card's own device selection: CUDA `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=<index>` and `-dev CUDA0`; Vulkan `-dev Vulkan<N>`; HIP `-dev ROCm0`.
    Build with `build-cuda` / `build-vk` (and the HIP build for AMD).
 
 ## RTX 3090 (24 GB)
@@ -43,6 +47,7 @@ with q8_0 KV and `-c 32768` (the specrun setting), without / with the draft.
 | GLM-4.7-Flash-REAP-23B-A3B (UD-Q4_K_XL) | f16 KV (**required** for speed: q8_0 decode at 16k is 93 on CUDA and 60 on Vulkan against 110 / 102). pp 5537, tg 140 / 110 @16k | f16 KV. pp 4218, tg 135 / 102 @16k, pp@16k 990 |
 | Qwen3-14B (Q4_K_M) | f16 KV for prefill (2950 vs 2910); at long contexts q8_0 decodes faster on CUDA (68 vs 66 @16k). No draft (Eagle3 is slower) | f16 KV, no draft. pp 2843, tg 80 / 59 @16k |
 | Qwen3.8-27B (UD-IQ4_XS) | f16 KV (or `iq4_nl` for >64k contexts, tg@64k 37.8). pp 1704, tg 48 / 45 @16k; with MTP see `rtx3090-results.md` | f16 KV. pp 1252, tg 39 / 37 @16k |
+
 
 
 
@@ -74,13 +79,13 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 bu
 **gemma-4-12b (MTP)**
 
 ```
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 build-cuda/bin/llama-server -hf unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md ~/.cache/huggingface/hub/models--unsloth--gemma-4-12b-it-GGUF/snapshots/fc034cfff751157913579611efad8462ac1be606/MTP/mtp-gemma-4-12b-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 build-cuda/bin/llama-server -hf unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md ~/.cache/huggingface/hub/models--unsloth--gemma-4-12b-it-GGUF/snapshots/fc034cfff751157913579611efad8462ac1be606/MTP/mtp-gemma-4-12b-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0 --dry-multiplier 0.8
 ```
 
 **gemma-4-26B-A4B (MTP)**
 
 ```
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 build-cuda/bin/llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ4_NL -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md ~/.cache/huggingface/hub/models--unsloth--gemma-4-26B-A4B-it-GGUF/snapshots/c099eb48e663fd284577b04978a94ffccb261841/MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 build-cuda/bin/llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ4_NL -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md ~/.cache/huggingface/hub/models--unsloth--gemma-4-26B-A4B-it-GGUF/snapshots/c099eb48e663fd284577b04978a94ffccb261841/MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0 --dry-multiplier 0.8
 ```
 
 **Nemotron-3.5-Lightning-30B-A3B (MTP)**
@@ -155,13 +160,13 @@ LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/Phi-4-reasoning-
 **gemma-4-12b (MTP)**
 
 ```
-LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md ~/.cache/huggingface/hub/models--unsloth--gemma-4-12b-it-GGUF/snapshots/fc034cfff751157913579611efad8462ac1be606/MTP/mtp-gemma-4-12b-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md ~/.cache/huggingface/hub/models--unsloth--gemma-4-12b-it-GGUF/snapshots/fc034cfff751157913579611efad8462ac1be606/MTP/mtp-gemma-4-12b-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0 --dry-multiplier 0.8
 ```
 
 **gemma-4-26B-A4B (MTP)**
 
 ```
-LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ4_NL -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md ~/.cache/huggingface/hub/models--unsloth--gemma-4-26B-A4B-it-GGUF/snapshots/c099eb48e663fd284577b04978a94ffccb261841/MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ4_NL -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md ~/.cache/huggingface/hub/models--unsloth--gemma-4-26B-A4B-it-GGUF/snapshots/c099eb48e663fd284577b04978a94ffccb261841/MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0 --dry-multiplier 0.8
 ```
 
 **Nemotron-3.5-Lightning-30B-A3B (MTP)**
