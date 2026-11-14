@@ -57,3 +57,54 @@ with q8_0 KV and `-c 32768` (the specrun setting), without / with the draft.
 - test-backend-ops: CUDA 20335/20335, Vulkan 22421/22421 (FLASH_ATTN_EXT also 5820/5820 on the T1200).
 - wikiqa 25/25 + 5/5 on both backends (Qwen3.5 MTP, Qwen3.8 iq4_nl and MTP); attach test 6/6 finished, loop counts unchanged from
   the previous rounds (`val3090-final.txt`).
+
+## Complete commands (model via `-hf`)
+
+Each line is the best configuration from the table above. `-hf` resolves the main model from the Hugging Face cache (or downloads it).
+`-hfd` does not resolve the gemma-4 `MTP/` subdirectory files, so those two use `-md` with the cached path (`$HF` below).
+Context is `-c 32768` (f16 KV); raise it as described in "Context length guidance". For Vulkan drop the two CUDA variables and use `-dev Vulkan1`
+(Bolt: the only differences are noted in the table; gpt-oss, GLM, Phi-4, Qwen3-14B, flint, Qwen3.8 are identical on both backends except `-dev`).
+
+```
+P='CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1'
+C='-dev CUDA0 -ngl 99 -fa on -c 32768 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj'
+HF=~/.cache/huggingface/hub/models--unsloth--gemma-4-12b-it-GGUF/snapshots/fc034cfff751157913579611efad8462ac1be606
+
+# Qwen3.5-9B (MTP, n-max 2 for short prompts, 1 for long)
+env $P llama-server -hf unsloth/Qwen3.5-9B-MTP-GGUF:UD-Q4_K_XL $C --spec-type draft-mtp --spec-draft-n-max 2 -ctkd q8_0 -ctvd q8_0
+
+# Ornith-1.5-9B
+env $P llama-server -hf ornith-ai/Ornith-1.5-9B-GGUF:Q4_K_M $C --spec-type draft-mtp --spec-draft-n-max 1 -ctkd q8_0 -ctvd q8_0
+
+# Phi-4-reasoning-plus
+env $P llama-server -hf unsloth/Phi-4-reasoning-plus-GGUF:UD-Q4_K_XL $C
+
+# gemma-4-12b (MTP draft from the cached MTP/ file)
+env $P llama-server -hf unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL $C -md $HF/MTP/mtp-gemma-4-12b-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0
+
+# gemma-4-26B-A4B
+HF26=~/.cache/huggingface/hub/models--unsloth--gemma-4-26B-A4B-it-GGUF/snapshots/c099eb48e663fd284577b04978a94ffccb261841
+env $P llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ4_NL $C -md $HF26/MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0
+
+# Nemotron-3.5-Lightning-30B-A3B
+env $P llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF:UD-IQ3_XXS $C --spec-type draft-mtp --spec-draft-n-max 1 -ctkd q8_0 -ctvd q8_0
+
+# Nemotron-3.5-Bolt-E4B (CUDA: -ub 1024; Vulkan: -ub 1024 too for prefill)
+env $P llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:UD-Q4_K_XL ${C/-ub 2048/-ub 1024}
+
+# flint (either quantization)
+env $P llama-server -hf unsloth/flint-GGUF:UD-Q3_K_XL $C
+env $P llama-server -hf unsloth/flint-GGUF:UD-IQ3_XXS $C
+
+# gpt-oss-20b
+env $P llama-server -hf unsloth/gpt-oss-20b-GGUF:UD-Q4_K_XL $C
+
+# GLM-4.7-Flash-REAP-23B-A3B (keep f16 KV)
+env $P llama-server -hf unsloth/GLM-4.7-Flash-REAP-23B-A3B-GGUF:UD-Q4_K_XL $C
+
+# Qwen3-14B
+env $P llama-server -hf unsloth/Qwen3-14B-GGUF:Q4_K_M $C
+
+# Qwen3.8-27B (iq4_nl KV only for contexts above ~64k: -c 131072 -ctk iq4_nl -ctv iq4_nl)
+env $P llama-server -hf unsloth/Qwen3.8-27B-GGUF:UD-IQ4_XS $C
+```
