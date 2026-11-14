@@ -60,3 +60,11 @@ Outputs are written to `~/llama-bench-results/attach-test/` by default (`--out`)
 - `attach-<name>.srv.log`: the server log.
 
 The result line ends with `not ok: x/y`.
+
+## MTP prompt-cache regression (`mtp-cancel-cache.py`)
+
+A cancelled generation, then a request whose prompt the server restores from its prompt cache (`--cache-ram`), used to
+fail with `inconsistent sequence positions ... for M-RoPE, it is required that the position satisfies: X < Y` in the MTP
+draft context when `LLAMA_MTP_DEFER_CATCHUP=1` was set: the deferred catch-up rows of the cancelled task were
+decoded in front of the restored prompt's next batch. `common_speculative` now only keeps deferred rows that end right
+before the next batch (`catchup_align`). Run: start an MTP server with `--parallel 1`, then `python3 mtp-cancel-cache.py PORT`.

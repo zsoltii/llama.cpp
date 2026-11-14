@@ -1583,6 +1583,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    // The deferred rows have to end right before pos: rows at or after it are stale (rollback, re-evaluation), and rows
+    // that leave a gap or overlap the draft KV belong to another context (a cancelled task, a prompt restored from the
+    // server's prompt cache): the draft KV of this sequence was replaced under them, so they would only make the next
+    // draft batch start before the last position of the draft KV ("inconsistent sequence positions").
+    void catchup_align(llama_seq_id seq_id, llama_pos pos) {
+        catchup_drop_from(seq_id, pos);
+        auto & rows = catchup[seq_id];
+        if (!rows.empty() && rows.back().pos + 1 != pos) {
+            rows.clear();
+            catchup_pos0[seq_id] = -1;
+        }
+    }
+
     // add the deferred rows of a sequence to the draft batch, without outputs
     void catchup_add(llama_seq_id seq_id) {
         for (const auto & r : catchup[seq_id]) {
@@ -1796,7 +1809,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (i_batch_beg[seq_id] >= 0) {
-                    catchup_drop_from(seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0]);
+                    catchup_align(seq_id, batch_in.tokens[i_batch_beg[seq_id]].pos[0]);
                 }
             }
 
@@ -1958,7 +1971,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             if (defer_catchup) {
-                catchup_drop_from(seq_id, dp.pos0);
+                catchup_align(seq_id, dp.pos0);
                 catchup_add(seq_id);
             }
 
