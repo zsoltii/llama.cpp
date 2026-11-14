@@ -46,6 +46,7 @@ with q8_0 KV and `-c 32768` (the specrun setting), without / with the draft.
 
 
 
+
 Commands below use the context and KV type from the rules (smallest KV quantization that reaches the model maximum). Prefill and decode are a few percent slower than the f16 numbers above where the KV is quantized; the f16 line is the fastest choice if you need less context.
 
 
@@ -84,7 +85,7 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /h
 **Nemotron-3.5-Lightning-30B-A3B (MTP)**
 
 ```
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF:UD-IQ3_XXS -dev CUDA0 -ngl 99 -fa on -c 622336 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 1 -ctkd q8_0 -ctvd q8_0
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF:UD-IQ3_XXS -dev CUDA0 -ngl 99 -fa on -c 393216 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 1 -ctkd q8_0 -ctvd q8_0
 ```
 
 **Nemotron-3.5-Bolt-E4B**
@@ -210,6 +211,13 @@ LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llam
 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/Qwen3.8-27B-GGUF:UD-IQ4_XS -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
 ```
 
+
+Notes (RTX 3090, verified by starting every command above, see `verify-cmds.txt`; each one answered a request):
+- Nemotron Lightning on CUDA: `llama-fit-params` allows `-c 622336` with iq4_nl KV, but with the MTP draft the compute buffers no longer fit
+  (cudaMalloc out of memory at 622336, 589824, 524288 and 458752); 393216 loads (23.5 GB). Without the draft (remove the three `--spec-type`/`-ctkd`/`-ctvd` options) use `-c 622336`.
+  On Vulkan the full 1048576 fits with q8_0 KV and the draft.
+- Quantizing the draft KV (`-ctkd iq4_nl`) did not change that limit, so the commands keep `q8_0` for the draft.
+- The tokens/s printed by the verification (16-token request on a cold server) are not benchmark numbers; use the speed table.
 
 ## Other cards
 
