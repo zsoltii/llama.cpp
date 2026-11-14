@@ -13940,6 +13940,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // MoE expert mat-vec of a decode / MTP verify step (type, n_expert, n_used, m, k)
+    {
+        struct moe_case { ggml_type t; int n_mats, n_used; int64_t m, k; };
+        for (const moe_case & c : std::vector<moe_case>{
+                { GGML_TYPE_MXFP4,   32, 4, 2880, 2880 },   // gpt-oss-20b gate/up/down
+                { GGML_TYPE_Q4_K,    48, 4, 1536, 2048 },   // GLM-4.7-Flash gate/up
+                { GGML_TYPE_Q6_K,    48, 4, 2048, 1536 },   // GLM-4.7-Flash down
+                { GGML_TYPE_IQ3_S,  128, 8, 1408, 2816 },   // gemma-4-26B-A4B gate_up
+                { GGML_TYPE_IQ4_NL, 128, 8, 2816,  704 },   // gemma-4-26B-A4B down
+                { GGML_TYPE_IQ4_NL, 128, 6, 1856, 2688 },   // Nemotron-3.5-Lightning up
+                { GGML_TYPE_IQ4_NL, 128, 6, 2688, 1856 },   // Nemotron-3.5-Lightning down
+                { GGML_TYPE_IQ3_XXS,256, 6,  512, 2048 },   // flint gate/up
+                { GGML_TYPE_IQ4_XS, 256, 6, 2048,  512 },   // flint down
+            }) {
+            for (int n : { 1, 2, 512 }) { // 512: a prefill ubatch
+                test_cases.emplace_back(new test_mul_mat_id(c.t, GGML_TYPE_F32, c.n_mats, c.n_used, false, c.m, n, c.k));
+            }
+        }
+    }
+
     // Qwen3.8-27B KV cache write of a decode / MTP verify step (4 KV heads x 256 values per token)
     for (ggml_type t : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL }) {
         for (int r : { 1, 2 }) {
