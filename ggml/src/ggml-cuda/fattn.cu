@@ -603,19 +603,19 @@ static bool ggml_cuda_flash_attn_ext_mma_q_applies(const int cc, const ggml_tens
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
 
-    if ((Q->ne[0] != 256 && Q->ne[0] != 128) || V->ne[0] != Q->ne[0] || Q->ne[1] > 2 || Q->ne[3] != 1 || dst->src[5] != nullptr) {
+    if ((Q->ne[0] != 512 && Q->ne[0] != 256 && Q->ne[0] != 128) || V->ne[0] != Q->ne[0] || Q->ne[1] > 2 || Q->ne[3] != 1 || dst->src[5] != nullptr) {
         return false;
     }
     if (K->type != V->type || (K->type != GGML_TYPE_Q8_0 && K->type != GGML_TYPE_Q4_0 && K->type != GGML_TYPE_IQ4_NL)) {
         return false;
     }
-    const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
-    if (V_is_K_view || !mask || mask->ne[2] != 1 || K->ne[1] % FATTN_KQ_STRIDE != 0) {
+    if (!mask || mask->ne[2] != 1 || K->ne[1] % FATTN_KQ_STRIDE != 0) {
         return false;
     }
     // below a few thousand keys FA is a small part of a step and the vector kernel has less fixed cost:
     // Phi-4 q8_0 tg128 at depth 0 84.2 (vector) against 81.9 t/s
-    if (K->ne[1] < 2048) {
+    // head size 512 (one tile of 64 rows): q8_0 4096 keys 48 -> 53 us, 16384 keys 160 -> 112 us
+    if (K->ne[1] < (Q->ne[0] == 512 ? 8192 : 2048)) {
         return false;
     }
     // the raw rows are loaded 16 bytes at a time, 8 bytes if the row size is no multiple of 16 (head size 128)
@@ -635,6 +635,9 @@ static bool ggml_cuda_flash_attn_ext_mma_q_applies(const int cc, const ggml_tens
     }
 
     const int gqa_ratio = Q->ne[2] / K->ne[2];
+    if (Q->ne[0] == 512) {
+        return Q->ne[1] == 1 && gqa_ratio > 4;
+    }
     return gqa_ratio > 4 || (gqa_ratio > 2 && (Q->ne[1] == 2 || Q->ne[0] == 128)); // 8 or 4 Q heads per block
 #endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 }
@@ -644,7 +647,11 @@ static void ggml_cuda_flash_attn_ext_mma_q_type(ggml_backend_cuda_context & ctx,
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const int gqa_ratio = Q->ne[2] / K->ne[2];
-    if (gqa_ratio > 4) {
+    if constexpr (D == 512) {
+        // 1 token, 8 Q heads per K/V head: the only head size 512 variant with the 2-stage pipeline (Gemma-4 global layers)
+        GGML_ASSERT(gqa_ratio > 4 && Q->ne[1] == 1);
+        ggml_cuda_flash_attn_ext_mma_f16_case_impl<D, D, 1, 8, KV_type>(ctx, dst);
+    } else if (gqa_ratio > 4) {
         // 1 token: two 128-thread blocks per SM fit for the 4-bit types, not for q8_0 (larger raw tile)
         if (Q->ne[1] == 1 && KV_type != GGML_TYPE_Q8_0) {
             ggml_cuda_flash_attn_ext_mma_f16_case_impl<D, D, 1, 8, KV_type>(ctx, dst);
@@ -661,16 +668,19 @@ static void ggml_cuda_flash_attn_ext_mma_q(ggml_backend_cuda_context & ctx, ggml
     GGML_UNUSED_VARS(ctx, dst);
     GGML_ABORT("fatal error");
 #else
-    const bool d256 = dst->src[0]->ne[0] == 256;
+    const int D = dst->src[0]->ne[0];
     switch (dst->src[1]->type) {
         case GGML_TYPE_Q8_0:
-            d256 ? ggml_cuda_flash_attn_ext_mma_q_type<256, GGML_TYPE_Q8_0>(ctx, dst) : ggml_cuda_flash_attn_ext_mma_q_type<128, GGML_TYPE_Q8_0>(ctx, dst);
+            D == 512 ? ggml_cuda_flash_attn_ext_mma_q_type<512, GGML_TYPE_Q8_0>(ctx, dst) :
+            D == 256 ? ggml_cuda_flash_attn_ext_mma_q_type<256, GGML_TYPE_Q8_0>(ctx, dst) : ggml_cuda_flash_attn_ext_mma_q_type<128, GGML_TYPE_Q8_0>(ctx, dst);
             break;
         case GGML_TYPE_Q4_0:
-            d256 ? ggml_cuda_flash_attn_ext_mma_q_type<256, GGML_TYPE_Q4_0>(ctx, dst) : ggml_cuda_flash_attn_ext_mma_q_type<128, GGML_TYPE_Q4_0>(ctx, dst);
+            D == 512 ? ggml_cuda_flash_attn_ext_mma_q_type<512, GGML_TYPE_Q4_0>(ctx, dst) :
+            D == 256 ? ggml_cuda_flash_attn_ext_mma_q_type<256, GGML_TYPE_Q4_0>(ctx, dst) : ggml_cuda_flash_attn_ext_mma_q_type<128, GGML_TYPE_Q4_0>(ctx, dst);
             break;
         case GGML_TYPE_IQ4_NL:
-            d256 ? ggml_cuda_flash_attn_ext_mma_q_type<256, GGML_TYPE_IQ4_NL>(ctx, dst) : ggml_cuda_flash_attn_ext_mma_q_type<128, GGML_TYPE_IQ4_NL>(ctx, dst);
+            D == 512 ? ggml_cuda_flash_attn_ext_mma_q_type<512, GGML_TYPE_IQ4_NL>(ctx, dst) :
+            D == 256 ? ggml_cuda_flash_attn_ext_mma_q_type<256, GGML_TYPE_IQ4_NL>(ctx, dst) : ggml_cuda_flash_attn_ext_mma_q_type<128, GGML_TYPE_IQ4_NL>(ctx, dst);
             break;
         default: GGML_ABORT("fatal error");
     }
@@ -785,6 +795,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_auto(const int device, 
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        // no vector kernel for head size 512: the quantized cache would be converted to f16 first
+        if (Q->ne[0] == 512 && Q->ne[1] == 1 && gqa_ratio > 4 && gqa_opt_applies && ggml_cuda_flash_attn_ext_mma_q_applies(cc, dst)) {
+            return BEST_FATTN_KERNEL_MMA_Q;
+        }
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
                 // the sparse gather exists only in the MMA kernel: (DKQ, DV, 1, 8) with GQA > 4
