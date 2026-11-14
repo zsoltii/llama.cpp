@@ -62,49 +62,68 @@ with q8_0 KV and `-c 32768` (the specrun setting), without / with the draft.
 
 Each line is the best configuration from the table above. `-hf` resolves the main model from the Hugging Face cache (or downloads it).
 `-hfd` does not resolve the gemma-4 `MTP/` subdirectory files, so those two use `-md` with the cached path (`$HF` below).
-Context is `-c 32768` (f16 KV); raise it as described in "Context length guidance". For Vulkan drop the two CUDA variables and use `-dev Vulkan1`
+`-c` is the model maximum, or, where f16 KV does not fit in 24 GB, the largest value that fits (see the table below); the numbers come from `llama-fit-params -fa on -ctk f16 -ctv f16 -ub 2048 -fitt 2048` (2 GiB left free for compute buffers and a draft model), the smaller of the CUDA and Vulkan results. For Vulkan drop the two CUDA variables and use `-dev Vulkan1`
 (Bolt: the only differences are noted in the table; gpt-oss, GLM, Phi-4, Qwen3-14B, flint, Qwen3.8 are identical on both backends except `-dev`).
 
 ```
 P='CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1'
-C='-dev CUDA0 -ngl 99 -fa on -c 32768 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj'
+C='-dev CUDA0 -ngl 99 -fa on -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj'
 HF=~/.cache/huggingface/hub/models--unsloth--gemma-4-12b-it-GGUF/snapshots/fc034cfff751157913579611efad8462ac1be606
 
 # Qwen3.5-9B (MTP, n-max 2 for short prompts, 1 for long)
-env $P llama-server -hf unsloth/Qwen3.5-9B-MTP-GGUF:UD-Q4_K_XL $C --spec-type draft-mtp --spec-draft-n-max 2 -ctkd q8_0 -ctvd q8_0
+env $P llama-server -hf unsloth/Qwen3.5-9B-MTP-GGUF:UD-Q4_K_XL -c 262144 $C --spec-type draft-mtp --spec-draft-n-max 2 -ctkd q8_0 -ctvd q8_0
 
 # Ornith-1.5-9B
-env $P llama-server -hf ornith-ai/Ornith-1.5-9B-GGUF:Q4_K_M $C --spec-type draft-mtp --spec-draft-n-max 1 -ctkd q8_0 -ctvd q8_0
+env $P llama-server -hf ornith-ai/Ornith-1.5-9B-GGUF:Q4_K_M -c 262144 $C --spec-type draft-mtp --spec-draft-n-max 1 -ctkd q8_0 -ctvd q8_0
 
 # Phi-4-reasoning-plus
-env $P llama-server -hf unsloth/Phi-4-reasoning-plus-GGUF:UD-Q4_K_XL $C
+env $P llama-server -hf unsloth/Phi-4-reasoning-plus-GGUF:UD-Q4_K_XL -c 32768 $C
 
 # gemma-4-12b (MTP draft from the cached MTP/ file)
-env $P llama-server -hf unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL $C -md $HF/MTP/mtp-gemma-4-12b-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0
+env $P llama-server -hf unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL -c 262144 $C -md $HF/MTP/mtp-gemma-4-12b-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0
 
 # gemma-4-26B-A4B
 HF26=~/.cache/huggingface/hub/models--unsloth--gemma-4-26B-A4B-it-GGUF/snapshots/c099eb48e663fd284577b04978a94ffccb261841
-env $P llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ4_NL $C -md $HF26/MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0
+env $P llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ4_NL -c 259840 $C -md $HF26/MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0
 
 # Nemotron-3.5-Lightning-30B-A3B
-env $P llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF:UD-IQ3_XXS $C --spec-type draft-mtp --spec-draft-n-max 1 -ctkd q8_0 -ctvd q8_0
+env $P llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF:UD-IQ3_XXS -c 335872 $C --spec-type draft-mtp --spec-draft-n-max 1 -ctkd q8_0 -ctvd q8_0
 
 # Nemotron-3.5-Bolt-E4B (CUDA: -ub 1024; Vulkan: -ub 1024 too for prefill)
-env $P llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:UD-Q4_K_XL ${C/-ub 2048/-ub 1024}
+env $P llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:UD-Q4_K_XL -c 131072 ${C/-ub 2048/-ub 1024}
 
 # flint (either quantization)
-env $P llama-server -hf unsloth/flint-GGUF:UD-Q3_K_XL $C
-env $P llama-server -hf unsloth/flint-GGUF:UD-IQ3_XXS $C
+env $P llama-server -hf unsloth/flint-GGUF:UD-Q3_K_XL -c 97536 $C
+env $P llama-server -hf unsloth/flint-GGUF:UD-IQ3_XXS -c 216064 $C
 
 # gpt-oss-20b
-env $P llama-server -hf unsloth/gpt-oss-20b-GGUF:UD-Q4_K_XL $C
+env $P llama-server -hf unsloth/gpt-oss-20b-GGUF:UD-Q4_K_XL -c 131072 $C
 
 # GLM-4.7-Flash-REAP-23B-A3B (keep f16 KV)
-env $P llama-server -hf unsloth/GLM-4.7-Flash-REAP-23B-A3B-GGUF:UD-Q4_K_XL $C
+env $P llama-server -hf unsloth/GLM-4.7-Flash-REAP-23B-A3B-GGUF:UD-Q4_K_XL -c 128256 $C
 
 # Qwen3-14B
-env $P llama-server -hf unsloth/Qwen3-14B-GGUF:Q4_K_M $C
+env $P llama-server -hf unsloth/Qwen3-14B-GGUF:Q4_K_M -c 40960 $C
 
-# Qwen3.8-27B (iq4_nl KV only for contexts above ~64k: -c 131072 -ctk iq4_nl -ctv iq4_nl)
-env $P llama-server -hf unsloth/Qwen3.8-27B-GGUF:UD-IQ4_XS $C
+# Qwen3.8-27B (f16 KV fits 101376 tokens; with `-ctk q8_0 -ctv q8_0` 181248, with iq4_nl more still)
+env $P llama-server -hf unsloth/Qwen3.8-27B-GGUF:UD-IQ4_XS -c 101376 $C
 ```
+
+Largest context that fits (llama-fit-params, 2 GiB free), CUDA / Vulkan; a value equal to the model maximum is not a limit:
+
+| model | f16 KV | q8_0 KV | model maximum |
+|---|---|---|---|
+| Qwen3.5-9B, Ornith-1.5-9B, gemma-4-12b | 262144 / 262144 | 262144 | 262144 |
+| Phi-4-reasoning-plus | 32768 | 32768 | 32768 |
+| Qwen3-14B | 40960 | 40960 | 40960 |
+| gpt-oss-20b, Bolt-E4B | 131072 | 131072 | 131072 |
+| GLM-4.7-Flash-REAP | 128256 / 132352 | 202752 | 202752 |
+| flint UD-Q3_K_XL | 97536 / 107520 | 169984 / 186880 | 262144 |
+| flint UD-IQ3_XXS | 216064 / 226048 | 262144 | 262144 |
+| gemma-4-26B-A4B | 259840 / 262144 | 262144 | 262144 |
+| Nemotron Lightning-30B | 335872 / 564224 | 480512 / 1048576 | 1048576 |
+| Qwen3.8-27B | 101376 / 101888 | 181248 / 182272 | 262144 |
+
+Models where f16 does not reach the maximum (GLM, flint Q3_K_XL, Qwen3.8, Lightning, gemma-26B, flint IQ3_XXS) can use
+`-ctk q8_0 -ctv q8_0` with the larger value from the second column at a few percent lower speed.
+Raw output: `~/llama-bench-results/ctxfit.txt`.
