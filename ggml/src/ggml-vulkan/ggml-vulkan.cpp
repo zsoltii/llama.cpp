@@ -1477,6 +1477,13 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat2(const vk_device& device
     result.subgroup_size = device->subgroup_size;
     result.workgroup_size = (small_rows && (D % 32) == 0) ? 256 : 128;
 
+    if (small_rows && hsk == 576) {
+        // MLA decode (GQA rows of the single K/V head): RTX 3090 GLM-4.7-Flash kv 16384 tg64 f16 95 -> 102, q8_0 55 -> 59 t/s;
+        // gemma-4 (head size 512) q8_0 gets 4-6% slower with this tile
+        result.block_cols = 16;
+        result.workgroup_size = 128;
+    }
+
     return result;
 }
 
