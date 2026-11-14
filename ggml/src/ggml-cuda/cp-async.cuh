@@ -58,6 +58,18 @@ static __device__ __forceinline__ void cp_async_ca_8(const unsigned int dst, con
 #endif // CP_ASYNC_AVAILABLE
 }
 
+// 4 byte copy through L1, for data that is only 4 byte aligned (the 36 / 68 byte rows of a quantized KV cache with head size 64).
+static __device__ __forceinline__ void cp_async_ca_4(const unsigned int dst, const void * src) {
+#ifdef CP_ASYNC_AVAILABLE
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;"
+        : : "r"(dst), "l"(src));
+#else
+    GGML_UNUSED(dst);
+    GGML_UNUSED(src);
+    NO_DEVICE_CODE;
+#endif // CP_ASYNC_AVAILABLE
+}
+
 // Makes each thread wait until its asynchronous data copies are done.
 // This does NOT provide any additional synchronization.
 // In particular, when copying data with multiple warps a call to __syncthreads will be needed.
