@@ -194,3 +194,10 @@ Open:
 - flint UD-IQ3_XXS: CUDA pp 6744 / tg 160 (145 @16k), Vulkan pp 5241 / tg 123 (110 @16k).
 - Still open: Vulkan MoE prefill (MUL_MAT_ID) 1.5-2.4x behind CUDA; Vulkan GLM q8_0 decode (60 vs 102 f16); CUDA GLM MLA
   quantized-KV decode (93 vs 109); Bolt prefill is faster at -ub 1024 than 2048 on CUDA (cause not found).
+
+## New models (2026-11-14): Laguna-XS-2.1, LFM2.5-24B-A2B, Muse-Glimmer-30B, Devstral-Small-2, Magistral-Small-2509
+
+Measured with the same sweep as the other models (`bestsweep-new1.txt`, `bestsweep-new2.txt`, `specrun-new.txt`, `ctxfit-new.txt`); commands in `best-commands.md`.
+f16 KV and `-ub 2048` are fastest for all five on both backends. No code change was needed; none of them has an MTP draft. Muse-Glimmer has a DFlash draft:
+CUDA tg 45/46 -> 59/70 (acceptance 0.36-0.46), Vulkan it is slower (38/44 vs 42/44), so it is not used there.
+The dense 24-30B models run at about 80 % of the memory bandwidth (Devstral tg 53, Magistral 54, Muse 48 on CUDA).

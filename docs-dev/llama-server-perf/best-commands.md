@@ -47,6 +47,11 @@ with q8_0 KV and `-c 32768` (the specrun setting), without / with the draft.
 | GLM-4.7-Flash-REAP-23B-A3B (UD-Q4_K_XL) | f16 KV (**required** for speed: q8_0 decode at 16k is 93 on CUDA and 60 on Vulkan against 110 / 102). pp 5537, tg 140 / 110 @16k | f16 KV. pp 4218, tg 135 / 102 @16k, pp@16k 990 |
 | Qwen3-14B (Q4_K_M) | f16 KV for prefill (2950 vs 2910); at long contexts q8_0 decodes faster on CUDA (68 vs 66 @16k). No draft (Eagle3 is slower) | f16 KV, no draft. pp 2843, tg 80 / 59 @16k |
 | Qwen3.8-27B (UD-IQ4_XS) | f16 KV (or `iq4_nl` for >64k contexts, tg@64k 37.8). pp 1704, tg 48 / 45 @16k; with MTP see `rtx3090-results.md` | f16 KV. pp 1252, tg 39 / 37 @16k |
+| Laguna-XS-2.1 (IQ4_NL) | f16 KV. pp 6645, tg 187 / 159 @16k; server tg 144 (21k prompt) / 165 | f16 KV. pp 5441, tg 162 / 135 @16k; server tg 115 / 139 |
+| LFM2.5-24B-A2B (UD-Q4_K_XL) | f16 KV. pp 10303, tg 265 / 238 @16k; server tg 194 / 226 | f16 KV. pp 8488, tg 231 / 198 @16k; server tg 166 / 192 |
+| Muse-Glimmer-30B (UD-Q4_K_XL) | f16 KV, `-md dflash-kquant.gguf --spec-type draft-dflash -ctkd q8_0 -ctvd q8_0`. pp 1661, tg 48 / 47 @16k; server tg 45 / 46 -> 59 / 70 (acceptance 0.36-0.46) | f16 KV, **no draft** (DFlash is slower on Vulkan: 38 / 44 vs 42 / 44). pp 1474, tg 46 / 44 @16k |
+| Devstral-Small-2-24B (UD-Q4_K_XL) | f16 KV, no draft (none exists). pp 1957, tg 53 / 46 @16k; server tg 43 / 51 | f16 KV. pp 1772, tg 49 / 40 @16k; server tg 36 / 46 |
+| Magistral-Small-2509 (UD-Q4_K_XL) | f16 KV, no draft. pp 1958, tg 54 / 47 @16k; server tg 44 / 52 | f16 KV. pp 1780, tg 52 / 42 @16k; server tg 39 / 50 |
 
 
 
@@ -137,6 +142,36 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 bu
 ```
 
 
+**Laguna-XS-2.1 (bartowski IQ4_NL)**
+
+```
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 build-cuda/bin/llama-server -hf bartowski/Laguna-XS-2.1-GGUF:IQ4_NL -dev CUDA0 -ngl 99 -fa on -c 200448 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**LFM2.5-24B-A2B**
+
+```
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 build-cuda/bin/llama-server -hf unsloth/LFM2.5-24B-A2B-GGUF:UD-Q4_K_XL -dev CUDA0 -ngl 99 -fa on -c 131072 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**Muse-Glimmer-30B (DFlash draft on CUDA only)**
+
+```
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 build-cuda/bin/llama-server -hf unsloth/Muse-Glimmer-30B-GGUF:UD-Q4_K_XL -dev CUDA0 -ngl 99 -fa on -c 131072 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md ~/.cache/huggingface/hub/models--unsloth--Muse-Glimmer-30B-GGUF/snapshots/faa5b025c584459c13febfa5c59883516710ae39/dflash-kquant.gguf --spec-type draft-dflash -ctkd q8_0 -ctvd q8_0
+```
+
+**Devstral-Small-2-24B**
+
+```
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 build-cuda/bin/llama-server -hf unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF:UD-Q4_K_XL -dev CUDA0 -ngl 99 -fa on -c 151552 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**Magistral-Small-2509 (24B)**
+
+```
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 build-cuda/bin/llama-server -hf unsloth/Magistral-Small-2509-GGUF:UD-Q4_K_XL -dev CUDA0 -ngl 99 -fa on -c 131072 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
 ### Commands: Vulkan (`-dev Vulkan1`)
 
 **Qwen3.5-9B (MTP)**
@@ -217,6 +252,40 @@ LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/Qwen3-14B-GGUF:Q
 LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/Qwen3.8-27B-GGUF:UD-IQ4_XS -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
 ```
 
+
+**Laguna-XS-2.1 (bartowski IQ4_NL)**
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf bartowski/Laguna-XS-2.1-GGUF:IQ4_NL -dev Vulkan1 -ngl 99 -fa on -c 245248 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**LFM2.5-24B-A2B**
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/LFM2.5-24B-A2B-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 131072 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**Muse-Glimmer-30B (DFlash draft on CUDA only)**
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/Muse-Glimmer-30B-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 131072 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**Devstral-Small-2-24B**
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 150528 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**Magistral-Small-2509 (24B)**
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/Magistral-Small-2509-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 131072 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+Notes for the second group (Laguna, LFM2.5, Muse-Glimmer, Devstral, Magistral): none of them has an MTP draft. Only Muse-Glimmer has a DFlash draft (CUDA only).
+Laguna and Devstral do not reach the model maximum even with iq4_nl KV, so `-c` is the largest value `llama-fit-params` accepted (CUDA 200448 / 151552, Vulkan 245248 / 150528).
+The 5 new models are in `ctxfit-new.txt`, `bestsweep-new1.txt`, `bestsweep-new2.txt`, `specrun-new.txt` (in `~/llama-bench-results`).
 
 Notes (RTX 3090, verified by starting every command above, see `verify-cmds.txt`; each one answered a request):
 - Nemotron Lightning on CUDA: `llama-fit-params` allows `-c 622336` with iq4_nl KV, but with the MTP draft the compute buffers no longer fit
