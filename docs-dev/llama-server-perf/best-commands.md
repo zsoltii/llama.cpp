@@ -1,29 +1,29 @@
-# Best llama-server settings per model (RTX 3090, CUDA and Vulkan)
+# Best llama-server commands per card and model
 
-Measured 2026-11-14 on the RTX 3090 (`CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1`, `-dev CUDA0`; Vulkan `-dev Vulkan1`),
-HEAD fc0a84e32. Sources: `llama-bench` sweep (pp2048 / tg128, and the same at 16k depth, `-fa 1`, all layers on GPU) and server
-runs with a 20.7k-token prompt + 800 generated tokens (`specrun.sh`). All numbers are tokens/s.
+Every command is a single line that works with copy and paste (run it from any directory; the binaries are addressed by absolute path).
+Speed numbers are tokens/s from `llama-bench` / `llama-server` runs (see `bestsweep2.txt`, `specrun-final.txt` in `~/llama-bench-results`).
 
-## Common rules
+## Rules for writing a section for a new card
 
-- Always `-fa on -ngl 99`. Pick the device with `-dev CUDA0` (set the two environment variables above) or `-dev Vulkan1`.
-- **KV type: `f16` is fastest** for every model that has room for it (24 GB). It beats q8_0 by 0-5 % on decode and 2-10 % on
-  prefill at 16k. Use `-ctk q8_0 -ctv q8_0` only when the context does not fit in f16 (about 2x more context), and `iq4_nl` only
-  when q8_0 does not fit either (4x more context than f16; on Vulkan it costs 5-15 % decode, on CUDA 1-4 %).
-  Exceptions: Qwen3-14B and Phi-4 on CUDA decode a little faster at 16k with a quantized KV (68 vs 66, 67 vs 64).
-- `-ub 2048` (the batch default of `-b 2048`) is best on everything except Nemotron Bolt on CUDA (`-ub 1024`, +12 % prefill).
-  Smaller `-ub` costs 20-30 % prefill on MoE models; do not go below 1024.
-- Speculative decoding: set `LLAMA_MTP_DEFER_CATCHUP=1`; give the draft model a q8_0 KV (`-ctkd q8_0 -ctvd q8_0`).
-- On HIP/ROCm quantized MMA flash attention is not used; see `rx6900xt-results.md` for that card.
-- Template for every command below:
+1. **Only models that fit the card's memory get a command.** A model fits when its weights plus a usable context
+   (at least 32k tokens, or the model maximum if that is smaller) fit in the card's VRAM with about 2 GiB free.
+   Check with `llama-fit-params -m MODEL.gguf -dev DEV -fa on -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 -fitt 2048`
+   (no `-ngl`; it prints the largest `-c` that fits). Models that need CPU offload are left out.
+2. **The goal is the largest context.** `-c` is the model maximum; if f16 KV does not reach it, use `-ctk q8_0 -ctv q8_0`,
+   and if q8_0 does not reach it, `-ctk iq4_nl -ctv iq4_nl` (on CUDA 1-4 % slower decode than f16, on Vulkan 5-15 %). If even
+   iq4_nl does not reach the maximum, `-c` is the value `llama-fit-params` printed for iq4_nl. Run `llama-fit-params` once per KV type and per
+   backend and take the first KV type that reaches the maximum.
+3. Draft models (MTP): keep `-ctkd q8_0 -ctvd q8_0`; their KV is small, the 2 GiB margin covers it. If a draft does not fit, drop it before
+   shrinking the main context.
+4. `-ub 2048`, except Nemotron Bolt (`-ub 1024`, +12 % prefill on CUDA, +5 % on Vulkan).
+5. Verify each line: start it, wait for `/health`, send one request, and record the VRAM used.
+6. Use the card's own device selection: CUDA `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=<index>` and `-dev CUDA0`; Vulkan `-dev Vulkan<N>`; HIP `-dev ROCm0`.
+   Build with `build-cuda` / `build-vk` (and the HIP build for AMD).
 
-```
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 \
-  llama-server -m MODEL.gguf -dev CUDA0 -ngl 99 -fa on -c CTX -ctk f16 -ctv f16 -ub 2048 --parallel 1 [SPEC ARGS]
-# Vulkan: the same without the CUDA variables and with -dev Vulkan1
-```
+## RTX 3090 (24 GB)
 
-## Per model
+
+### Measured speed (f16 KV, `-ub 2048`)
 
 `SPEC ARGS` are the extra arguments of the best configuration. "tg server" is the 20.7k prompt / short prompt generation speed
 with q8_0 KV and `-c 32768` (the specrun setting), without / with the draft.
@@ -44,86 +44,175 @@ with q8_0 KV and `-c 32768` (the specrun setting), without / with the draft.
 | Qwen3-14B (Q4_K_M) | f16 KV for prefill (2950 vs 2910); at long contexts q8_0 decodes faster on CUDA (68 vs 66 @16k). No draft (Eagle3 is slower) | f16 KV, no draft. pp 2843, tg 80 / 59 @16k |
 | Qwen3.8-27B (UD-IQ4_XS) | f16 KV (or `iq4_nl` for >64k contexts, tg@64k 37.8). pp 1704, tg 48 / 45 @16k; with MTP see `rtx3090-results.md` | f16 KV. pp 1252, tg 39 / 37 @16k |
 
-## Context length guidance
 
-- 24 GB leaves room for f16 KV of about 32k tokens for the 9B-14B dense models and much more for hybrid/SWA models
-  (Qwen3.5/3.8, gemma-4, Nemotron): there the KV is small and `-c 131072` with f16 fits.
-- Beyond that switch to `-ctk q8_0 -ctv q8_0`, then `iq4_nl`. Decode at 64k depth with iq4_nl on CUDA is 37.8 t/s for Qwen3.8-27B
-  and 113 t/s for gemma-4-26B (q8_0 KV, MMA path).
-- ROCm needs `-c 100000` with MTP on the 16 GB RX 6900 XT (see `rx6900xt-results.md`).
 
-## Validation of this state
+Commands below use the context and KV type from the rules (smallest KV quantization that reaches the model maximum). Prefill and decode are a few percent slower than the f16 numbers above where the KV is quantized; the f16 line is the fastest choice if you need less context.
 
-- test-backend-ops: CUDA 20335/20335, Vulkan 22421/22421 (FLASH_ATTN_EXT also 5820/5820 on the T1200).
-- wikiqa 25/25 + 5/5 on both backends (Qwen3.5 MTP, Qwen3.8 iq4_nl and MTP); attach test 6/6 finished, loop counts unchanged from
-  the previous rounds (`val3090-final.txt`).
 
-## Complete commands (model via `-hf`)
+### Commands: CUDA (`-dev CUDA0`)
 
-Each line is the best configuration from the table above. `-hf` resolves the main model from the Hugging Face cache (or downloads it).
-`-hfd` does not resolve the gemma-4 `MTP/` subdirectory files, so those two use `-md` with the cached path (`$HF` below).
-`-c` is the model maximum, or, where f16 KV does not fit in 24 GB, the largest value that fits (see the table below); the numbers come from `llama-fit-params -fa on -ctk f16 -ctv f16 -ub 2048 -fitt 2048` (2 GiB left free for compute buffers and a draft model), the smaller of the CUDA and Vulkan results. For Vulkan drop the two CUDA variables and use `-dev Vulkan1`
-(Bolt: the only differences are noted in the table; gpt-oss, GLM, Phi-4, Qwen3-14B, flint, Qwen3.8 are identical on both backends except `-dev`).
+**Qwen3.5-9B (MTP)**
 
 ```
-P='CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1'
-C='-dev CUDA0 -ngl 99 -fa on -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj'
-HF=~/.cache/huggingface/hub/models--unsloth--gemma-4-12b-it-GGUF/snapshots/fc034cfff751157913579611efad8462ac1be606
-
-# Qwen3.5-9B (MTP, n-max 2 for short prompts, 1 for long)
-env $P llama-server -hf unsloth/Qwen3.5-9B-MTP-GGUF:UD-Q4_K_XL -c 262144 $C --spec-type draft-mtp --spec-draft-n-max 2 -ctkd q8_0 -ctvd q8_0
-
-# Ornith-1.5-9B
-env $P llama-server -hf ornith-ai/Ornith-1.5-9B-GGUF:Q4_K_M -c 262144 $C --spec-type draft-mtp --spec-draft-n-max 1 -ctkd q8_0 -ctvd q8_0
-
-# Phi-4-reasoning-plus
-env $P llama-server -hf unsloth/Phi-4-reasoning-plus-GGUF:UD-Q4_K_XL -c 32768 $C
-
-# gemma-4-12b (MTP draft from the cached MTP/ file)
-env $P llama-server -hf unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL -c 262144 $C -md $HF/MTP/mtp-gemma-4-12b-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0
-
-# gemma-4-26B-A4B
-HF26=~/.cache/huggingface/hub/models--unsloth--gemma-4-26B-A4B-it-GGUF/snapshots/c099eb48e663fd284577b04978a94ffccb261841
-env $P llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ4_NL -c 259840 $C -md $HF26/MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0
-
-# Nemotron-3.5-Lightning-30B-A3B
-env $P llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF:UD-IQ3_XXS -c 335872 $C --spec-type draft-mtp --spec-draft-n-max 1 -ctkd q8_0 -ctvd q8_0
-
-# Nemotron-3.5-Bolt-E4B (CUDA: -ub 1024; Vulkan: -ub 1024 too for prefill)
-env $P llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:UD-Q4_K_XL -c 131072 ${C/-ub 2048/-ub 1024}
-
-# flint (either quantization)
-env $P llama-server -hf unsloth/flint-GGUF:UD-Q3_K_XL -c 97536 $C
-env $P llama-server -hf unsloth/flint-GGUF:UD-IQ3_XXS -c 216064 $C
-
-# gpt-oss-20b
-env $P llama-server -hf unsloth/gpt-oss-20b-GGUF:UD-Q4_K_XL -c 131072 $C
-
-# GLM-4.7-Flash-REAP-23B-A3B (keep f16 KV)
-env $P llama-server -hf unsloth/GLM-4.7-Flash-REAP-23B-A3B-GGUF:UD-Q4_K_XL -c 128256 $C
-
-# Qwen3-14B
-env $P llama-server -hf unsloth/Qwen3-14B-GGUF:Q4_K_M -c 40960 $C
-
-# Qwen3.8-27B (f16 KV fits 101376 tokens; with `-ctk q8_0 -ctv q8_0` 181248, with iq4_nl more still)
-env $P llama-server -hf unsloth/Qwen3.8-27B-GGUF:UD-IQ4_XS -c 101376 $C
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/Qwen3.5-9B-MTP-GGUF:UD-Q4_K_XL -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 2 -ctkd q8_0 -ctvd q8_0
 ```
 
-Largest context that fits (llama-fit-params, 2 GiB free), CUDA / Vulkan; a value equal to the model maximum is not a limit:
+**Ornith-1.5-9B (MTP)**
 
-| model | f16 KV | q8_0 KV | model maximum |
-|---|---|---|---|
-| Qwen3.5-9B, Ornith-1.5-9B, gemma-4-12b | 262144 / 262144 | 262144 | 262144 |
-| Phi-4-reasoning-plus | 32768 | 32768 | 32768 |
-| Qwen3-14B | 40960 | 40960 | 40960 |
-| gpt-oss-20b, Bolt-E4B | 131072 | 131072 | 131072 |
-| GLM-4.7-Flash-REAP | 128256 / 132352 | 202752 | 202752 |
-| flint UD-Q3_K_XL | 97536 / 107520 | 169984 / 186880 | 262144 |
-| flint UD-IQ3_XXS | 216064 / 226048 | 262144 | 262144 |
-| gemma-4-26B-A4B | 259840 / 262144 | 262144 | 262144 |
-| Nemotron Lightning-30B | 335872 / 564224 | 480512 / 1048576 | 1048576 |
-| Qwen3.8-27B | 101376 / 101888 | 181248 / 182272 | 262144 |
+```
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf ornith-ai/Ornith-1.5-9B-GGUF:Q4_K_M -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 1 -ctkd q8_0 -ctvd q8_0
+```
 
-Models where f16 does not reach the maximum (GLM, flint Q3_K_XL, Qwen3.8, Lightning, gemma-26B, flint IQ3_XXS) can use
-`-ctk q8_0 -ctv q8_0` with the larger value from the second column at a few percent lower speed.
-Raw output: `~/llama-bench-results/ctxfit.txt`.
+**Phi-4-reasoning-plus**
+
+```
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/Phi-4-reasoning-plus-GGUF:UD-Q4_K_XL -dev CUDA0 -ngl 99 -fa on -c 32768 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**gemma-4-12b (MTP)**
+
+```
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md /home/zsoltii/.cache/huggingface/hub/models--unsloth--gemma-4-12b-it-GGUF/snapshots/fc034cfff751157913579611efad8462ac1be606/MTP/mtp-gemma-4-12b-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0
+```
+
+**gemma-4-26B-A4B (MTP)**
+
+```
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ4_NL -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md /home/zsoltii/.cache/huggingface/hub/models--unsloth--gemma-4-26B-A4B-it-GGUF/snapshots/c099eb48e663fd284577b04978a94ffccb261841/MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0
+```
+
+**Nemotron-3.5-Lightning-30B-A3B (MTP)**
+
+```
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF:UD-IQ3_XXS -dev CUDA0 -ngl 99 -fa on -c 622336 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 1 -ctkd q8_0 -ctvd q8_0
+```
+
+**Nemotron-3.5-Bolt-E4B**
+
+```
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:UD-Q4_K_XL -dev CUDA0 -ngl 99 -fa on -c 131072 -ctk f16 -ctv f16 -ub 1024 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**flint UD-Q3_K_XL**
+
+```
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/flint-GGUF:UD-Q3_K_XL -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**flint UD-IQ3_XXS**
+
+```
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/flint-GGUF:UD-IQ3_XXS -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**gpt-oss-20b**
+
+```
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/gpt-oss-20b-GGUF:UD-Q4_K_XL -dev CUDA0 -ngl 99 -fa on -c 131072 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**GLM-4.7-Flash-REAP-23B-A3B**
+
+```
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/GLM-4.7-Flash-REAP-23B-A3B-GGUF:UD-Q4_K_XL -dev CUDA0 -ngl 99 -fa on -c 202752 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**Qwen3-14B**
+
+```
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/Qwen3-14B-GGUF:Q4_K_M -dev CUDA0 -ngl 99 -fa on -c 40960 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**Qwen3.8-27B**
+
+```
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/Qwen3.8-27B-GGUF:UD-IQ4_XS -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+
+### Commands: Vulkan (`-dev Vulkan1`)
+
+**Qwen3.5-9B (MTP)**
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/Qwen3.5-9B-MTP-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 2 -ctkd q8_0 -ctvd q8_0
+```
+
+**Ornith-1.5-9B (MTP)**
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf ornith-ai/Ornith-1.5-9B-GGUF:Q4_K_M -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 1 -ctkd q8_0 -ctvd q8_0
+```
+
+**Phi-4-reasoning-plus**
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/Phi-4-reasoning-plus-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 32768 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**gemma-4-12b (MTP)**
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md /home/zsoltii/.cache/huggingface/hub/models--unsloth--gemma-4-12b-it-GGUF/snapshots/fc034cfff751157913579611efad8462ac1be606/MTP/mtp-gemma-4-12b-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0
+```
+
+**gemma-4-26B-A4B (MTP)**
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ4_NL -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md /home/zsoltii/.cache/huggingface/hub/models--unsloth--gemma-4-26B-A4B-it-GGUF/snapshots/c099eb48e663fd284577b04978a94ffccb261841/MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0
+```
+
+**Nemotron-3.5-Lightning-30B-A3B (MTP)**
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF:UD-IQ3_XXS -dev Vulkan1 -ngl 99 -fa on -c 1048576 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 1 -ctkd q8_0 -ctvd q8_0
+```
+
+**Nemotron-3.5-Bolt-E4B**
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 131072 -ctk f16 -ctv f16 -ub 1024 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**flint UD-Q3_K_XL**
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/flint-GGUF:UD-Q3_K_XL -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**flint UD-IQ3_XXS**
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/flint-GGUF:UD-IQ3_XXS -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**gpt-oss-20b**
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/gpt-oss-20b-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 131072 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**GLM-4.7-Flash-REAP-23B-A3B**
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/GLM-4.7-Flash-REAP-23B-A3B-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 202752 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**Qwen3-14B**
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/Qwen3-14B-GGUF:Q4_K_M -dev Vulkan1 -ngl 99 -fa on -c 40960 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**Qwen3.8-27B**
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/Qwen3.8-27B-GGUF:UD-IQ4_XS -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+
+## Other cards
+
+Add one section per card with the same layout (rules above, then speed table and the CUDA / Vulkan / HIP command blocks).
+Cards to do: RX 6900 XT (16 GB, HIP and Vulkan; with MTP it needs `-c 100000`, see `rx6900xt-results.md`), RTX 2080 Ti (11 GB), GTX 1080 Ti (11 GB),
+Intel Arc Pro B50 (16 GB, Vulkan), T1200 is not a target. For 11-16 GB cards most of the 20-30B MoE models above no longer fit; start from the fit check in rule 1.
