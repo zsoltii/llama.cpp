@@ -1,6 +1,6 @@
 # Best llama-server commands per card and model
 
-Every command is a single line that works with copy and paste (run it from any directory; the binaries are addressed by absolute path).
+Every command is a single line that works with copy and paste (run it from the repository root; the binaries are addressed relative to it, the cached MTP files with `~`).
 Speed numbers are tokens/s from `llama-bench` / `llama-server` runs (see `bestsweep2.txt`, `specrun-final.txt` in `~/llama-bench-results`).
 
 ## Rules for writing a section for a new card
@@ -47,6 +47,7 @@ with q8_0 KV and `-c 32768` (the specrun setting), without / with the draft.
 
 
 
+
 Commands below use the context and KV type from the rules (smallest KV quantization that reaches the model maximum). Prefill and decode are a few percent slower than the f16 numbers above where the KV is quantized; the f16 line is the fastest choice if you need less context.
 
 
@@ -55,79 +56,79 @@ Commands below use the context and KV type from the rules (smallest KV quantizat
 **Qwen3.5-9B (MTP)**
 
 ```
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/Qwen3.5-9B-MTP-GGUF:UD-Q4_K_XL -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 2 -ctkd q8_0 -ctvd q8_0
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 build-cuda/bin/llama-server -hf unsloth/Qwen3.5-9B-MTP-GGUF:UD-Q4_K_XL -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 2 -ctkd q8_0 -ctvd q8_0
 ```
 
 **Ornith-1.5-9B (MTP)**
 
 ```
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf ornith-ai/Ornith-1.5-9B-GGUF:Q4_K_M -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 1 -ctkd q8_0 -ctvd q8_0
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 build-cuda/bin/llama-server -hf ornith-ai/Ornith-1.5-9B-GGUF:Q4_K_M -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 1 -ctkd q8_0 -ctvd q8_0
 ```
 
 **Phi-4-reasoning-plus**
 
 ```
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/Phi-4-reasoning-plus-GGUF:UD-Q4_K_XL -dev CUDA0 -ngl 99 -fa on -c 32768 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 build-cuda/bin/llama-server -hf unsloth/Phi-4-reasoning-plus-GGUF:UD-Q4_K_XL -dev CUDA0 -ngl 99 -fa on -c 32768 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
 ```
 
 **gemma-4-12b (MTP)**
 
 ```
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md /home/zsoltii/.cache/huggingface/hub/models--unsloth--gemma-4-12b-it-GGUF/snapshots/fc034cfff751157913579611efad8462ac1be606/MTP/mtp-gemma-4-12b-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 build-cuda/bin/llama-server -hf unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md ~/.cache/huggingface/hub/models--unsloth--gemma-4-12b-it-GGUF/snapshots/fc034cfff751157913579611efad8462ac1be606/MTP/mtp-gemma-4-12b-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0
 ```
 
 **gemma-4-26B-A4B (MTP)**
 
 ```
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ4_NL -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md /home/zsoltii/.cache/huggingface/hub/models--unsloth--gemma-4-26B-A4B-it-GGUF/snapshots/c099eb48e663fd284577b04978a94ffccb261841/MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 build-cuda/bin/llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ4_NL -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md ~/.cache/huggingface/hub/models--unsloth--gemma-4-26B-A4B-it-GGUF/snapshots/c099eb48e663fd284577b04978a94ffccb261841/MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0
 ```
 
 **Nemotron-3.5-Lightning-30B-A3B (MTP)**
 
 ```
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF:UD-IQ3_XXS -dev CUDA0 -ngl 99 -fa on -c 393216 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 1 -ctkd q8_0 -ctvd q8_0
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 build-cuda/bin/llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF:UD-IQ3_XXS -dev CUDA0 -ngl 99 -fa on -c 393216 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 1 -ctkd q8_0 -ctvd q8_0
 ```
 
 **Nemotron-3.5-Bolt-E4B**
 
 ```
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:UD-Q4_K_XL -dev CUDA0 -ngl 99 -fa on -c 131072 -ctk f16 -ctv f16 -ub 1024 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 build-cuda/bin/llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:UD-Q4_K_XL -dev CUDA0 -ngl 99 -fa on -c 131072 -ctk f16 -ctv f16 -ub 1024 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
 ```
 
 **flint UD-Q3_K_XL**
 
 ```
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/flint-GGUF:UD-Q3_K_XL -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 build-cuda/bin/llama-server -hf unsloth/flint-GGUF:UD-Q3_K_XL -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
 ```
 
 **flint UD-IQ3_XXS**
 
 ```
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/flint-GGUF:UD-IQ3_XXS -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 build-cuda/bin/llama-server -hf unsloth/flint-GGUF:UD-IQ3_XXS -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
 ```
 
 **gpt-oss-20b**
 
 ```
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/gpt-oss-20b-GGUF:UD-Q4_K_XL -dev CUDA0 -ngl 99 -fa on -c 131072 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 build-cuda/bin/llama-server -hf unsloth/gpt-oss-20b-GGUF:UD-Q4_K_XL -dev CUDA0 -ngl 99 -fa on -c 131072 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
 ```
 
 **GLM-4.7-Flash-REAP-23B-A3B**
 
 ```
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/GLM-4.7-Flash-REAP-23B-A3B-GGUF:UD-Q4_K_XL -dev CUDA0 -ngl 99 -fa on -c 202752 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 build-cuda/bin/llama-server -hf unsloth/GLM-4.7-Flash-REAP-23B-A3B-GGUF:UD-Q4_K_XL -dev CUDA0 -ngl 99 -fa on -c 202752 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
 ```
 
 **Qwen3-14B**
 
 ```
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/Qwen3-14B-GGUF:Q4_K_M -dev CUDA0 -ngl 99 -fa on -c 40960 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 build-cuda/bin/llama-server -hf unsloth/Qwen3-14B-GGUF:Q4_K_M -dev CUDA0 -ngl 99 -fa on -c 40960 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
 ```
 
 **Qwen3.8-27B**
 
 ```
-CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-cuda/bin/llama-server -hf unsloth/Qwen3.8-27B-GGUF:UD-IQ4_XS -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 build-cuda/bin/llama-server -hf unsloth/Qwen3.8-27B-GGUF:UD-IQ4_XS -dev CUDA0 -ngl 99 -fa on -c 262144 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
 ```
 
 
@@ -136,79 +137,79 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 LLAMA_MTP_DEFER_CATCHUP=1 /h
 **Qwen3.5-9B (MTP)**
 
 ```
-LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/Qwen3.5-9B-MTP-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 2 -ctkd q8_0 -ctvd q8_0
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/Qwen3.5-9B-MTP-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 2 -ctkd q8_0 -ctvd q8_0
 ```
 
 **Ornith-1.5-9B (MTP)**
 
 ```
-LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf ornith-ai/Ornith-1.5-9B-GGUF:Q4_K_M -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 1 -ctkd q8_0 -ctvd q8_0
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf ornith-ai/Ornith-1.5-9B-GGUF:Q4_K_M -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 1 -ctkd q8_0 -ctvd q8_0
 ```
 
 **Phi-4-reasoning-plus**
 
 ```
-LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/Phi-4-reasoning-plus-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 32768 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/Phi-4-reasoning-plus-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 32768 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
 ```
 
 **gemma-4-12b (MTP)**
 
 ```
-LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md /home/zsoltii/.cache/huggingface/hub/models--unsloth--gemma-4-12b-it-GGUF/snapshots/fc034cfff751157913579611efad8462ac1be606/MTP/mtp-gemma-4-12b-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md ~/.cache/huggingface/hub/models--unsloth--gemma-4-12b-it-GGUF/snapshots/fc034cfff751157913579611efad8462ac1be606/MTP/mtp-gemma-4-12b-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0
 ```
 
 **gemma-4-26B-A4B (MTP)**
 
 ```
-LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ4_NL -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md /home/zsoltii/.cache/huggingface/hub/models--unsloth--gemma-4-26B-A4B-it-GGUF/snapshots/c099eb48e663fd284577b04978a94ffccb261841/MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ4_NL -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md ~/.cache/huggingface/hub/models--unsloth--gemma-4-26B-A4B-it-GGUF/snapshots/c099eb48e663fd284577b04978a94ffccb261841/MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0
 ```
 
 **Nemotron-3.5-Lightning-30B-A3B (MTP)**
 
 ```
-LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF:UD-IQ3_XXS -dev Vulkan1 -ngl 99 -fa on -c 1048576 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 1 -ctkd q8_0 -ctvd q8_0
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF:UD-IQ3_XXS -dev Vulkan1 -ngl 99 -fa on -c 1048576 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 1 -ctkd q8_0 -ctvd q8_0
 ```
 
 **Nemotron-3.5-Bolt-E4B**
 
 ```
-LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 131072 -ctk f16 -ctv f16 -ub 1024 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 131072 -ctk f16 -ctv f16 -ub 1024 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
 ```
 
 **flint UD-Q3_K_XL**
 
 ```
-LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/flint-GGUF:UD-Q3_K_XL -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/flint-GGUF:UD-Q3_K_XL -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
 ```
 
 **flint UD-IQ3_XXS**
 
 ```
-LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/flint-GGUF:UD-IQ3_XXS -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/flint-GGUF:UD-IQ3_XXS -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
 ```
 
 **gpt-oss-20b**
 
 ```
-LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/gpt-oss-20b-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 131072 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/gpt-oss-20b-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 131072 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
 ```
 
 **GLM-4.7-Flash-REAP-23B-A3B**
 
 ```
-LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/GLM-4.7-Flash-REAP-23B-A3B-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 202752 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/GLM-4.7-Flash-REAP-23B-A3B-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 202752 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
 ```
 
 **Qwen3-14B**
 
 ```
-LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/Qwen3-14B-GGUF:Q4_K_M -dev Vulkan1 -ngl 99 -fa on -c 40960 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/Qwen3-14B-GGUF:Q4_K_M -dev Vulkan1 -ngl 99 -fa on -c 40960 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
 ```
 
 **Qwen3.8-27B**
 
 ```
-LLAMA_MTP_DEFER_CATCHUP=1 /home/zsoltii/IdeaProjects/llama.cpp/build-vk/bin/llama-server -hf unsloth/Qwen3.8-27B-GGUF:UD-IQ4_XS -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/Qwen3.8-27B-GGUF:UD-IQ4_XS -dev Vulkan1 -ngl 99 -fa on -c 262144 -ctk iq4_nl -ctv iq4_nl -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
 ```
 
 
