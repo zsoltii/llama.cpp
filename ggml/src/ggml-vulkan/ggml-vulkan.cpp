@@ -1464,8 +1464,11 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat2(const vk_device& device
         result.block_rows = 32;
         result.block_cols = 32;
     } else if (ggml_is_quantized(k_type) || ggml_is_quantized(v_type) || hsk >= 256 || hsv >= 256) {
-        result.block_rows = (hsk >= 512 || hsv >= 512) ? 32 : 64;
-        result.block_cols = 32;
+        const bool huge_head = hsk >= 512 || hsv >= 512;
+        result.block_rows = huge_head ? 32 : 64;
+        // 16 key columns for head sizes 512 and 576 (smaller K/V tile, better occupancy): RTX 3090 prefill at 16k depth,
+        // GLM-4.7-Flash 338 -> 934, gemma-4-26B 2070 -> 2770, Gemma-4 E4B 3997 -> 4931 t/s
+        result.block_cols = huge_head ? 16 : 32;
     } else {
         result.block_rows = 64;
         result.block_cols = 64;
