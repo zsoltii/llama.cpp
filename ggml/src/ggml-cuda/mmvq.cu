@@ -665,6 +665,22 @@ static constexpr __host__ __device__ bool mmvq_four_rows_generic(ggml_type type)
     }
 }
 
+// 2-4 columns (MTP verify) on Ampere+: the light types also gain from 4 rows per block. RTX 3090, 8 matrices 17408 x 5120,
+// GB/s, 2 columns: iq4_xs 837 -> 865, q4_K 812 -> 851, q6_K 862 -> 875; q5_K and 1 column are unchanged: 4 rows with the
+// fused gate / up path of 1 column costs 2.7% of Qwen3.8 tg128 (47.8 -> 46.5 t/s)
+static constexpr __host__ __device__ bool mmvq_four_rows_light_batched(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+            return true;
+        default:
+            return false;
+    }
+}
+
 #ifndef GGML_CUDA_MMVQ_TURING_RPB_SMALL
 #define GGML_CUDA_MMVQ_TURING_RPB_SMALL 4
 #endif
@@ -697,7 +713,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
                 if (table_id == MMVQ_PARAMETERS_PASCAL) {
                     return GGML_CUDA_MMVQ_PASCAL_RPB_SMALL;
                 }
-                if (table_id == MMVQ_PARAMETERS_GENERIC && mmvq_four_rows_generic(type)) {
+                if (table_id == MMVQ_PARAMETERS_GENERIC && (mmvq_four_rows_generic(type) || mmvq_four_rows_light_batched(type))) {
                     return 4;
                 }
                 return 2;
