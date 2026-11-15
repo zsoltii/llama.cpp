@@ -294,6 +294,55 @@ Notes (RTX 3090, verified by starting every command above, see `verify-cmds.txt`
 - Quantizing the draft KV (`-ctkd iq4_nl`) did not change that limit, so the commands keep `q8_0` for the draft.
 - The tokens/s printed by the verification (16-token request on a cold server) are not benchmark numbers; use the speed table.
 
+## RX 6900 XT (16 GB, gfx1030)
+
+HIP build: `build-rocm`, device `-dev ROCm0`. Only models that fit in 16 GB without CPU offload are listed (`llama-fit-params` with `-fitt 2048`, 2026-11-15).
+Left out because they need offload at the context they would be useful at: Qwen3.8-27B, gemma-4-26B-A4B, Nemotron-3.5-Lightning-30B, flint (both quants), GLM-4.7-Flash-REAP, Laguna-XS-2.1, LFM2.5-24B, Muse-Glimmer-30B, Devstral-Small-2, Magistral-Small (all fit only 4096 tokens or less with weights on the GPU).
+MTP models use `-c 100000` on ROCm (the draft context does not fit larger). Each line was started, answered one chat request, and the VRAM below was read after it. tg is the short-prompt server speed.
+Decode at 100k context (llama-bench, depth 0 -> 100000, t/s): Qwen3.5-9B 62.8 -> 50.3, gemma-4-12b f16 48.1 -> 37.5, gpt-oss-20b q8_0 115 -> 64.8 (see `rx6900xt-results.md`).
+
+**Qwen3.5-9B (MTP)** (10.8 GiB, short-prompt tg 100 with MTP)
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-rocm/bin/llama-server -hf unsloth/Qwen3.5-9B-MTP-GGUF:UD-Q4_K_XL -dev ROCm0 -ngl 99 -fa on -c 100000 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 2 -ctkd q8_0 -ctvd q8_0
+```
+
+**Ornith-1.5-9B (MTP)** (10.3 GiB, tg 94)
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-rocm/bin/llama-server -hf ornith-ai/Ornith-1.5-9B-GGUF:Q4_K_M -dev ROCm0 -ngl 99 -fa on -c 100000 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 1 -ctkd q8_0 -ctvd q8_0
+```
+
+**Phi-4-reasoning-plus** (12.7 GiB, tg 44; f16 KV reaches only 24832 tokens, q8_0 the full 32768)
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-rocm/bin/llama-server -hf unsloth/Phi-4-reasoning-plus-GGUF:UD-Q4_K_XL -dev ROCm0 -ngl 99 -fa on -c 32768 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**gemma-4-12b (MTP)** (14.2 GiB, tg 88; f16 KV (q8_0/iq4_nl would convert the hd512 cache to f16 every step: 28.5 vs 37.5 t/s at 100k), f16 reaches 204544 tokens, use q8_0 -c 262144 only if you need more)
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-rocm/bin/llama-server -hf unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL -dev ROCm0 -ngl 99 -fa on -c 200000 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md ~/.cache/huggingface/hub/models--unsloth--gemma-4-12b-it-GGUF/snapshots/fc034cfff751157913579611efad8462ac1be606/MTP/mtp-gemma-4-12b-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0 --dry-multiplier 0.8
+```
+
+**Nemotron-3.5-Bolt-E4B** (6.2 GiB, tg 71)
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-rocm/bin/llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:UD-Q4_K_XL -dev ROCm0 -ngl 99 -fa on -c 131072 -ctk f16 -ctv f16 -ub 1024 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**gpt-oss-20b** (13.2 GiB, tg 110; q8_0 KV (fits 105216 tokens; iq4_nl reaches 131072 but its hd64 decode kernel is 50 % slower at 100k))
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-rocm/bin/llama-server -hf unsloth/gpt-oss-20b-GGUF:UD-Q4_K_XL -dev ROCm0 -ngl 99 -fa on -c 105216 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**Qwen3-14B** (12.6 GiB, tg 44; f16 KV reaches only 28928 tokens, q8_0 the full 40960)
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-rocm/bin/llama-server -hf unsloth/Qwen3-14B-GGUF:Q4_K_M -dev ROCm0 -ngl 99 -fa on -c 40960 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
 ## Other cards
 
 Add one section per card with the same layout (rules above, then speed table and the CUDA / Vulkan / HIP command blocks).
