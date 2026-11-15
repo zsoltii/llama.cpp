@@ -269,7 +269,6 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_iq4_nl(
 
     float sum = 0.0f;
 
-#ifndef GGML_USE_HIP
     if constexpr ((QI8_1/2) % nthreads == 0) {
         // A thread also handles the high nibbles of its ints (QI8_1/2 further on): one table lookup for both halves.
 #pragma unroll
@@ -296,7 +295,6 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_iq4_nl(
         }
         return sum;
     }
-#endif // GGML_USE_HIP
 
 #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {

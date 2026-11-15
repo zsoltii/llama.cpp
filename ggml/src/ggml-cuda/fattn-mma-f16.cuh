@@ -393,7 +393,7 @@ static constexpr __device__ int ggml_cuda_fattn_mma_get_nstages(
 // where the 2-stage pipeline preloads its f16 tiles. _quant_dequant then converts the raw tile to the f16 tile that the
 // rest of the kernel uses. K and V share the raw tile and the f16 tile.
 template<int KV_type>
-static constexpr __device__ int flash_attn_ext_f16_quant_row_bytes(const int D) {
+static constexpr __host__ __device__ int flash_attn_ext_f16_quant_row_bytes(const int D) {
     return D/32 * (KV_type == GGML_TYPE_Q8_0 ? sizeof(block_q8_0) : sizeof(block_q4_0));
 }
 

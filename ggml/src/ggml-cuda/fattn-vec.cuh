@@ -298,13 +298,9 @@ static __global__ void flash_attn_ext_vec(
         // GQA mode on NVIDIA: partial unrolling of the KQ and V loops keeps fewer K/V loads in flight (255 registers
         // with spills otherwise). RTX 3090, us, full -> 2 / 8: gqa 4 kv 20736 q8_0 85 -> 65, iq4_nl 66 -> 55,
         // 2 tokens 106 -> 95; gqa 6 kv 33280 q8_0 148 -> 142, 2 tokens iq4_nl 237 -> 213.
-#ifdef GGML_USE_HIP
-        constexpr int unroll_KQ = nthreads_KQ;
-        constexpr int unroll_V  = WARP_SIZE;
-#else
+        // RX 6900 XT, gqa 6 kv 33280: iq4_nl 267 -> 153 us, q4_1 275 -> 170, q5_1 288 -> 220, q5_0 312 -> 217
         constexpr int unroll_KQ = ncols2 > 1 ? 2 : nthreads_KQ;
         constexpr int unroll_V  = ncols2 > 1 ? 8 : WARP_SIZE;
-#endif // GGML_USE_HIP
 #pragma unroll unroll_KQ
         for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; ++i_KQ_0) {
             const int i_KQ = threadIdx.y*WARP_SIZE + (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ-1))) + i_KQ_0;
@@ -621,6 +617,11 @@ static int ggml_cuda_flash_attn_ext_vec_gqa_heads(const ggml_tensor * dst) {
 #ifdef GGML_USE_HIP
     // q5_0 and q5_1 lose with 2 heads per block at gqa 4 (190 -> 244 us), and win at gqa 6 (371 -> 310 us)
     const bool q5 = K->type == GGML_TYPE_Q5_0 || K->type == GGML_TYPE_Q5_1;
+    // 3 heads per block (gqa 6) win for q8_0 (269 -> 228 us) and q4_0 (913 -> 222), and lose for iq4_nl (153 -> 320),
+    // q4_1 (170 -> 357) and q5_0/q5_1 (220 -> 540-650)
+    if ((K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_Q4_0) && gqa_ratio % 3 == 0) {
+        return 3;
+    }
     return !q5 || gqa_ratio > 4 ? 2 : 1;
 #else
     // RTX 3090, us, 1 head -> n heads per block:
@@ -655,14 +656,12 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
                 case 2:
                     ggml_cuda_flash_attn_ext_vec_case_impl<D, 2, 2, type_K, type_V, false>(ctx, dst);
                     return;
-#ifndef GGML_USE_HIP
                 case 3:
                     ggml_cuda_flash_attn_ext_vec_case_impl<D, 3, 3, type_K, type_V, false>(ctx, dst);
                     return;
                 case 4:
                     ggml_cuda_flash_attn_ext_vec_case_impl<D, 4, 4, type_K, type_V, false>(ctx, dst);
                     return;
-#endif // GGML_USE_HIP
                 default:
                     break;
             }
