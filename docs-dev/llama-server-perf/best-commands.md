@@ -296,8 +296,8 @@ Notes (RTX 3090, verified by starting every command above, see `verify-cmds.txt`
 
 ## RX 6900 XT (16 GB, gfx1030)
 
-HIP build: `build-rocm`, device `-dev ROCm0`. Only models that fit in 16 GB without CPU offload are listed (`llama-fit-params` with `-fitt 2048`, 2026-11-15).
-Left out because they need offload at the context they would be useful at: Qwen3.8-27B, gemma-4-26B-A4B, Nemotron-3.5-Lightning-30B, flint (both quants), GLM-4.7-Flash-REAP, Laguna-XS-2.1, LFM2.5-24B, Muse-Glimmer-30B, Devstral-Small-2, Magistral-Small (all fit only 4096 tokens or less with weights on the GPU).
+HIP build: `build-rocm`, device `-dev ROCm0`. Fit check: `llama-fit-params` with `-ub 256 -fitt 512` and the KV ladder (2026-11-15). The compute buffer of `-ub 2048` is several GiB too much on 16 GB for the bigger models, so those use `-ub 128`/`256` (slower prefill, same decode). Rule 5 does not apply to them.
+Left out because they still need CPU offload (4096 tokens or less on the GPU): Nemotron-3.5-Lightning-30B, Laguna-XS-2.1, flint UD-Q3_K_XL.
 MTP models use `-c 100000` on ROCm (the draft context does not fit larger). Each line was started, answered one chat request, and the VRAM below was read after it. tg is the short-prompt server speed.
 Decode at 100k context (llama-bench, depth 0 -> 100000, t/s): Qwen3.5-9B 62.8 -> 50.3, gemma-4-12b f16 48.1 -> 37.5, gpt-oss-20b q8_0 115 -> 64.8 (see `rx6900xt-results.md`).
 
@@ -341,6 +341,54 @@ LLAMA_MTP_DEFER_CATCHUP=1 build-rocm/bin/llama-server -hf unsloth/gpt-oss-20b-GG
 
 ```
 LLAMA_MTP_DEFER_CATCHUP=1 build-rocm/bin/llama-server -hf unsloth/Qwen3-14B-GGUF:Q4_K_M -dev ROCm0 -ngl 99 -fa on -c 40960 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**Qwen3.8-27B** (15.7 GiB, tg 25.3, pp 600-630. No draft. `-ub 256` is what lets the model plus 128k of iq4_nl KV fit (`-ub 2048` leaves only 4k); the same command gives 21.7 t/s at 100k depth)
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-rocm/bin/llama-server -hf unsloth/Qwen3.8-27B-GGUF:UD-IQ4_XS -dev ROCm0 -ngl 99 -fa on -c 128000 -ctk iq4_nl -ctv iq4_nl -ub 256 -b 256 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**gemma-4-26B-A4B (MTP)** (16.0 GiB, tg 120 with MTP; f16 KV, `-c 90000` (109568 fits without the draft, but then the VRAM is full at 16.3 GiB))
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-rocm/bin/llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ4_NL -dev ROCm0 -ngl 99 -fa on -c 90000 -ctk f16 -ctv f16 -ub 256 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md ~/.cache/huggingface/hub/models--unsloth--gemma-4-26B-A4B-it-GGUF/snapshots/c099eb48e663fd284577b04978a94ffccb261841/MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0 --dry-multiplier 0.8
+```
+
+**flint UD-IQ3_XXS** (16.1 GiB, tg 66; iq4_nl KV, `-ub 128` reaches the full 262144 (`-ub 256` 230656, q8_0 124416))
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-rocm/bin/llama-server -hf unsloth/flint-GGUF:UD-IQ3_XXS -dev ROCm0 -ngl 99 -fa on -c 262144 -ctk iq4_nl -ctv iq4_nl -ub 128 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**GLM-4.7-Flash-REAP-23B-A3B** (16.3 GiB, tg 64; iq4_nl KV, `-ub 128` 165632 tokens (`-ub 256` 140800, q8_0 75776); model maximum 202752 does not fit)
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-rocm/bin/llama-server -hf unsloth/GLM-4.7-Flash-REAP-23B-A3B-GGUF:UD-Q4_K_XL -dev ROCm0 -ngl 99 -fa on -c 165632 -ctk iq4_nl -ctv iq4_nl -ub 128 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**LFM2.5-24B-A2B** (15.4 GiB, tg 116; iq4_nl KV (q8_0 reaches 125696))
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-rocm/bin/llama-server -hf unsloth/LFM2.5-24B-A2B-GGUF:UD-Q4_K_XL -dev ROCm0 -ngl 99 -fa on -c 131072 -ctk iq4_nl -ctv iq4_nl -ub 256 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**Muse-Glimmer-30B** (15.8 GiB, tg 26; q8_0 KV, no draft (the DFlash draft does not fit next to the 131072 context))
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-rocm/bin/llama-server -hf unsloth/Muse-Glimmer-30B-GGUF:UD-Q4_K_XL -dev ROCm0 -ngl 99 -fa on -c 131072 -ctk q8_0 -ctv q8_0 -ub 256 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**Devstral-Small-2-24B** (16.2 GiB, tg 27.5; iq4_nl KV, `-ub 128`: only 54016 tokens fit (the model maximum is 151552))
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-rocm/bin/llama-server -hf unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF:UD-Q4_K_XL -dev ROCm0 -ngl 99 -fa on -c 54016 -ctk iq4_nl -ctv iq4_nl -ub 128 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**Magistral-Small-2509 (24B)** (16.2 GiB, tg 28.2; iq4_nl KV, `-ub 128`: only 54016 tokens fit (maximum 131072))
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-rocm/bin/llama-server -hf unsloth/Magistral-Small-2509-GGUF:UD-Q4_K_XL -dev ROCm0 -ngl 99 -fa on -c 54016 -ctk iq4_nl -ctv iq4_nl -ub 128 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
 ```
 
 ## Other cards
