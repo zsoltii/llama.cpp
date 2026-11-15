@@ -13982,6 +13982,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // single-token decode attention at 100k depth: Qwen3.5-9B / Ornith (hd256, 4 KV heads, gqa 4), gemma-4-12b global layers
+    // (hd512, 1 KV head, gqa 16), gpt-oss-20b full-attention layers (hd64, 8 KV heads, gqa 8, sinks)
+    for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1}, 99840, 1, true, false, 0, 0, GGML_PREC_F32, t, t));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {16, 1}, 99840, 1, true, false, 0, 0, GGML_PREC_F32, t, t));
+        test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 99840, 1, true, true, 0, 0, GGML_PREC_F32, t, t));
+    }
+
     // Qwen3.8-27B KV cache write of a decode / MTP verify step (4 KV heads x 256 values per token)
     for (ggml_type t : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_IQ4_NL }) {
         for (int r : { 1, 2 }) {

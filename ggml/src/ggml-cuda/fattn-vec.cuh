@@ -649,7 +649,14 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     // K/V head. On HIP 4 or 8 heads per block are slower (register pressure). RX 6900 XT, us, 1 head -> 2 heads:
     // - Qwen3.5-9B (gqa 4), kv 20736: q8_0 498 -> 161, iq4_nl 429 -> 160, q4_1 620 -> 192;
     // - Qwen3.8-27B (gqa 6), kv 33280: q8_0 831 -> 261, iq4_nl 696 -> 266, q4_1 1067 -> 270, q5_1 342 -> 285.
-    if constexpr (D == 256) {
+    // head sizes 64 and 128 on HIP only (not tried on CUDA). RX 6900 XT, gpt-oss (hd64, gqa 8, sinks), kv 99840:
+    // q8_0 1551 -> 431 us, iq4_nl 699 -> 662 (4 heads per block: 826 and 771)
+#ifdef GGML_USE_HIP
+    constexpr bool gqa_head_size = D == 256 || D == 128 || D == 64;
+#else
+    constexpr bool gqa_head_size = D == 256;
+#endif // GGML_USE_HIP
+    if constexpr (gqa_head_size) {
         const int heads = ggml_cuda_flash_attn_ext_vec_gqa_heads(dst);
         if (Q->ne[1] == 1) {
             switch (heads) {
