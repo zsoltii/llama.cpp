@@ -390,3 +390,31 @@ During the brew Qwen3.8-27B run the eGPU dropped off the Thunderbolt bus once (`
 - **Vulkan prefill at depth is below ROCm** on Qwen3.8 (326 vs 415 t/s at 32k), and Vulkan decode at 32k is 2% below upstream.
 - **Vulkan tg at short context is 4-12% below ROCm** on most models: mat-vec and small-op launch overhead (about 19% of a decode step).
 - The second-round commits still need the story loop, attachment and wiki QA validation runs.
+
+## Fifth round (2026-11-15): token generation at 100k context on ROCm
+
+Goal: generation speed must not fall off at 100k+ context. RX 6900 XT, ROCm0, llama-bench tg64 at depth 0 / 100000, `-ub 512`.
+Single llama-bench runs are disturbed by clock ramp (Qwen3.5-9B q8_0 @100k read 30.3 once, 47.17 +- 0.13 with `-r 4`): use `-r 3` or more.
+`test-backend-ops` FLASH_ATTN_EXT needs a kv length that is a multiple of 256 (the vec kernel needs `K->ne[1] % 256 == 0`; 100000 silently goes to the tile kernel), so the decode cases use 99840.
+
+Changes (commits 79ae27493, 93b7ffbf3):
+- iq4_nl KQ dot with one table lookup for both nibble halves, partial unroll (2 / 8) in the GQA vec kernel, now also on HIP. Qwen3.8 shape (hd256, gqa 6, kv 33280), us per layer: iq4_nl 267 -> 153, q4_1 275 -> 170, q5_0 312 -> 217, q5_1 288 -> 220, q4_0 913 -> 222 (3 heads), q8_0 269 -> 228 (3 heads). Qwen3.8-27B tg at 100k 19.45 -> 21.48 t/s (depth 0: 25.3 -> 25.6; the drop 23% -> 16%).
+- 3 heads per block (gqa 6) only for q8_0 and q4_0: iq4_nl 153 -> 320, q4_1 170 -> 357, q5 220 -> 540-650 with 3 heads.
+- Multi-head GQA vec path for head sizes 64 and 128 on HIP (gpt-oss-20b: hd64, gqa 8, sinks), kv 99840: q8_0 1551 -> 431 us (f16: 484), iq4_nl 699 -> 662. gpt-oss q8_0 tg at 100k 52.6 -> 65.0 (depth 0: 114.4). The gate is HIP only; CUDA is untested.
+- Build fixes for HIP: `__shfl_down_sync` macro, host-callable `flash_attn_ext_f16_quant_row_bytes`.
+
+Dead ends (per layer, us): 4 K threads for iq4_nl at gqa 6 (153 -> 170); 4 heads per block for hd64 (431 -> 826); vec kernel for hd512 with 2 / 3 / 4 heads (f16 898 -> 4000 / 4000 / 13000, q8_0 1543 -> 1603 / 1602 / 2259).
+
+Decode at 100k, tg64 at depth 0 -> 100000 (t/s):
+
+| model | KV | now |
+|---|---|---|
+| Qwen3.8-27B IQ4_XS | iq4_nl | 25.6 -> 21.5 |
+| Qwen3.5-9B Q4_K_XL | q8_0 | 62.6 -> 47.2 |
+| gpt-oss-20b | q8_0 | 114.4 -> 65.0 |
+| gemma-4-12b | f16 | 48.0 -> 33.9 |
+| gemma-4-12b | q8_0 | 45.9 -> 28.5 |
+
+For gemma-4-12b the global layers (hd512, 1 KV head, gqa 16) run on the tile kernel: f16 898 us per layer (bound about 400), q8_0 1543 (the cache is converted to f16 first), iq4_nl 1369. On 16 GB the f16 KV fits at 262k, so f16 is the better choice there.
+
+Open: a quantized K/V tile load for the hd512 tile kernel; the remaining attention gap at 100k (hd256 iq4_nl is at about 50% of the bandwidth bound); gpt-oss iq4_nl hd64 (662 us against 431 for q8_0); CUDA check of the hd64 / hd128 multi-head path on the RTX 3090.
