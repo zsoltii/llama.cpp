@@ -24,30 +24,6 @@ Speed numbers are tokens/s from `llama-bench` / `llama-server` runs (see `bestsw
 7. Use the card's own device selection: CUDA `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=<index>` and `-dev CUDA0`; Vulkan `-dev Vulkan<N>`; HIP `-dev ROCm0`.
    Build with `build-cuda` / `build-vk` (and the HIP build for AMD).
 
-## Idle expiry (unloading the model and the cache after a pause)
-
-llama-server has no time-to-live for the prompt cache entries (`--cache-ram` evicts by size only). The time-based option is
-`--sleep-idle-seconds SECONDS` (env `LLAMA_ARG_SLEEP_IDLE_SECONDS`, default -1 = never): after that many seconds without a request the server
-unloads the model and the KV cache, frees the VRAM and the prompt cache is lost; the next request reloads the model (a few seconds from the page cache) and recomputes the prompt.
-Append it to any command in this file:
-
-| expiry | argument |
-|---|---|
-| 1 hour | `--sleep-idle-seconds 3600` |
-| 6 hours | `--sleep-idle-seconds 21600` |
-| 12 hours | `--sleep-idle-seconds 43200` |
-| 24 hours | `--sleep-idle-seconds 86400` |
-
-Example (RX 6900 XT, Bolt, expiry 6 hours):
-
-```
-build-rocm/bin/llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:UD-Q4_K_XL -dev ROCm0 -ngl 99 -fa on -c 131072 -ctk f16 -ctv f16 -ub 1024 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --sleep-idle-seconds 21600
-```
-
-`GET /props` shows `"is_sleeping": true|false`. `GET /health`, `/props`, `/models` and `/metrics` neither wake the server nor reset the timer.
-Checked on the RX 6900 XT with `--sleep-idle-seconds 20` (Bolt): awake 4111 MiB VRAM, after 40 s `is_sleeping: true` and 282 MiB, the next `/completion` answered and the server was awake again at 4113 MiB.
-`-to` / `--timeout` (default 3600) is only the HTTP read/write timeout, not a cache lifetime.
-
 ## RTX 3090 (24 GB)
 
 
