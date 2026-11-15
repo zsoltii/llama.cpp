@@ -418,3 +418,14 @@ Decode at 100k, tg64 at depth 0 -> 100000 (t/s):
 For gemma-4-12b the global layers (hd512, 1 KV head, gqa 16) run on the tile kernel: f16 898 us per layer (bound about 400), q8_0 1543 (the cache is converted to f16 first), iq4_nl 1369. On 16 GB the f16 KV fits at 262k, so f16 is the better choice there.
 
 Open: a quantized K/V tile load for the hd512 tile kernel; the remaining attention gap at 100k (hd256 iq4_nl is at about 50% of the bandwidth bound); gpt-oss iq4_nl hd64 (662 us against 431 for q8_0); CUDA check of the hd64 / hd128 multi-head path on the RTX 3090.
+
+### Fifth round, part 2: more parallel blocks for decode (commit 7ea10527d)
+
+The HIP occupancy query is forced to 1 block per CU, so `launch_fattn` sized the grid for one wave of blocks and single-token decode was latency bound. It now uses at least nsm/2 blocks per output tile and 4*nsm in total when `Q->ne[1] == 1`.
+- A parallel-block sweep at kv 99840 (us, default -> best): hd256 gqa 4 iq4_nl 453 -> 264, q8_0 594 -> 461; hd64 gqa 8 iq4_nl 658 -> 388, q8_0 401 -> 335; hd512 gqa 16 f16 898 -> 534 (80 blocks), q8_0 1539 -> 1308 (40), iq4_nl 1365 -> 1148 (40); hd256 gqa 6 kv 33280 q8_0 228 -> 115. f16 hd256 at gqa 6 (tile kernel) 310 -> 195.
+- All 184 single-token FLASH_ATTN_EXT cases of `test-backend-ops perf`: mean time x0.78, 134 cases more than 5% faster, 3 slower (at most 7%: hd64 kv 7680-8704 q8_0, hd512 kv 16384 f16).
+- tg64 at depth 0 -> 100000, `-r 3`: Qwen3.8-27B iq4_nl 25.6 -> 21.7, Qwen3.5-9B q8_0 62.8 -> 50.3, gemma-4-12b f16 48.1 -> 37.5, gpt-oss-20b q8_0 115.2 -> 64.8.
+
+Validation on this state (ROCm0, Qwen3.5-9B MTP, q8_0 KV, `-c 100000`): FLASH_ATTN_EXT 4828/4828; attachment test 0/6 loops (seeds 7-12, qwen sampling, pp 1175, tg 58.4-59.7, acceptance 0.69-0.72); wikiqa 25/25, abstention 5/5. `loop-run.sh` has no ROCm config, so the story loop test was not run.
+
+Remaining decode gaps at 100k (share of the depth-0 speed lost): gpt-oss 44%, gemma-4-12b 22%, Qwen3.5-9B 20%, Qwen3.8-27B 15%. For gpt-oss the full-attention layers cost about 0.34-0.43 ms each; for Qwen3.8 the iq4_nl kernel (gqa 6) is compute bound in the dequant, about 2x above the bandwidth bound.
