@@ -1588,6 +1588,16 @@ void launch_fattn(
             }
         }
 
+#ifdef GGML_USE_HIP
+        // Single-token decode is latency bound: the HIP occupancy query is forced to 1 block per CU, so the wave count above
+        // underestimates what the GPU can overlap. More blocks hide the latency of the K/V loads. RX 6900 XT, us, kv 99840,
+        // default -> at least nsm/2 blocks per output tile and 4*nsm blocks in total (hd256 gqa 4 iq4_nl 453 -> 270, q8_0 594 -> 460;
+        // hd64 gqa 8 iq4_nl 658 -> 390; hd512 gqa 16 f16 898 -> 534; hd256 gqa 6 kv 33280 q8_0 228 -> 120).
+        if (Q->ne[1] == 1) {
+            const int want = std::max(nsm/2, (4*nsm + ntiles_dst - 1)/ntiles_dst);
+            parallel_blocks = std::max(parallel_blocks, std::min(want, ntiles_KV));
+        }
+#endif // GGML_USE_HIP
         if (kv_chunk > 0) {
             parallel_blocks = std::max(parallel_blocks, 2); // the chunks are merged using the partial results
         }
