@@ -349,11 +349,20 @@ LLAMA_MTP_DEFER_CATCHUP=1 build-rocm/bin/llama-server -hf unsloth/Qwen3-14B-GGUF
 LLAMA_MTP_DEFER_CATCHUP=1 build-rocm/bin/llama-server -hf unsloth/Qwen3.8-27B-GGUF:UD-IQ4_XS -dev ROCm0 -ngl 99 -fa on -c 128000 -ctk iq4_nl -ctv iq4_nl -ub 256 -b 256 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
 ```
 
-**gemma-4-26B-A4B (MTP)** (16.0 GiB, tg 120 with MTP; f16 KV, `-c 90000` (109568 fits without the draft, but then the VRAM is full at 16.3 GiB))
+**gemma-4-26B-A4B (MTP, IQ4_NL draft)** (16.0 GiB, tg 126-151 with MTP, acceptance 62-81 %; f16 KV, `-c 100000`. The draft is re-quantized to IQ4_NL, see below; with the original Q8_0 draft only `-c 90000` is comfortable (100000 fits at 16.2 GiB, 109568 only without a draft))
 
 ```
-LLAMA_MTP_DEFER_CATCHUP=1 build-rocm/bin/llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ4_NL -dev ROCm0 -ngl 99 -fa on -c 90000 -ctk f16 -ctv f16 -ub 256 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md ~/.cache/huggingface/hub/models--unsloth--gemma-4-26B-A4B-it-GGUF/snapshots/c099eb48e663fd284577b04978a94ffccb261841/MTP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0 --dry-multiplier 0.8
+LLAMA_MTP_DEFER_CATCHUP=1 build-rocm/bin/llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ4_NL -dev ROCm0 -ngl 99 -fa on -c 100000 -ctk f16 -ctv f16 -ub 256 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md ~/.cache/huggingface/hub/models--unsloth--gemma-4-26B-A4B-it-GGUF/snapshots/c099eb48e663fd284577b04978a94ffccb261841/MTP/mtp-gemma-4-26B-A4B-it-IQ4_NL.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0 --dry-multiplier 0.8
 ```
+
+The IQ4_NL draft is not downloadable; build it once from the Q8_0 draft that comes with the model (CPU only, a few seconds, no imatrix needed):
+
+```
+SNAP=~/.cache/huggingface/hub/models--unsloth--gemma-4-26B-A4B-it-GGUF/snapshots/c099eb48e663fd284577b04978a94ffccb261841/MTP
+build-rocm/bin/llama-quantize --allow-requantize $SNAP/mtp-gemma-4-26B-A4B-it-Q8_0.gguf $SNAP/mtp-gemma-4-26B-A4B-it-IQ4_NL.gguf IQ4_NL
+```
+
+`--allow-requantize` is needed because the source is already quantized (Q8_0, nearly lossless). The tied token embedding / output head (262144 x 1024) is kept at q6_K by the quantizer, so 425 MiB becomes 291 MiB, not 220. A/B on this card (3 prompts, 400 tokens, temperature 0, same acceptance within noise: 260/416 vs 264/404 accepted drafts): tg 128.6 / 151.2 / 131.2 against 126.3 / 145.0 / 125.9 with the Q8_0 draft, VRAM -137 MiB. It only helps where VRAM is the limit; the Qwen3.8 draft is already Q4_0 (same size as IQ4_NL) and the DFlash draft of Muse is 1.5 GiB either way.
 
 **flint UD-IQ3_XXS** (16.1 GiB, tg 66; iq4_nl KV, `-ub 128` reaches the full 262144 (`-ub 256` 230656, q8_0 124416))
 
