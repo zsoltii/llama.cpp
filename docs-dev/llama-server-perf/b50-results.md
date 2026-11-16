@@ -957,6 +957,45 @@ Validation:
 - test-backend-ops on the B50: 22297/22297 passed.
 - MUL_MAT iq2_s/iq3_xxs and MUL_MAT_ID: passed on the B50 and the T1200.
 
+### 32. Decode at long context on every model that fits 16 GB (2026-11-16)
+
+Goal: token generation must not fall at 100k+ context. B50 is `Vulkan1` (free VRAM 15798 MiB). `llama-bench -p 0 -n 64 -d 0,DEPTH -r 1`, scripts `depth-vk.sh`, `depth-vk-big.sh`.
+
+tg d0 -> deep, t/s (KV type of the best command; `-ub 512` small models, 256 big ones):
+
+| model | KV | d0 | deep | loss |
+|---|---|---|---|---|
+| Qwen3.5-9B | q8_0 | 29.1 | 15.4 @100k | -47% |
+| Qwen3.5-9B | f16 | 29.2 | 15.9 @100k | -46% |
+| gemma-4-12b | f16 | 21.9 | 14.3 @100k | -35% |
+| gpt-oss-20b | q8_0 | 43.0 | 20.4 @100k | -52% |
+| Qwen3.8-27B | iq4_nl | 9.77 | 6.31 @100k | -35% |
+| gemma-4-26B-A4B | iq4_nl | 36.7 | 18.5 @100k | -50% |
+| GLM-4.7-Flash | iq4_nl | 44.95 | **5.44 @32k** | -88% |
+| Devstral-Small-2 | iq4_nl | 12.0 | 8.36 @32k | -30% |
+| Magistral-Small | iq4_nl | 12.35 | 8.44 @32k | -32% |
+| flint IQ3_XXS | iq4_nl | 51.5 | 36.2 @32k | -30% |
+| LFM2.5-24B-A2B | iq4_nl | 78.8 | 53.0 @32k | -33% |
+| Muse-Glimmer-30B | iq4_nl | 12.07 | 11.2 @32k | -7% |
+
+Single-token decode FA, `test-backend-ops perf` at kv 99840 (hd256 gqa 4 / 6, hd512 gqa 16, hd64 gqa 8), us per layer:
+f16 2465 / 2853 / 2328 / 1944, q8_0 2983 / 3022 / 2617 / 1805, iq4_nl 3065 / 3079 / 2486 / 1702.
+The bandwidth bound at 224 GB/s is 1820 (hd256 f16), 970 (q8_0), 510 (iq4_nl) us: f16 is at 74 % of it, the quantized types are 3-6x above it.
+A 100k f16 cache costs ~14.6 ms per token just to read, so f16 KV is no cure; the quantized FA kernel is the lever.
+
+**GLM MLA decode read the cache once per head (fixed, c993d2335).** 20 heads on one KV head are more than the 16-row coopmat1 block, so
+no GQA block formed (`gqa=1`, `wg=(1,20,1)`) and the whole K was read 20 times: 37.7 MB x 20 = 754 MB = 3.4 ms at 224 GB/s, the
+measured 3.05 ms. The heads are now split into the fewest groups that fit a block (2 x 10 rows), each a virtual KV head (stride 0).
+kv 32768, us: f16 3051 -> 1297, q8_0 2816 -> 1863, iq4_nl 3397 -> 1685; GLM tg64 @ d32768 5.44 -> 10.42. More groups are slower
+(4: 2.1-3.2 ms, 5: 2.7-3.9 ms), so the cost is the K read per group. `GGML_VK_FA_MLA_SPLIT=0/1` switches it (default on for Xe2 only).
+FLASH_ATTN_EXT 5820/5820 on the B50.
+
+Dead ends (kernel level, hd256 gqa 4 kv 99840, q8_0 / iq4_nl us, baseline 2979 / 3067):
+- split-k count: 8 / 16 / 32 / 64 workgroups per core 4659 / 3230 / 2989 / 2946: flat from 32 up; min keys per split 128 vs 512 the same.
+- scalar shader for q8_0 / iq4_nl: 4115 / 3811; with the RDNA2/NVIDIA decode tile (rows = n_rows, 128 threads, d_split 16) at Bc 16 / 32 / 64: 4745 / 3599 / 3217 (q8_0), 4013 / 3295 / 2994 (iq4_nl): no gain.
+- full K tile staging in shared memory (`SHMEM_STAGING=1`, one barrier per tile instead of two per 16 dims): 6419 / 5590, the larger shared memory costs occupancy.
+- The coopmat1 shader stages a quantized K in 16-dim chunks with two barriers each (32 barriers per 32-key block); a fix needs a new decode kernel, not a tuning knob.
+
 ## Remaining work
 
 - FA prefill (coopmat1, Xe2): ~3.5 TFLOPS, about a third of the wiki pp.
