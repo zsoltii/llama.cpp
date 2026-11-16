@@ -1043,3 +1043,21 @@ So the Fedora 45 package build and kernel make no measurable difference to the B
 - Speed up the iq4_nl/q5_x FA dequant on CUDA and Vulkan.
 - Hardware: RTX 3090 (Ampere), RX 6900 XT (ROCm and Vulkan; the packages and groups need sudo from the user).
 - For stable measurements: `sudo nvidia-smi -i 1 -lgc 1800,1800` (the user has to run it); the noise is ±10–15% now.
+
+## Finding 34: upstream Intel Xe FA prefill kernel (#29357) ported (B50)
+
+Upstream `a963f6595` adds `flash_attn_prefill.comp` (f16 K/V, mask, no sparse/softcap/ALiBi) for Intel Xe. The latest upstream build (6b01a4767) was faster than the fork at depth, so the commit was cherry-picked and merged with the fork's KV-chunk path, MLA wrapper and `virtual_kv_heads` gate (commit 7433212b8).
+
+Qwen3.5-9B Q4_K_XL, f16 KV, Vulkan1, `-ub 512`, tokens/s:
+
+| test | fork before | after port | upstream latest |
+|---|---|---|---|
+| pp512 | 1048 | 1037 | 1026 |
+| pp4096 | 986 | 978 | 972 |
+| pp512 @ d16384 | 572 | 634 | 637 |
+| pp4096 @ d16384 | 545 | 612 | 615 |
+| tg64 @ d16384 | 25.35 | 25.38 | - |
+
+gemma-4-12B f16 and gpt-oss-20b (f16 / q8_0 KV) prefill at depth 8192 are unchanged (not eligible for the new kernel). FLASH_ATTN_EXT 5820/5820 on Vulkan1. The other recent upstream Vulkan commits (narrow-N matmul, CM2 dequantized KV) are coopmat2-only, the UMA copy change targets iGPUs; none applies to the B50.
+
+Dead end: replacing the two workgroup barriers per 16-wide quantized K chunk in `flash_attn_cm1.comp` by subgroup-scope barriers (per-subgroup staging) did not change the 100k decode time (q8_0 2983 -> 2992 us, iq4_nl 3065 -> 3041 us).
