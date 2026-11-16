@@ -1002,6 +1002,18 @@ Dead ends (kernel level, hd256 gqa 4 kv 99840, q8_0 / iq4_nl us, baseline 2979 /
 - full K tile staging in shared memory (`SHMEM_STAGING=1`, one barrier per tile instead of two per 16 dims): 6419 / 5590, the larger shared memory costs occupancy.
 - The coopmat1 shader stages a quantized K in 16-dim chunks with two barriers each (32 barriers per 32-key block); a fix needs a new decode kernel, not a tuning knob.
 
+### 33. Fedora 44 -> 45 (Mesa 26.2.6 both times): no speed difference (2026-11-16)
+
+The upgrade did not change the Mesa version: `mesa-vulkan-drivers-26.2.6-1.fc44` before, `-1.fc45` after (a rebuild of the same version); the kernel is 7.3.3 in both
+(`-200.fc44`, `-300.fc45`). `mesa-suite.sh` (frozen binaries of the fork `04196d4dd` and upstream `202c1a229`, `-r 3`) before and after, folders `mesa-before` and `mesa-after-fc45`
+in `~/llama-bench-results`:
+- Kernel level (34 cases: single-token decode FA at kv 99840, the GLM MLA case, decode FA at kv 20736 and prefill FA, q4_K mat-vec), time after / before: mean 0.992, median 0.999, range 0.88-1.01.
+  The outliers are small q4_1 / q5_1 FA cases that became 8-12 % faster; nothing got slower than 1.4 %.
+- Models (Qwen3.5-9B q8_0, gpt-oss-20b q8_0, Qwen3.8-27B iq4_nl; fork and upstream; pp512, pp4096, tg128 at depth 0 and 8192): all within +-1.1 %,
+  except one run: fork Qwen3.8 tg128 9.76 -> 8.94 (-8 %). A repeat (`-r 3`, twice) gave 9.85 and 9.76, i.e. the same as before: a transient, not a driver effect (upstream 8.74 / 8.72 in both).
+So the Fedora 45 package build and kernel make no measurable difference to the B50 Vulkan speed. A real Mesa version comparison needs a separately built ANV
+(the Mesa source is in `~/IdeaProjects/vulkan-refs/mesa`, 27.0.0-devel) selected with `VK_ICD_FILENAMES`; it has not been done.
+
 ## Remaining work
 
 - FA prefill (coopmat1, Xe2): ~3.5 TFLOPS, about a third of the wiki pp.
