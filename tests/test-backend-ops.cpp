@@ -13988,6 +13988,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1}, 99840, 1, true, false, 0, 0, GGML_PREC_F32, t, t));
         test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {16, 1}, 99840, 1, true, false, 0, 0, GGML_PREC_F32, t, t));
         test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 99840, 1, true, true, 0, 0, GGML_PREC_F32, t, t));
+        // Qwen3.8-27B (hd256, 4 KV heads, gqa 6) and GLM-4.7-Flash MLA (hsk 576, V is a view of K, 1 KV head, 20 heads)
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 99840, 1, true, false, 0, 0, GGML_PREC_F32, t, t));
+        test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 32768, 1, true, false, 0, 0, GGML_PREC_F32, t, t, {0, 1, 2, 3}, true, true));
     }
 
     // Qwen3.8-27B KV cache write of a decode / MTP verify step (4 KV heads x 256 values per token)

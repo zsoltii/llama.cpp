@@ -8701,7 +8701,7 @@ static bool ggml_vk_fa_scratch_plan(ggml_backend_vk_context * ctx, uint32_t KV, 
     return true;
 }
 
-void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
+static void ggml_vk_flash_attn_impl(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst, bool virtual_kv_heads) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
     std::cerr << "), (" << v << ", name=" << v->name << ", type=" << v->type << ", ne0=" << v->ne[0] << ", ne1=" << v->ne[1] << ", ne2=" << v->ne[2] << ", ne3=" << v->ne[3] << ", nb0=" << v->nb[0] << ", nb1=" << v->nb[1] << ", nb2=" << v->nb[2] << ", nb3=" << v->nb[3];
@@ -8975,7 +8975,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     bool xe_fa_supported_platform =
         (ctx->device.get()->architecture == INTEL_XE2 && ctx->device.get()->properties.deviceID != 0xFD80 && ctx->device.get()->properties.deviceID != 0xFD81) ||
         (ctx->device.get()->architecture == INTEL_XE1 && ctx->device.get()->coopmat_support && ctx->device.get()->uma);
-    bool xe_fa_supported_usage = neq0 % 32 == 0 && nev0 % 16 == 0 && q->nb[1] > q->nb[2] && k->nb[1] > k->nb[2] && v->nb[1] > v->nb[2] && mask != nullptr;
+    bool xe_fa_supported_usage = !virtual_kv_heads && neq0 % 32 == 0 && nev0 % 16 == 0 && q->nb[1] > q->nb[2] && k->nb[1] > k->nb[2] && v->nb[1] > v->nb[2] && mask != nullptr;
     bool xe_fa_supported_dtype = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 && (mask != nullptr && mask->type == GGML_TYPE_F16);
     std::pair<vk_pipeline, vk_pipeline> xe_fa_pipeline_dual_phases = { nullptr , nullptr };
     vk_pipeline xe_fa_pipeline = nullptr;
@@ -9533,6 +9533,43 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     if (use_mask_opt || use_sparse) {
         ctx->prealloc_y_need_sync = true;
     }
+}
+
+// MLA decode (one KV head, e.g. GLM-4.7-Flash: 20 heads, 576/512) has more heads per KV head than a block of rows holds,
+// so no GQA block formed and every head read the whole K/V cache. The heads are split into the fewest groups that fit a
+// block, and each group is a virtual KV head (stride 0) that reads the same K/V: the cache is read `groups` times instead
+// of once per head. Arc Pro B50, kv 32768, 20 heads, f16 / q8_0 / iq4_nl, us: see docs-dev/llama-server-perf/b50-results.md.
+// GGML_VK_FA_MLA_SPLIT: 0 off, 1 on (default on Intel Xe2, opt-in elsewhere until measured).
+void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
+    static const int mla_split_env = [] {
+        const char * env = getenv("GGML_VK_FA_MLA_SPLIT");
+        return env ? atoi(env) : -1;
+    }();
+    const bool mla_split_on = mla_split_env >= 0 ? mla_split_env != 0 :
+        (ctx->device->vendor_id == VK_VENDOR_ID_INTEL && ctx->device->architecture == vk_device_architecture::INTEL_XE2);
+    if (mla_split_on && k->ne[2] == 1 && v->ne[2] == 1 && q->ne[1] <= 8 && q->ne[2] > 1 && (!mask || mask->ne[2] <= 1) &&
+            k->ne[3] == q->ne[3] && v->ne[3] == q->ne[3]) {
+        const bool f32acc = !ctx->device->fp16 || !ggml_vk_prec_allows_f16acc(ggml_prec_get_acc(dst)) || k->type == GGML_TYPE_BF16;
+        const uint32_t max_gqa = std::min(get_fa_tuning_params(ctx->device, k->ne[0], v->ne[0], 512, k->ne[1], k->type, v->type, f32acc).block_rows, 32u);
+        const uint32_t heads = (uint32_t) q->ne[2];
+        if (heads > max_gqa) {
+            static const uint32_t min_groups = [] {
+                const char * env = getenv("GGML_VK_FA_MLA_GROUPS");
+                return env ? (uint32_t) std::max(2, atoi(env)) : 2u;
+            }();
+            for (uint32_t groups = min_groups; groups <= heads; ++groups) {
+                if (heads % groups == 0 && heads / groups <= max_gqa) {
+                    ggml_tensor k_virtual = *k;
+                    ggml_tensor v_virtual = *v;
+                    k_virtual.ne[2] = v_virtual.ne[2] = groups;
+                    k_virtual.nb[2] = v_virtual.nb[2] = 0;
+                    ggml_vk_flash_attn_impl(ctx, subctx, q, &k_virtual, &v_virtual, mask, sinks, dst, true);
+                    return;
+                }
+            }
+        }
+    }
+    ggml_vk_flash_attn_impl(ctx, subctx, q, k, v, mask, sinks, dst, false);
 }
 
 static vk_conv_shapes ggml_vk_conv_select_shape(ggml_backend_vk_context * ctx, uint32_t K, uint32_t NPQ) {
