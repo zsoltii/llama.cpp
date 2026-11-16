@@ -961,22 +961,28 @@ Validation:
 
 Goal: token generation must not fall at 100k+ context. B50 is `Vulkan1` (free VRAM 15798 MiB). `llama-bench -p 0 -n 64 -d 0,DEPTH -r 1`, scripts `depth-vk.sh`, `depth-vk-big.sh`.
 
-tg d0 -> deep, t/s (KV type of the best command; `-ub 512` small models, 256 big ones):
+tg d0 -> deep, t/s, Mesa 26.2.6 (Fedora 44). "upstream" is ggml-org master `202c1a229` (`build-vk`), "fork before" the fork without the GLM MLA fix
+(`b50-depth-base.txt`, `b50-depth-big-*.txt`), "fork after" the fork with it (c993d2335). The fork code that the MLA fix touches is used only by models
+with more heads per KV head than a 16-row block (GLM); for every other model "fork after" is the same as "fork before" (checked: the
+`mesa-before` suite re-measured Qwen3.5-9B / gpt-oss / Qwen3.8 on the new build, tg128 28.9 / 43.1 / 9.8 at depth 0).
 
-| model | KV | d0 | deep | loss |
-|---|---|---|---|---|
-| Qwen3.5-9B | q8_0 | 29.1 | 15.4 @100k | -47% |
-| Qwen3.5-9B | f16 | 29.2 | 15.9 @100k | -46% |
-| gemma-4-12b | f16 | 21.9 | 14.3 @100k | -35% |
-| gpt-oss-20b | q8_0 | 43.0 | 20.4 @100k | -52% |
-| Qwen3.8-27B | iq4_nl | 9.77 | 6.31 @100k | -35% |
-| gemma-4-26B-A4B | iq4_nl | 36.7 | 18.5 @100k | -50% |
-| GLM-4.7-Flash | iq4_nl | 44.95 | **5.44 @32k** | -88% |
-| Devstral-Small-2 | iq4_nl | 12.0 | 8.36 @32k | -30% |
-| Magistral-Small | iq4_nl | 12.35 | 8.44 @32k | -32% |
-| flint IQ3_XXS | iq4_nl | 51.5 | 36.2 @32k | -30% |
-| LFM2.5-24B-A2B | iq4_nl | 78.8 | 53.0 @32k | -33% |
-| Muse-Glimmer-30B | iq4_nl | 12.07 | 11.2 @32k | -7% |
+| model | KV | depth | upstream | fork before | fork after |
+|---|---|---|---|---|---|
+| Qwen3.5-9B | q8_0 | 100k | 28.66 -> 9.40 | 29.09 -> 15.39 | same |
+| gemma-4-12b | f16 | 100k | 21.61 -> no result (see below) | 21.93 -> 14.29 | same |
+| gpt-oss-20b | q8_0 | 100k | 42.84 -> 6.83 | 43.01 -> 20.44 | same |
+| Qwen3.8-27B | iq4_nl | 100k | 8.75 -> 3.78 | 9.77 -> 6.31 | same |
+| gemma-4-26B-A4B | iq4_nl | 100k | 34.59 -> no result | 36.72 -> 18.46 | same |
+| GLM-4.7-Flash | iq4_nl | 32k | 45.27 -> no result | 44.95 -> 5.44 | 44.02 -> **10.42** |
+| Devstral-Small-2 | iq4_nl | 32k | 11.85 -> 4.86 | 12.02 -> 8.36 | same |
+| Magistral-Small | iq4_nl | 32k | 12.02 -> 4.91 | 12.35 -> 8.44 | same |
+| flint IQ3_XXS | iq4_nl | 32k | 44.71 -> 18.05 | 51.51 -> 36.23 | same |
+| LFM2.5-24B-A2B | iq4_nl | 32k | 77.81 -> 47.43 | 78.83 -> 52.97 | same |
+| Muse-Glimmer-30B | iq4_nl | 32k | 12.04 -> 5.92 | 12.07 -> 11.21 | same |
+
+"no result": the upstream `llama-bench` printed no deep-depth row for those three runs (gemma-4 hd512 at 100k, GLM MLA at 32k). The cause was checked separately; see the note below the table.
+
+Qwen3.5-9B with f16 KV (fork, not in the table): 29.18 -> 15.87 @100k.
 
 Single-token decode FA, `test-backend-ops perf` at kv 99840 (hd256 gqa 4 / 6, hd512 gqa 16, hd64 gqa 8), us per layer:
 f16 2465 / 2853 / 2328 / 1944, q8_0 2983 / 3022 / 2617 / 1805, iq4_nl 3065 / 3079 / 2486 / 1702.

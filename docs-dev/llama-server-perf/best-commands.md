@@ -454,7 +454,7 @@ LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/flint-GGUF:UD-IQ
 LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/gpt-oss-20b-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 131072 -ctk q8_0 -ctv q8_0 -ub 256 -b 256 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
 ```
 
-**GLM-4.7-Flash-REAP-23B-A3B** (tg 43; iq4_nl KV, `-ub 128` 138752 tokens (maximum 202752 does not fit); decode @32k 10.4 (5.4 before the MLA head-group fix))
+**GLM-4.7-Flash-REAP-23B-A3B** (tg 43; iq4_nl KV, `-ub 128` 138752 tokens (maximum 202752 does not fit); decode @32k 10.4 with the MLA head-group fix (upstream: no result))
 
 ```
 LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/GLM-4.7-Flash-REAP-23B-A3B-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 138752 -ctk iq4_nl -ctv iq4_nl -ub 128 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
