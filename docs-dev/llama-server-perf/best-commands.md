@@ -430,7 +430,7 @@ LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/Phi-4-reasoning-
 LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 150000 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md ~/.cache/huggingface/hub/models--unsloth--gemma-4-12b-it-GGUF/snapshots/fc034cfff751157913579611efad8462ac1be606/MTP/mtp-gemma-4-12b-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0 --dry-multiplier 0.8
 ```
 
-**gemma-4-26B-A4B (MTP, IQ4_NL draft)** (tg 50 with MTP (37 without); q8_0 KV, 150000 tokens,  (the IQ4_NL draft is built as in the RX 6900 XT section); decode @100k with iq4_nl KV 18.5)
+**gemma-4-26B-A4B (MTP, IQ4_NL draft)** (tg 50 with MTP (37 without); q8_0 KV, 150000 tokens, `-ub 256` (the IQ4_NL draft is built as in the RX 6900 XT section); decode @100k with iq4_nl KV 18.5)
 
 ```
 LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ4_NL -dev Vulkan1 -ngl 99 -fa on -c 150000 -ctk q8_0 -ctv q8_0 -ub 256 -b 256 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md ~/.cache/huggingface/hub/models--unsloth--gemma-4-26B-A4B-it-GGUF/snapshots/c099eb48e663fd284577b04978a94ffccb261841/MTP/mtp-gemma-4-26B-A4B-it-IQ4_NL.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0 --dry-multiplier 0.8
