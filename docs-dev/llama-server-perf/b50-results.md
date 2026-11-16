@@ -980,7 +980,7 @@ with more heads per KV head than a 16-row block (GLM); for every other model "fo
 | LFM2.5-24B-A2B | iq4_nl | 32k | 77.81 -> 47.43 | 78.83 -> 52.97 | same |
 | Muse-Glimmer-30B | iq4_nl | 32k | 12.04 -> 5.92 | 12.07 -> 11.21 | same |
 
-"no result": the upstream `llama-bench` printed no deep-depth row for those three runs (gemma-4 hd512 at 100k, GLM MLA at 32k). The cause was checked separately; see the note below the table.
+"no result": the upstream `llama-bench` printed no deep-depth row for those three runs (gemma-4 hd512 at 100k, GLM MLA at 32k); the scripts filter the output, so the error text was not kept. The cause is not determined: a repeat of upstream gemma-4-12b f16 at depth 65536 (`-p 0 -n 8`) printed neither a result nor an error within 15 minutes (the limit of the check). The device-lost explanation of finding 1 (small BAR eGPU, long prompts) is a guess, not verified.
 
 Qwen3.5-9B with f16 KV (fork, not in the table): 29.18 -> 15.87 @100k.
 
