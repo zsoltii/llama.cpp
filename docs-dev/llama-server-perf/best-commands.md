@@ -400,6 +400,102 @@ LLAMA_MTP_DEFER_CATCHUP=1 build-rocm/bin/llama-server -hf unsloth/Devstral-Small
 LLAMA_MTP_DEFER_CATCHUP=1 build-rocm/bin/llama-server -hf unsloth/Magistral-Small-2509-GGUF:UD-Q4_K_XL -dev ROCm0 -ngl 99 -fa on -c 54016 -ctk iq4_nl -ctv iq4_nl -ub 128 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
 ```
 
+## Intel Arc Pro B50 (16 GB, Vulkan)
+
+Vulkan build `build-vk`, device `-dev Vulkan1` (the T1200 is `Vulkan0`). Free VRAM is 15798 MiB. Fit check: `llama-fit-params` with `-fitt 2048` at `-ub 2048`, and `-fitt 512/256/128` at `-ub 256/128/64` for the bigger models, KV ladder f16 -> q8_0 -> iq4_nl (2026-11-16).
+`-ub 2048` fits the models up to 14B and the 12B-26B MoEs with a short KV; the 20-30B models need `-ub 128/256` (slower prefill, the same decode). The B50 is bandwidth bound (224 GB/s): tg is the short-prompt server speed, and 100k contexts lose 30-50 % of it (single-token decode attention on quantized KV runs 3-6x above the bandwidth bound, see `b50-results.md` finding 32).
+Left out because they still need CPU offload: Nemotron-3.5-Lightning-30B, Laguna-XS-2.1, flint UD-Q3_K_XL. Every line below was started on `Vulkan1` and answered a chat request.
+
+**Qwen3.5-9B (MTP)** (tg 43 with MTP (29 without); f16 KV, 175104 tokens; decode @100k 15.9 (q8_0 15.4))
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/Qwen3.5-9B-MTP-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 175104 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 2 -ctkd q8_0 -ctvd q8_0
+```
+
+**Ornith-1.5-9B (MTP)** (tg 45 with MTP; f16 KV, 184576 tokens)
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf ornith-ai/Ornith-1.5-9B-GGUF:Q4_K_M -dev Vulkan1 -ngl 99 -fa on -c 184576 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 --spec-type draft-mtp --spec-draft-n-max 1 -ctkd q8_0 -ctvd q8_0
+```
+
+**Phi-4-reasoning-plus** (tg 19.6; q8_0 KV (f16 reaches only 21504 tokens))
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/Phi-4-reasoning-plus-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 32768 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**gemma-4-12b (MTP)** (tg 45 with MTP (22 without); f16 KV, 150000 tokens (165632 without the draft); decode @100k 14.3)
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 150000 -ctk f16 -ctv f16 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md ~/.cache/huggingface/hub/models--unsloth--gemma-4-12b-it-GGUF/snapshots/fc034cfff751157913579611efad8462ac1be606/MTP/mtp-gemma-4-12b-it-Q8_0.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0 --dry-multiplier 0.8
+```
+
+**gemma-4-26B-A4B (MTP, IQ4_NL draft)** (tg 50 with MTP (37 without); q8_0 KV, 150000 tokens,  (the IQ4_NL draft is built as in the RX 6900 XT section); decode @100k with iq4_nl KV 18.5)
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-IQ4_NL -dev Vulkan1 -ngl 99 -fa on -c 150000 -ctk q8_0 -ctv q8_0 -ub 256 -b 256 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080 -md ~/.cache/huggingface/hub/models--unsloth--gemma-4-26B-A4B-it-GGUF/snapshots/c099eb48e663fd284577b04978a94ffccb261841/MTP/mtp-gemma-4-26B-A4B-it-IQ4_NL.gguf --spec-type draft-mtp -ctkd q8_0 -ctvd q8_0 --dry-multiplier 0.8
+```
+
+**Nemotron-3.5-Bolt-E4B** (tg 35)
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/NVIDIA-Nemotron-3.5-Bolt-E4B-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 131072 -ctk f16 -ctv f16 -ub 1024 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**flint UD-IQ3_XXS** (tg 51; iq4_nl KV, `-ub 128` 229888 tokens (`-ub 64` 254720); decode @32k 36.2)
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/flint-GGUF:UD-IQ3_XXS -dev Vulkan1 -ngl 99 -fa on -c 229888 -ctk iq4_nl -ctv iq4_nl -ub 128 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**gpt-oss-20b** (tg 43; q8_0 KV, `-ub 256` reaches the full 131072 (`-ub 2048` only 64256); decode @100k 20.4)
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/gpt-oss-20b-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 131072 -ctk q8_0 -ctv q8_0 -ub 256 -b 256 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**GLM-4.7-Flash-REAP-23B-A3B** (tg 43; iq4_nl KV, `-ub 128` 138752 tokens (maximum 202752 does not fit); decode @32k 10.4 (5.4 before the MLA head-group fix))
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/GLM-4.7-Flash-REAP-23B-A3B-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 138752 -ctk iq4_nl -ctv iq4_nl -ub 128 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**Qwen3-14B** (tg 20; q8_0 KV (f16 reaches only 23808 tokens))
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/Qwen3-14B-GGUF:Q4_K_M -dev Vulkan1 -ngl 99 -fa on -c 40960 -ctk q8_0 -ctv q8_0 -ub 2048 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**Qwen3.8-27B** (tg 9.8, no draft; iq4_nl KV, `-ub 256` 112896 tokens (`-ub 128` 136192); decode @100k 6.3)
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/Qwen3.8-27B-GGUF:UD-IQ4_XS -dev Vulkan1 -ngl 99 -fa on -c 112896 -ctk iq4_nl -ctv iq4_nl -ub 256 -b 256 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**LFM2.5-24B-A2B** (tg 76; iq4_nl KV (q8_0 reaches 88832); decode @32k 53.0)
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/LFM2.5-24B-A2B-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 131072 -ctk iq4_nl -ctv iq4_nl -ub 256 -b 256 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**Muse-Glimmer-30B** (tg 12.0, no draft (no MTP exists; the DFlash draft runs out of memory even at 8192 tokens); iq4_nl KV)
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/Muse-Glimmer-30B-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 131072 -ctk iq4_nl -ctv iq4_nl -ub 256 -b 256 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**Devstral-Small-2-24B** (tg 12.0; iq4_nl KV, `-ub 128`: only 45056 tokens fit (maximum 151552); decode @32k 8.4)
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 45056 -ctk iq4_nl -ctv iq4_nl -ub 128 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
+**Magistral-Small-2509 (24B)** (tg 12.3; iq4_nl KV, `-ub 128`: only 45056 tokens fit (maximum 131072); decode @32k 8.4)
+
+```
+LLAMA_MTP_DEFER_CATCHUP=1 build-vk/bin/llama-server -hf unsloth/Magistral-Small-2509-GGUF:UD-Q4_K_XL -dev Vulkan1 -ngl 99 -fa on -c 45056 -ctk iq4_nl -ctv iq4_nl -ub 128 --parallel 1 --no-mmproj --host 127.0.0.1 --port 8080
+```
+
 ## Other cards
 
 Add one section per card with the same layout (rules above, then speed table and the CUDA / Vulkan / HIP command blocks).
