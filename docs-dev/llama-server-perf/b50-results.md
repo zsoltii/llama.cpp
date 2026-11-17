@@ -1096,3 +1096,13 @@ q4_K 4096x512x14336, baseline measured in the same session 3150 us (the card run
 - touching the next B block early (software prefetch, consumed after the loop): 3340 us, slower;
 - loading the B fragments straight from global memory with coopMatLoad (no shared copy, aligned f16 B): 12.2 ms, 4x slower (no 2D block load, per-lane gathers).
 Conclusion: the shared-memory staging structure of `mul_mm.comp` cannot be fixed with local edits; a real gain needs a kernel that issues 2D block loads for both operands or a register-staged, software-pipelined main loop, which needs ISA-level profiling (not available here) to guide it.
+
+## Finding 40: Mesa 27.0.0-devel ANV vs Mesa 26.2.6 on the B50 (frozen binaries)
+
+Mesa 27.0.0-devel (git 4fac8318e4, 2026-11-10) built from `~/IdeaProjects/vulkan-refs/mesa` with only the Intel Vulkan driver (`meson setup -Dvulkan-drivers=intel -Dgallium-drivers= -Dplatforms= -Dllvm=enabled -Dbuildtype=release`), loaded through `VK_ICD_FILENAMES=~/mesa27-anv/intel_icd.json` (the B50 is then the only device, so `mesa-suite-v0.sh` uses Vulkan0). Same frozen fork (04196d4dd) and upstream (202c1a229) binaries, same kernel 7.3.3, same session type as `mesa-before` (26.2.6); results in `~/llama-bench-results/mesa-mesa27/`.
+
+Kernel level (34 cases, time 27 / 26.2.6): mean 0.842, median 0.855, range 0.62-1.09. Single-token decode FA at kv 99840: hd256 gqa4 f16 2472 -> 2039 us, q8_0 2989 -> 2229, hd64 gqa8 f16 1945 -> 1344, hd512 q8_0 2615 -> 1988; prefill FA (kv 8704, 512 rows) quantized K/V 29-36 ms -> 19-22 ms (ratio 0.62-0.71), f16 0.91; kv 20736 decode 0.70-0.96. Exceptions: the GLM MLA case (576/512, 20 heads) f16 1301 -> 1418 us (+9 %), q8_0 / iq4_nl +0-3 %.
+
+Models (fork binary, tokens/s, 26.2.6 -> 27): Qwen3.5-9B q8_0 KV pp512 1018 -> 1117 (+9.7 %), pp4096 +9.4 %, tg128 28.9 -> 28.2 (-2.4 %), at depth 8192 pp +9 %, tg unchanged; gpt-oss-20b pp512 1061 -> 1557 (+47 %), pp4096 +43 %, tg128 43.1 -> 48.4 (+12 %), at depth 8192 pp +34 % / tg +13 %; Qwen3.8-27B iq4_nl pp +1-4 %, tg +2 %. Upstream binary: Qwen3.5 +8-9 % pp, gpt-oss pp512 +38 %, tg +12-22 %, but Qwen3.8 pp4096 -6 % and at depth 8192 -15 % (the fork's own kernels do not regress there).
+
+Conclusion: the Mesa version matters a lot, unlike the Fedora 44 -> 45 repackaging (finding 33). The newer ANV compiler speeds up the quantized FA and the gpt-oss path by up to 47 %. Mesa 27 is not released (devel snapshot, locally built); a distro update to 27 should bring these gains for free, and the fork's tunings (`GGML_VK_FA_WG_PER_CORE`, min KV split, MLA head groups) should be re-checked against it once it ships (the GLM MLA f16 case is the one that got slower).
