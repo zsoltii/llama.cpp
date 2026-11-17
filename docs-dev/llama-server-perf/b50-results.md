@@ -1117,3 +1117,12 @@ Conclusion: the Mesa version matters a lot, unlike the Fedora 44 -> 45 repackagi
 | hybrid | 6684 -> 7502 | 9683 -> 11905 (+23 %) | 7577 -> 8578 |
 
 The hybrid head costs ~3 % against dense. FA off is 15-40 % slower at pp2048 (4.6k vs 7.6k t/s), so keep it on. Qwen3.5-9B pp512 / tg64 unchanged (1036 / 29.3 vs 1032 / 29.3). Accuracy against the CPU backend (68 texts of `corpus/long-wiki.txt`, hybrid f16): dense cos min 0.999973, sparse rel. L1 0.40 %, top-1 dense 1.0 / sparse 0.985, top-5 1.0; `test-backend-ops` ADD,MUL 210/210. Remaining 37 ms: matmul 23.5 ms (12-16 TFLOPS, the shared-staging limit of findings 38/39), FA 6.7 ms (3.8 TFLOPS), ADD 2.4, GELU 1.5, PAD+CPY 1.7 (K/V pad of the no-cache encoder is a no-op copy when the token count is a multiple of 256; skipping it would change the graph the OpenVINO backend caches), NORM 0.9.
+
+## Finding 42: validation of the origin/master merge, vec4 ADD/MUL, Intel prefill FA, MLA split (B50, Vulkan1, Qwen3.5-9B UD-Q4_K_XL)
+
+`bench/suites/validate.sh merge-20261117` on commit e783ba23e (build-vk, Mesa 26.2.6):
+- `test-backend-ops` full on Vulkan1: 22678/22678 passed.
+- Wiki QA (hallucination): answerable 25/25, abstained 5/5.
+- Speed, Qwen sampling, median of the wiki/story prompts: MTP pp 628-341 / tg 30.9-33.4 t/s, no MTP tg 23.5-27.8 t/s.
+- Attachment test (the user's command, 24 seeds, 41366-token prompt): 0/24 loops, 24/24 finished with `stop`, none stuck in thinking, pp 455 t/s, tg 27.4-28.8 t/s (baseline of 2026-10-30: 0/24, tg 22.1-22.9), MTP acceptance 0.66-0.74 (baseline 0.68-0.73).
+- Story loop test (prompt 2, 6 seeds, 12000 tokens), fork vs unmodified upstream Vulkan (202c1a229, new configs `upv-full` / `upv-qwen` in `loop-run.sh`): default sampling 6/6 vs 6/6 (as in the earlier baselines, both loop); Qwen sampling fork 2/6 "not ok" vs upstream 0/6. The two fork runs are seed 3 (LOOP score 0) and seed 5 (score 26, threshold 300): both ran into the 12000-token cap while still writing a story without repeating (the upstream runs ended with `stop` after 5-10k tokens), so no repetition loop by the detector; the earlier B50 loop baseline of the fork was 2/12 with ~400-token paragraph cycles. Fork tg in this test 35-43 t/s vs 29-32 t/s for upstream.
