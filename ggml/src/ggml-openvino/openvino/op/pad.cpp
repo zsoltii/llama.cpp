@@ -5,9 +5,11 @@
 #include <cstdint>
 #include <openvino/op/constant.hpp>
 #include <openvino/op/gather.hpp>
+#include <openvino/op/multiply.hpp>
 #include <openvino/op/pad.hpp>
 #include <openvino/op/reshape.hpp>
 #include <openvino/op/shape_of.hpp>
+#include <openvino/op/subtract.hpp>
 #include <utility>
 #include <vector>
 
@@ -56,13 +58,62 @@ ov::Output<ov::Node> translate_circular_pad(ov::Output<ov::Node> input,
 
 }  // namespace
 
+// The cacheless attention (embedding models) pads K, V and the KQ bias along the token axis up to the KV size of the
+// mask: GGML_PAD(n_tokens, 256) - n_tokens. The token axis is dynamic and the converted model is reused for other
+// token counts, so a constant pad would only fit the graph it was converted from: pad up to the mask's KV size.
+static bool translate_mask_kv_pad(const NodeContext & context,
+                                  const ov::Output<ov::Node> & input,
+                                  const std::array<int32_t, 8> & pads,
+                                  ov::Output<ov::Node> & res) {
+    if (!context.has_input("self_kq_mask")) {
+        return false;
+    }
+    const auto & shape = input.get_partial_shape();
+    if (shape.rank().is_dynamic() || shape.rank().get_length() != 4) {
+        return false;
+    }
+    int64_t axis = -1;
+    for (int64_t i = 0; i < 4; ++i) {
+        // ggml dim 3 - i
+        const bool padded = pads[2 * (3 - i)] != 0 || pads[2 * (3 - i) + 1] != 0;
+        if (shape[i].is_dynamic()) {
+            if (axis != -1 || pads[2 * (3 - i)] != 0) {
+                return false;
+            }
+            axis = i;
+        } else if (padded) {
+            return false;
+        }
+    }
+    if (axis == -1) {
+        return false;
+    }
+
+    auto mask = context.get_input("self_kq_mask");
+    auto mask_shape = std::make_shared<ov::op::v3::ShapeOf>(mask, ov::element::i64);
+    auto input_shape = std::make_shared<ov::op::v3::ShapeOf>(input, ov::element::i64);
+    auto gather_axis = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {0});
+    auto n_kv = std::make_shared<ov::op::v8::Gather>(
+        mask_shape, ov::op::v0::Constant::create(ov::element::i64, {1}, {3}), gather_axis);
+    auto n_cur = std::make_shared<ov::op::v8::Gather>(
+        input_shape, ov::op::v0::Constant::create(ov::element::i64, {1}, {axis}), gather_axis);
+    auto pad_len = std::make_shared<ov::op::v1::Subtract>(n_kv, n_cur);
+
+    // pads_end = one_hot(axis) * pad_len
+    std::vector<int64_t> one_hot(4, 0);
+    one_hot[axis] = 1;
+    auto pads_end = std::make_shared<ov::op::v1::Multiply>(
+        ov::op::v0::Constant::create(ov::element::i64, {4}, one_hot), pad_len);
+    auto pads_begin = ov::op::v0::Constant::create(ov::element::i64, {4}, std::vector<int64_t>(4, 0));
+    auto pad_value = ov::op::v0::Constant::create(input.get_element_type(), ov::Shape{}, {0});
+    res = std::make_shared<ov::op::v1::Pad>(input, pads_begin, pads_end, pad_value, ov::op::PadMode::CONSTANT);
+    return true;
+}
+
 OutputVector translate_pad(const NodeContext & context) {
     num_inputs_check(context, 1, 1);
 
     auto input = process_view_input_new(context, 0);
-    if (context.get_input_shape(0) == context.get_output_shape()) {
-        return rename_outputs_with_suffix({input}, context.get_name());
-    }
 
     const int32_t * op_params = context.get_output_op_params();
     FRONT_END_CHECK_IMPLEMENTED(op_params != nullptr, "PAD requires output op params");
@@ -70,6 +121,15 @@ OutputVector translate_pad(const NodeContext & context) {
     const std::array<int32_t, 8> pads = {op_params[0], op_params[1], op_params[2], op_params[3],
                                          op_params[4], op_params[5], op_params[6], op_params[7]};
     const bool circular = op_params[8] != 0;
+
+    ov::Output<ov::Node> kv_pad;
+    if (!circular && translate_mask_kv_pad(context, input, pads, kv_pad)) {
+        return rename_outputs_with_suffix({kv_pad}, context.get_name());
+    }
+
+    if (context.get_input_shape(0) == context.get_output_shape()) {
+        return rename_outputs_with_suffix({input}, context.get_name());
+    }
 
     if (circular) {
         auto res = translate_circular_pad(input, pads, context.get_input_shape(0).to_shape());

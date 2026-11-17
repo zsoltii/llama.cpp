@@ -1,0 +1,33 @@
+#version 450
+
+// ADD / MUL of contiguous f32 tensors, four elements per thread: src1 has the shape of src0 or is one row
+// that is repeated (bias, norm weight). The generic binary shaders compute the full 4-d indices per element.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {vec4 data_a[];};
+layout (binding = 1) readonly buffer B {vec4 data_b[];};
+layout (binding = 2) writeonly buffer D {vec4 data_d[];};
+
+layout (push_constant) uniform parameter
+{
+    uint n4;     // vec4 elements of dst
+    uint row4;   // vec4 elements of the repeated src1 row, 0 when src1 has the shape of src0
+    uint a_off;  // misalignment of each tensor in vec4 units
+    uint b_off;
+    uint d_off;
+} p;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.y * (gl_NumWorkGroups.x * 256) + gl_GlobalInvocationID.x;
+    if (i >= p.n4) {
+        return;
+    }
+    const vec4 a = data_a[p.a_off + i];
+    const vec4 b = data_b[p.b_off + (p.row4 != 0 ? i % p.row4 : i)];
+#if defined(OP_MUL)
+    data_d[p.d_off + i] = a * b;
+#else
+    data_d[p.d_off + i] = a + b;
+#endif
+}

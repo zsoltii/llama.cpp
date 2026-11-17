@@ -843,6 +843,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_get_rows_f32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_get_rows_back_f32;
     vk_pipeline pipeline_acc_f32;
+    vk_pipeline pipeline_binary_vec4_add;
+    vk_pipeline pipeline_binary_vec4_mul;
     vk_pipeline pipeline_set_f32;
 
     // [src0 0=fp32,1=fp16][src1 0=fp32,1=fp16][dst 0=fp32,1=fp16]

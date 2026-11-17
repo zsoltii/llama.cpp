@@ -3857,6 +3857,8 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_add_id_f32, "add_id_f32", add_id_f32_len, add_id_f32_data, "main", 4, sizeof(vk_op_add_id_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_acc_f32, "acc_f32", acc_f32_len, acc_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0, 1}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_binary_vec4_add, "binary_vec4_add", binary_vec4_add_len, binary_vec4_add_data, "main", 3, 5 * sizeof(uint32_t), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_binary_vec4_mul, "binary_vec4_mul", binary_vec4_mul_len, binary_vec4_mul_data, "main", 3, 5 * sizeof(uint32_t), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_set_f32, "set_f32", acc_f32_len, acc_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {0, 0}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_concat_i8, "concat_i8", concat_i8_len, concat_i8_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
@@ -11209,7 +11211,41 @@ void ggml_vk_multi_add(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_c
         }, pc, elements);
 }
 
+// ADD / MUL of contiguous f32 tensors where src1 has the shape of src0 or is a single repeated row: 4 elements per thread
+static bool ggml_vk_binary_vec4(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) ||
+        !ggml_are_same_shape(src0, dst) || src0->ne[0] % 4 != 0) {
+        return false;
+    }
+    uint32_t row4 = 0;
+    if (!ggml_are_same_shape(src0, src1)) {
+        if (src1->ne[0] != src0->ne[0] || src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+            return false;
+        }
+        row4 = (uint32_t)(src1->ne[0] / 4);
+    }
+    const uint32_t mis[3] = { get_misalign_bytes(ctx, src0), get_misalign_bytes(ctx, src1), get_misalign_bytes(ctx, dst) };
+    if ((mis[0] | mis[1] | mis[2]) % 16 != 0) {
+        return false;
+    }
+    vk_pipeline pipeline = dst->op == GGML_OP_MUL ? ctx->device->pipeline_binary_vec4_mul : ctx->device->pipeline_binary_vec4_add;
+    const uint32_t n4 = (uint32_t)(ggml_nelements(dst) / 4);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const std::array<uint32_t, 5> pc = { n4, row4, mis[0] / 16, mis[1] / 16, mis[2] / 16 };
+    const uint32_t groups = CEIL_DIV(n4, 256);
+    const uint32_t max_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
+    const uint32_t gx = std::min(groups, max_x);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, src0, true), ggml_vk_tensor_subbuffer(ctx, src1, true), ggml_vk_tensor_subbuffer(ctx, dst, true) },
+        pc, { gx * 256, CEIL_DIV(groups, gx), 1 });
+    return true;
+}
+
 void ggml_vk_add(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (!ctx->do_add_rms_partials && ggml_vk_binary_vec4(ctx, subctx, src0, src1, dst)) {
+        return;
+    }
     const uint32_t src0_type_size = ggml_type_size(src0->type);
     const uint32_t src1_type_size = ggml_type_size(src1->type);
     const uint32_t dst_type_size = ggml_type_size(dst->type);
@@ -11258,6 +11294,9 @@ void ggml_vk_sub(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_t
 }
 
 void ggml_vk_mul(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (ggml_vk_binary_vec4(ctx, subctx, src0, src1, dst)) {
+        return;
+    }
     const uint32_t src0_type_size = ggml_type_size(src0->type);
     const uint32_t src1_type_size = ggml_type_size(src1->type);
     const uint32_t dst_type_size = ggml_type_size(dst->type);

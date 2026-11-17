@@ -1106,3 +1106,14 @@ Kernel level (34 cases, time 27 / 26.2.6): mean 0.842, median 0.855, range 0.62-
 Models (fork binary, tokens/s, 26.2.6 -> 27): Qwen3.5-9B q8_0 KV pp512 1018 -> 1117 (+9.7 %), pp4096 +9.4 %, tg128 28.9 -> 28.2 (-2.4 %), at depth 8192 pp +9 %, tg unchanged; gpt-oss-20b pp512 1061 -> 1557 (+47 %), pp4096 +43 %, tg128 43.1 -> 48.4 (+12 %), at depth 8192 pp +34 % / tg +13 %; Qwen3.8-27B iq4_nl pp +1-4 %, tg +2 %. Upstream binary: Qwen3.5 +8-9 % pp, gpt-oss pp512 +38 %, tg +12-22 %, but Qwen3.8 pp4096 -6 % and at depth 8192 -15 % (the fork's own kernels do not regress there).
 
 Conclusion: the Mesa version matters a lot, unlike the Fedora 44 -> 45 repackaging (finding 33). The newer ANV compiler speeds up the quantized FA and the gpt-oss path by up to 47 %. Mesa 27 is not released (devel snapshot, locally built); a distro update to 27 should bring these gains for free, and the fork's tunings (`GGML_VK_FA_WG_PER_CORE`, min KV split, MLA head groups) should be re-checked against it once it ships (the GLM MLA f16 case is the one that got slower).
+
+## Finding 41: bge-m3 on the B50 (Vulkan), vec4 ADD / MUL
+
+`llama-bench -embd 1 -ub 2048 -fa 1` on `bge-m3-{dense,hybrid}-f16.gguf`. The profile (`GGML_VK_PERF_LOGGER`, pp512, 46 ms) showed 244 bias / residual ADDs at 36.7 us and 49 norm-weight MULs at 30 us per 1024 x 512 f32 tensor (2x the bandwidth bound: the generic binary shader computes four-dimensional indices per element), 20 % of the encode time. New `binary_vec4.comp` (contiguous f32, src1 of the same shape or one repeated row, four elements per thread, used by `ggml_vk_add` / `ggml_vk_mul`): ADD 9.7 us, MUL 6.9 us (3.8x / 4.4x), encode 46.0 -> 37.0 ms. Tokens/s, before -> after:
+
+| model | pp128 | pp512 | pp2048 |
+|---|---|---|---|
+| dense | 6949 -> 7734 | 9940 -> 12289 (+24 %) | 7591 -> 8711 |
+| hybrid | 6684 -> 7502 | 9683 -> 11905 (+23 %) | 7577 -> 8578 |
+
+The hybrid head costs ~3 % against dense. FA off is 15-40 % slower at pp2048 (4.6k vs 7.6k t/s), so keep it on. Qwen3.5-9B pp512 / tg64 unchanged (1036 / 29.3 vs 1032 / 29.3). Accuracy against the CPU backend (68 texts of `corpus/long-wiki.txt`, hybrid f16): dense cos min 0.999973, sparse rel. L1 0.40 %, top-1 dense 1.0 / sparse 0.985, top-5 1.0; `test-backend-ops` ADD,MUL 210/210. Remaining 37 ms: matmul 23.5 ms (12-16 TFLOPS, the shared-staging limit of findings 38/39), FA 6.7 ms (3.8 TFLOPS), ADD 2.4, GELU 1.5, PAD+CPY 1.7 (K/V pad of the no-cache encoder is a no-op copy when the token count is a multiple of 256; skipping it would change the graph the OpenVINO backend caches), NORM 0.9.
