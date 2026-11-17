@@ -1079,3 +1079,12 @@ Matmul tile sweep on the existing f16 coopmat path (q4_K 4096x512x14336, TFLOPS)
 Replacing the dequantize in `flash_attn_cm1.comp` by a constant (timing probes, wrong results): q8_0/q8_0 2943 -> 2314 with K const, 2295 with V const; skipping the per-vec4 scale load changes nothing (3003). So dequant plus its global loads costs ~650 us on each of K and V, and the rest (~2300 us, close to the f16 time of 2440) is the coopmat FA block structure itself. Even a free dequant would stay far above the quantized bandwidth bound (970 us). Mixed K/V types are slower than either pure type (K f16 / V q8_0 3683, K q8_0 / V f16 3238), because they fall into a different path.
 
 Dead ends (reverted): subgroup-scope barriers for the K staging (no change); register prefetch of K_PF dequantized K chunks ahead of the staging barrier: K_PF 1/2/4 gives q8_0 3012/3097/3299 us, i.e. more prefetch is monotonically slower (register pressure / occupancy, not load latency). The remaining lever is a different decode kernel structure (the plain scalar decode tile was 3.2-4.7 ms, also a dead end), not the K/V staging details.
+
+## Finding 38: where the Xe2 prefill matmul time goes (q4_K 4096x512x14336, 2912 us, 20.6 TFLOPS)
+
+Timing probes in `mul_mm.comp` (coopmat1 path, results wrong, shader-only rebuilds):
+- global loads + dequant of A/B only for the first K block: 2088 us (28.8 TFLOPS), so loading/dequant/shared-store costs ~830 us (28 %);
+- MMA only on half of the K steps (fragment loads of the other half dead): 2445 us, so the MMA + shared-fragment-load core is ~940 us (the f16 XMX peak would be ~330 us);
+- the remaining ~1100 us is barriers, epilogue, scheduling and exposed load latency (no register or shared-memory double buffering: the loop is load -> store to shared -> barrier -> MMA -> barrier).
+Loading each B fragment once per K step and reusing it for all A row fragments (instead of once per A row) changes nothing (2912 -> 2936 us; q6_K 3461 -> 3308 us), the compiler already hoisted it. BK 16/32/64 with 128x128 or 128x256 tiles and 256/512 threads are not better (BK 64 with 512 threads: 8.7 TFLOPS, shared memory 54 KB > 48 KB limit at 128x256).
+Shared-memory budget: A 128 rows x (BK/2+4) x 4 B + B 256 cols likewise = 30 KB at BK 32, so shared double buffering does not fit in 48 KB; the only overlap route is register prefetch of the next block (as `mul_mmq_cm1.comp` does with `block_a_prefetch`) for the f16 coopmat kernel, which is a per-quant-type rewrite. Expected prize: up to ~25 % of the matmul time if the load part is fully hidden.
