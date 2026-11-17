@@ -1069,3 +1069,7 @@ Vulkan 1.4.354 on the B50 (Mesa 26.2.6) exposes cooperative matrix shapes f16/bf
 Pitfall found on the way: Intel's integer-dot large tile uses wg_denoms 128x256; a kernel with a 128x128 tile must not reuse it (half of the column tiles are then never dispatched).
 
 Matmul tile sweep on the existing f16 coopmat path (q4_K 4096x512x14336, TFLOPS): current 512 threads 128x256 / 32x32 warp tile 18.9; 256 threads 128x128 17.1; 512 threads 256x128 16.3; 128 threads 64x128 13.2; 64x64 warp tiles 1.5-7 (register spills). The B50 f16 peak is ~85 TFLOPS, f16 A (no dequant) reaches only 15.7, so the kernel structure, not the dequant, limits prefill at ~20 TFLOPS.
+
+## Finding 36: build against the newest Vulkan headers (368) - no change
+
+`~/IdeaProjects/vulkan-refs/Vulkan-Headers` (header version 368, 2026-11-13; the system has 350) builds the Vulkan backend without changes (`-DVulkan_INCLUDE_DIR`, `-isystem`, build dir `build-vk368`) and FLASH_ATTN_EXT passes 5820/5820. Qwen3.5-9B f16 KV, tokens/s, system headers vs 368: pp512 1037 vs 1018, pp4096 981 vs 966, tg64 29.3 vs 29.1, pp512 @ d16384 639 vs 635, tg64 @ d16384 25.37 vs 25.36, i.e. no gain (the header version does not change the shaders or the driver). The device extensions that are new on the B50 driver (VK_KHR_shader_bfloat16, shader_fma, shader_subgroup_rotate, descriptor_heap, copy_memory_indirect, untyped pointers) were reviewed in the specs and none targets the matmul / FA limits found so far.
