@@ -84,14 +84,14 @@ static __device__ __forceinline__ void set_rows_quant_warp_block(const float x, 
     int   imax = j;
 #pragma unroll
     for (int offset = qk/2; offset > 0; offset >>= 1) {
-        const float a = __shfl_xor_sync(0xFFFFFFFF, amax, offset, qk);
-        const int   i = __shfl_xor_sync(0xFFFFFFFF, imax, offset, qk);
+        const float a = ggml_cuda_shfl_xor(amax, offset, qk);
+        const int   i = ggml_cuda_shfl_xor(imax, offset, qk);
         if (a > amax || (a == amax && i < imax)) {
             amax = a;
             imax = i;
         }
     }
-    const float vmax = __shfl_sync(0xFFFFFFFF, x, imax, qk);
+    const float vmax = ggml_cuda_shfl(x, imax, qk);
 
     if constexpr (type == GGML_TYPE_Q8_0) {
         block_q8_0 * y = (block_q8_0 *) dst;
@@ -132,7 +132,7 @@ static __device__ __forceinline__ void set_rows_quant_warp_block(const float x, 
             const float sumq2 = warp_reduce_sum<qk>(w*v*v);
             d = sumq2 > 0 ? sumqx/sumq2 : d;
         }
-        const int q_hi = __shfl_down_sync(0xFFFFFFFF, q, qk/2, qk);
+        const int q_hi = ggml_cuda_shfl(q, threadIdx.x + qk/2, qk);
         block_q4_0 * y = (block_q4_0 *) dst; // same layout as block_iq4_nl
         if (j < qk/2) {
             y->qs[j] = q | (q_hi << 4);
