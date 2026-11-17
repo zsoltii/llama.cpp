@@ -1061,3 +1061,11 @@ Qwen3.5-9B Q4_K_XL, f16 KV, Vulkan1, `-ub 512`, tokens/s:
 gemma-4-12B f16 and gpt-oss-20b (f16 / q8_0 KV) prefill at depth 8192 are unchanged (not eligible for the new kernel). FLASH_ATTN_EXT 5820/5820 on Vulkan1. The other recent upstream Vulkan commits (narrow-N matmul, CM2 dequantized KV) are coopmat2-only, the UMA copy change targets iGPUs; none applies to the B50.
 
 Dead end: replacing the two workgroup barriers per 16-wide quantized K chunk in `flash_attn_cm1.comp` by subgroup-scope barriers (per-subgroup staging) did not change the 100k decode time (q8_0 2983 -> 2992 us, iq4_nl 3065 -> 3041 us).
+
+## Finding 35: int8 coopmat MMQ on Xe2 (dead end for now) and matmul tile sweep
+
+Vulkan 1.4.354 on the B50 (Mesa 26.2.6) exposes cooperative matrix shapes f16/bf16 8x16x16 and s8/u8 8x16x32 (queried with `vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR`; no fp8, no coopmat2), `VK_KHR_shader_bfloat16`, `VK_KHR_shader_subgroup_rotate`, `VK_EXT_descriptor_heap`; `integerDotProduct8BitSignedAccelerated` is false. The fork already contains an int8 coopmat MMQ kernel (`mul_mmq_cm1.comp`), enabled only on RDNA3/4. It was ported to Xe2 (accumulator row = element index, no magic bias, subgroup 16, TM/TN/TK 8/16/32, own tile denominators, no q3_K/q6_K/nvfp4 because the 32-deep MMA cannot apply 16-wide scales). It passed MUL_MAT 2555/2555 and MUL_MAT_ID 1137/1137, but is 2-3x slower than the f16 dequant path: 4096x512x14336 q4_0 8.2 ms (7.4 TFLOPS) vs 2.95 ms (20.4 TFLOPS), Qwen3.5-9B pp512 479 vs 1036 t/s. Dropping the float rescale only gains 9%, so the cost is shared-memory traffic of the 32x32 warp tile and the unpack, not the scaling. Reverted.
+
+Pitfall found on the way: Intel's integer-dot large tile uses wg_denoms 128x256; a kernel with a 128x128 tile must not reuse it (half of the column tiles are then never dispatched).
+
+Matmul tile sweep on the existing f16 coopmat path (q4_K 4096x512x14336, TFLOPS): current 512 threads 128x256 / 32x32 warp tile 18.9; 256 threads 128x128 17.1; 512 threads 256x128 16.3; 128 threads 64x128 13.2; 64x64 warp tiles 1.5-7 (register spills). The B50 f16 peak is ~85 TFLOPS, f16 A (no dequant) reaches only 15.7, so the kernel structure, not the dequant, limits prefill at ~20 TFLOPS.
