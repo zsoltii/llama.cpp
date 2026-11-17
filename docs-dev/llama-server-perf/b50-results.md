@@ -1088,3 +1088,11 @@ Timing probes in `mul_mm.comp` (coopmat1 path, results wrong, shader-only rebuil
 - the remaining ~1100 us is barriers, epilogue, scheduling and exposed load latency (no register or shared-memory double buffering: the loop is load -> store to shared -> barrier -> MMA -> barrier).
 Loading each B fragment once per K step and reusing it for all A row fragments (instead of once per A row) changes nothing (2912 -> 2936 us; q6_K 3461 -> 3308 us), the compiler already hoisted it. BK 16/32/64 with 128x128 or 128x256 tiles and 256/512 threads are not better (BK 64 with 512 threads: 8.7 TFLOPS, shared memory 54 KB > 48 KB limit at 128x256).
 Shared-memory budget: A 128 rows x (BK/2+4) x 4 B + B 256 cols likewise = 30 KB at BK 32, so shared double buffering does not fit in 48 KB; the only overlap route is register prefetch of the next block (as `mul_mmq_cm1.comp` does with `block_a_prefetch`) for the f16 coopmat kernel, which is a per-quant-type rewrite. Expected prize: up to ~25 % of the matmul time if the load part is fully hidden.
+
+## Finding 39: Xe2 prefill matmul, further probes (all reverted)
+
+q4_K 4096x512x14336, baseline measured in the same session 3150 us (the card runs ~8 % slower than at finding 38, always compare in one session):
+- skipping only the A load/dequant/shared store after the first block: 2385 us (-770); skipping only the B (f16 copy) load/store: 2600 us (-550); so even the plain f16 B copy is expensive, while removing the q4_K scale decode (constant d/m) only gains 5 % (3000 us): the cost is load/store/barrier traffic, not ALU;
+- touching the next B block early (software prefetch, consumed after the loop): 3340 us, slower;
+- loading the B fragments straight from global memory with coopMatLoad (no shared copy, aligned f16 B): 12.2 ms, 4x slower (no 2D block load, per-lane gathers).
+Conclusion: the shared-memory staging structure of `mul_mm.comp` cannot be fixed with local edits; a real gain needs a kernel that issues 2D block loads for both operands or a register-staged, software-pipelined main loop, which needs ISA-level profiling (not available here) to guide it.
